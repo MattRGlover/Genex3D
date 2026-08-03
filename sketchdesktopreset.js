@@ -296,11 +296,22 @@ function checkCompletion() {
 // —————————————————————————————————————
 // MOUSE & KEYBOARD
 // —————————————————————————————————————
-function mouseDragged() {
+// Ignore mouse events that belong to the UI chrome (3D/fullscreen buttons,
+// instructions panel) or that happen while 3D mode is active - otherwise
+// clicking "3D" itself fires p5's global mousePressed and spawns a shape.
+function isUiEvent(event) {
+    if (typeof is3DMode !== 'undefined' && is3DMode) return true;
+    return !!(event && event.target && event.target.closest &&
+        event.target.closest('#controls, #instructions'));
+}
+
+function mouseDragged(event) {
+    if (isUiEvent(event)) return;
     handleDrag();
 }
   
-function mousePressed() {
+function mousePressed(event) {
+    if (isUiEvent(event)) return;
     handleDrag();
 }
   

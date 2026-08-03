@@ -222,6 +222,11 @@ function activate3DMode() {
   // Convert P5 shapes to 3D
   convertShapesTo3D();
   
+  // NOTE: the p5 draw loop is intentionally left running (not noLoop()'d)
+  // while in 3D. New-shape creation is blocked separately (isUiEvent() in
+  // sketchdesktopreset.js bails out of handleDrag() while is3DMode is true),
+  // but existing in-progress growth animations keep advancing in real time
+  // so 2D doesn't "resume" a stale animation when you come back to it.
   is3DMode = true;
   
   // Update button
