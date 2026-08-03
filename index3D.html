@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Kandinsky Abstract Art - 3D Mode</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Forum&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+    }
+    canvas {
+      display: block;
+      touch-action: none;
+    }
+    #p5-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 1;
+    }
+    #babylon-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 0;
+      display: none;
+    }
+    /* Subtle, barely-there UI: translucent glass buttons */
+    #fullscreen-btn {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 100;
+      background-color: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      color: rgba(255, 255, 255, 0.55);
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 13px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      transition: background-color 0.3s, color 0.3s;
+    }
+    #fullscreen-btn:hover {
+      background-color: rgba(255, 255, 255, 0.3);
+      color: rgba(255, 255, 255, 0.9);
+    }
+    #mode-toggle-btn {
+      position: absolute;
+      bottom: 15px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 100;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      color: rgba(255, 255, 255, 0.7);
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 13px;
+      font-family: 'Forum', serif;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      transition: background-color 0.3s, color 0.3s, opacity 0.3s;
+      animation: mode-btn-pulse 2.6s ease-in-out infinite;
+    }
+    #mode-toggle-btn:hover {
+      background: rgba(255, 255, 255, 0.35);
+      color: rgba(255, 255, 255, 1);
+    }
+    #mode-toggle-btn:disabled {
+      opacity: 0.25;
+      cursor: not-allowed;
+      animation: none;
+    }
+    @keyframes mode-btn-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.35); }
+      50% { box-shadow: 0 0 0 8px rgba(255, 255, 255, 0); }
+    }
+    #instructions {
+      position: absolute;
+      top: 60px;
+      left: 15px;
+      z-index: 100;
+      background: rgba(0, 0, 0, 0.25);
+      color: rgba(255, 255, 255, 0.85);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-family: 'Forum', serif;
+      font-size: 12px;
+      max-width: 240px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.6s;
+    }
+    #instructions.show {
+      opacity: 1;
+    }
+    #instructions h4 {
+      margin: 0 0 6px 0;
+      color: rgba(255, 255, 255, 0.9);
+      font-size: 12px;
+    }
+    #instructions p {
+      margin: 3px 0;
+      color: rgba(255, 255, 255, 0.8);
+    }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <button id="fullscreen-btn">
+      <i id="fullscreen-icon" class="fas fa-expand"></i>
+    </button>
+    <button id="mode-toggle-btn" disabled title="Toggle 3D mode">3D</button>
+  </div>
+
+  <div id="instructions">
+    <h4>🎮 3D Flight Controls</h4>
+    <p class="desktop-ctrl"><strong>Drag</strong> - Look around (360&deg;)</p>
+    <p class="desktop-ctrl"><strong>WASD</strong> - Move around</p>
+    <p class="desktop-ctrl"><strong>Q/E</strong> - Up/Down</p>
+    <p class="desktop-ctrl"><strong>ESC</strong> - Return to 2D</p>
+    <p class="touch-ctrl"><strong>Touch &amp; drag</strong> - Move (anywhere)</p>
+    <p class="touch-ctrl"><strong>Two fingers</strong> - Look around</p>
+  </div>
+
+  <!-- Babylon.js -->
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  
+  <!-- P5 libraries -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/addons/p5.sound.min.js" defer></script>
+
+  <!-- Firebase -->
+  <script src="https://www.gstatic.com/firebasejs/9.6.10/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.6.10/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.6.10/firebase-storage-compat.js"></script>
+
+  <!-- App scripts: ONE project for all devices, scaled by viewport size.
+       Mobile-specific controls (touch look/move) live in babylon3D.js -->
+  <script src="config.js"></script>
+  <script src="shapes.js" defer></script>
+  <script src="audio.js" defer></script>
+  <script src="sketchdesktopreset.js" defer></script>
+  <script src="babylon3D.js" defer></script>
+
+  <script>
+    // Show only the controls relevant to this device
+    document.addEventListener('DOMContentLoaded', () => {
+      const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+      document.querySelectorAll(isTouch ? '.desktop-ctrl' : '.touch-ctrl')
+        .forEach(el => el.style.display = 'none');
+    });
+  </script>
+
+  <script>
+    // Fullscreen Button Logic
+    document.addEventListener('DOMContentLoaded', (event) => {
+      const fullscreenBtn = document.getElementById('fullscreen-btn');
+      const fullscreenIcon = document.getElementById('fullscreen-icon');
+      
+      if (fullscreenBtn && fullscreenIcon) {
+        const docEl = document.documentElement;
+        const requestFs = docEl.requestFullscreen || docEl.webkitRequestFullscreen;
+        const exitFs = document.exitFullscreen || document.webkitExitFullscreen;
+        const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement;
+
+        if (!requestFs) {
+          // iPhone Safari has no fullscreen API for page content - hide the button
+          fullscreenBtn.style.display = 'none';
+        } else {
+          fullscreenBtn.addEventListener('click', () => {
+            if (!fsElement()) {
+              requestFs.call(docEl);
+            } else if (exitFs) {
+              exitFs.call(document);
+            }
+          });
+
+          const onFsChange = () => {
+            if (fsElement()) {
+              fullscreenIcon.classList.remove('fa-expand');
+              fullscreenIcon.classList.add('fa-compress');
+            } else {
+              fullscreenIcon.classList.remove('fa-compress');
+              fullscreenIcon.classList.add('fa-expand');
+            }
+          };
+          document.addEventListener('fullscreenchange', onFsChange);
+          document.addEventListener('webkitfullscreenchange', onFsChange);
+        }
+      }
+    });
+  </script>
+</body>
+</html>

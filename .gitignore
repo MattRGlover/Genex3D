@@ -1,0 +1,5 @@
+# Unrelated large SDK/installer accidentally added early on - not project code
+google-cloud-sdk/
+google-cloud-cli-*.tar.gz
+
+.DS_Store

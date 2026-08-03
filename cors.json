@@ -1,0 +1,17 @@
+[
+  {
+    "origin": [
+      "http://localhost:8000",
+      "https://canvas-b773a.web.app",
+      "https://canvas-b773a.firebaseapp.com"
+    ],
+    "method": ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"],
+    "responseHeader": [
+      "Content-Type",
+      "Access-Control-Allow-Origin",
+      "Authorization",
+      "x-goog-resumable"
+    ],
+    "maxAgeSeconds": 3600
+  }
+]
