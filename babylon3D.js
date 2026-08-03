@@ -683,9 +683,11 @@ function convertShapesTo3D() {
   }
   
   // Sky renders in group 0, artwork in group 1: the background can never
-  // occlude the artwork, no matter how far the camera flies
+  // occlude the artwork, no matter how far the camera flies (group 0 always
+  // renders - and is depth-tested - before group 1, regardless of actual
+  // world-space distance)
   babylonScene.meshes.forEach(m => {
-    m.renderingGroupId = m.name === 'skySphere' ? 0 : 1;
+    m.renderingGroupId = m.name.startsWith('skyFace_') ? 0 : 1;
   });
 }
 
