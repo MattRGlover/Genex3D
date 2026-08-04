@@ -206,12 +206,10 @@ function draw() {
   }
 
   // --- FADE AND RESET LOGIC ---
-  if (compositionFinished && resetCycleTimestamp === 0 && millis() - completionTimestamp > 10000) {
-    console.log(`[DEBUG] 10s pause complete. Starting fade cycle at ${millis()}`);
-    
-    // Start reset cycle (no snapshot or upload in local-only mode)
-    resetCycleTimestamp = millis();
-  }
+  // NOTE: the composition no longer resets itself automatically once finished
+  // (MAX_ELEMENTS reached) - it just stays on screen, complete, until the
+  // user manually triggers a reset from the menu (see resetComposition()
+  // below, which starts this same fade-out/blackout/fade-in cycle on demand).
 
   if (resetCycleTimestamp > 0) {
     let elapsed = millis() - resetCycleTimestamp;
@@ -302,7 +300,7 @@ function checkCompletion() {
 function isUiEvent(event) {
     if (typeof is3DMode !== 'undefined' && is3DMode) return true;
     return !!(event && event.target && event.target.closest &&
-        event.target.closest('#controls, #instructions'));
+        event.target.closest('#controls, #instructions, #menu-dropdown'));
 }
 
 function mouseDragged(event) {
@@ -535,12 +533,18 @@ function createLatticeElement(anchor) {
   else if (latticeSlots.length === 2) maxDim = 3;  // Reduced from 6
   else maxDim = 2;  // Reduced from 5
 
+  // MOBILE: grid is (2N+1) cells across, so N<=2 caps it at 5x5 (closest
+  // possible to a 6x6 ceiling), and cells are drawn smaller physically too.
+  const isMobileDevice = (typeof IS_TOUCH !== 'undefined' && IS_TOUCH) ||
+    (typeof window !== 'undefined' && ('ontouchstart' in window || navigator.maxTouchPoints > 0));
+  if (isMobileDevice) maxDim = Math.min(maxDim, 2);
+
   let N1 = floor(random(1, maxDim + 1));  // Start from 1 instead of 2
   let N2 = floor(random(max(1, N1 - 2), min(maxDim, N1 + 2) + 1));  // Smaller range
 
   const options = {
     angle1, angle2,
-    spacing: random(20, 40), // Reduced by half for better proportionality
+    spacing: isMobileDevice ? random(14, 24) : random(20, 40), // smaller cells on mobile
     N1, N2,
     fillAlpha: random(0.8, 1.0),
     anchorId: anchor.id,
@@ -1360,6 +1364,19 @@ class KandinskyShape {
 // —————————————————————————————————————
 // HELPER & STATE FUNCTIONS
 // —————————————————————————————————————
+
+// Manually start the fade-out/blackout/fade-in reset cycle (see the RESET
+// menu item). Composition no longer resets on its own after MAX_ELEMENTS -
+// this is now the only way a reset happens.
+function resetComposition() {
+  if (resetCycleTimestamp > 0) return; // a reset is already in progress
+  console.log('Manual reset triggered');
+  compositionFinished = true;
+  completionTimestamp = millis();
+  resetCycleTimestamp = millis();
+}
+window.resetComposition = resetComposition;
+
 function reset() {
   // Clear graphics layers
   if (lineLayer) lineLayer.clear();
@@ -1493,8 +1510,7 @@ function drawDebugInfo() {
   let msg = '';
 
   if (compositionFinished && resetCycleTimestamp === 0) {
-    const countdown = 20 - ((millis() - completionTimestamp) / 1000);
-    msg = `PAUSE: ${max(0, countdown).toFixed(1)}s`;
+    msg = 'COMPLETE - use menu to reset';
   } else if (resetCycleTimestamp > 0) {
     const elapsed = millis() - resetCycleTimestamp;
     if (elapsed < FADE_DURATION_MS) {

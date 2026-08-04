@@ -1432,7 +1432,10 @@ function create3DLattice(lattice, index, layerZ = 0) {
       sideOrientation: BABYLON.Mesh.DOUBLESIDE
     }, babylonScene);
     ribbon.position = new BABYLON.Vector3(x, y, z);
-    ribbon.material = unlitMat(`latticeMat_${index}_${ci}`, p5ColToRGBA(col));
+    // 10% more transparent than the 2D fill - lattices read as too solid/heavy in 3D
+    const latticeRGBA = p5ColToRGBA(col);
+    latticeRGBA.a *= 0.9;
+    ribbon.material = unlitMat(`latticeMat_${index}_${ci}`, latticeRGBA);
 
     // Black outline (2D uses strokeWeight 1.5)
     makeStrokeTube(`latticeOutline_${index}_${ci}`,
@@ -1445,5 +1448,135 @@ function create3DLattice(lattice, index, layerZ = 0) {
   console.log(`✅ Lattice ${index}: built ${built}/${cells.length} cells`);
   return built > 0;
 }
+
+// —————————————————————————————————————
+// EXPORT 3D MODEL (.OBJ + .MTL) - for Rhino / other rendering software
+// —————————————————————————————————————
+
+window.isBabylonSceneReady = function () {
+  return !!(babylonScene && babylonScene.meshes.some(m => !m.name.startsWith('skyFace_')));
+};
+
+// Best representative flat color for a mesh's material (matches how unlitMat
+// assigns emissiveColor = the true 2D paint color, with sensible fallbacks
+// for texture-based materials that have no flat color)
+function meshExportColor(mesh) {
+  const mat = mesh.material;
+  if (mat && mat.emissiveColor && (mat.emissiveColor.r + mat.emissiveColor.g + mat.emissiveColor.b) > 0.004) {
+    return { c: mat.emissiveColor, a: mat.alpha !== undefined ? mat.alpha : 1 };
+  }
+  if (mat && mat.diffuseColor && (mat.diffuseColor.r + mat.diffuseColor.g + mat.diffuseColor.b) > 0.004) {
+    return { c: mat.diffuseColor, a: mat.alpha !== undefined ? mat.alpha : 1 };
+  }
+  // Texture-only material (e.g. some open shapes): sample the average pixel
+  // color of its DynamicTexture canvas as a flat stand-in color
+  const tex = mat && (mat.emissiveTexture || mat.diffuseTexture);
+  if (tex && typeof tex.getContext === 'function') {
+    try {
+      const ctx = tex.getContext();
+      const w = ctx.canvas.width, h = ctx.canvas.height;
+      const step = Math.max(1, Math.floor(Math.min(w, h) / 24)); // sparse sample, stays fast
+      const data = ctx.getImageData(0, 0, w, h).data;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let y = 0; y < h; y += step) {
+        for (let x = 0; x < w; x += step) {
+          const i = (y * w + x) * 4;
+          if (data[i + 3] < 8) continue; // skip transparent pixels
+          r += data[i]; g += data[i + 1]; b += data[i + 2]; n++;
+        }
+      }
+      if (n > 0) {
+        return { c: new BABYLON.Color3(r / n / 255, g / n / 255, b / n / 255), a: mat.alpha !== undefined ? mat.alpha : 1 };
+      }
+    } catch (e) { /* canvas may be tainted or empty - fall through to default */ }
+  }
+  return { c: new BABYLON.Color3(0.7, 0.7, 0.7), a: 1 };
+}
+
+function downloadTextFile(filename, contents, mime) {
+  const blob = new Blob([contents], { type: mime || 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Exports every artwork mesh (skybox excluded) as a single OBJ + companion
+// MTL, one material per mesh so each shape keeps its flat 2D color in Rhino.
+// Babylon uses a left-handed coordinate system; OBJ/Rhino expect right-handed,
+// so Z is negated and triangle winding reversed to keep normals/faces correct.
+window.exportSceneToOBJ = function () {
+  if (!babylonScene) {
+    console.warn('No 3D scene to export yet - enter 3D mode first');
+    return;
+  }
+  const meshes = babylonScene.meshes.filter(m =>
+    !m.name.startsWith('skyFace_') && m.isEnabled() && m.getTotalVertices() > 0
+  );
+  if (meshes.length === 0) {
+    console.warn('Nothing to export - no artwork meshes found');
+    return;
+  }
+
+  const objLines = ['# Kandinsky 3D export', 'mtllib scene.mtl', ''];
+  const mtlLines = [];
+  let vertexOffset = 0;
+  const seenColors = new Map(); // dedupe identical colors into one material
+
+  meshes.forEach((mesh, mi) => {
+    mesh.computeWorldMatrix(true);
+    const world = mesh.getWorldMatrix();
+    const positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
+    const indices = mesh.getIndices();
+    if (!positions || !indices || indices.length < 3) return;
+
+    const { c, a } = meshExportColor(mesh);
+    const colorKey = `${c.r.toFixed(3)}_${c.g.toFixed(3)}_${c.b.toFixed(3)}_${a.toFixed(2)}`;
+    let matName = seenColors.get(colorKey);
+    if (!matName) {
+      matName = `mat_${seenColors.size}`;
+      seenColors.set(colorKey, matName);
+      mtlLines.push(
+        `newmtl ${matName}`,
+        `Kd ${c.r.toFixed(4)} ${c.g.toFixed(4)} ${c.b.toFixed(4)}`,
+        `Ka 0 0 0`,
+        `Ks 0 0 0`,
+        `d ${a.toFixed(3)}`,
+        `illum 1`,
+        ''
+      );
+    }
+
+    objLines.push(`o ${mesh.name.replace(/\s+/g, '_')}_${mi}`, `usemtl ${matName}`);
+
+    const vertCount = positions.length / 3;
+    for (let i = 0; i < vertCount; i++) {
+      const p = BABYLON.Vector3.TransformCoordinates(
+        new BABYLON.Vector3(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]),
+        world
+      );
+      // Left-handed -> right-handed: negate Z
+      objLines.push(`v ${p.x.toFixed(5)} ${p.y.toFixed(5)} ${(-p.z).toFixed(5)}`);
+    }
+
+    for (let i = 0; i + 2 < indices.length; i += 3) {
+      // Reverse winding to match the Z negation above (keeps faces/normals correct)
+      const a1 = indices[i] + 1 + vertexOffset;
+      const b1 = indices[i + 1] + 1 + vertexOffset;
+      const c1 = indices[i + 2] + 1 + vertexOffset;
+      objLines.push(`f ${a1} ${c1} ${b1}`);
+    }
+
+    vertexOffset += vertCount;
+  });
+
+  downloadTextFile('kandinsky-3d.obj', objLines.join('\n') + '\n', 'text/plain');
+  downloadTextFile('scene.mtl', mtlLines.join('\n') + '\n', 'text/plain');
+  console.log(`Exported ${meshes.length} meshes to kandinsky-3d.obj / scene.mtl`);
+};
 
 console.log('✅ babylon3D.js loaded!');
