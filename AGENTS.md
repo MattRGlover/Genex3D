@@ -51,11 +51,21 @@ inside UI chrome (`isUiEvent()` in `sketchdesktopreset.js`), since p5's global
 
 Top-left menu button (`#menu-btn`/`#menu-dropdown` in `index3D.html`):
 - **Export 3D Model (.OBJ)** — `window.exportSceneToOBJ()` in `babylon3D.js`.
-  Exports all artwork meshes (skybox excluded) as `kandinsky-3d.obj` +
-  `scene.mtl`, one material per unique flat color, ready to import into Rhino.
-  Handles the Babylon (left-handed) -> OBJ/Rhino (right-handed) conversion by
-  negating Z and reversing triangle winding. Enabled once
-  `window.isBabylonSceneReady()` is true (i.e. 3D mode has been entered once).
+  Exports all artwork meshes (skybox excluded) as a single
+  `kandinsky-3d-<timestamp>.zip` containing the matching `.obj` + `.mtl` pair
+  (one material per unique flat color) - bundled into one zip via a small
+  dependency-free STORE-only zip writer (`buildZip`/`downloadZip`) because
+  browsers silently block a page's second auto-triggered download, so two
+  separate downloads meant the `.mtl` (all color data) never actually
+  reached disk. Unzip, then import the `.obj` into Rhino.
+  Axes are remapped so the piece stands upright in Rhino's Front view
+  (Rhino Z = Babylon Y "up", Rhino Y = Babylon Z "depth"), with matching
+  triangle-winding reversal to keep faces/normals correct. "Open" shapes
+  (openRect/openTriangle/openSemiCircle) tag their mesh with the true
+  polygon footprint + flat color via `metadata.exportPolygon`/`exportColor`,
+  since their live 3D geometry is actually a texture-alpha-cutout plane that
+  would otherwise export as a plain rectangle with a guessed color. Enabled
+  once `window.isBabylonSceneReady()` is true (3D mode entered at least once).
 - **Reset Composition** — `window.resetComposition()` in `sketchdesktopreset.js`.
   The composition no longer auto-resets after `MAX_ELEMENTS` (50) is reached;
   it stays complete on screen until manually reset from this menu.

@@ -558,9 +558,13 @@ function convertShapesTo3D() {
     return { z, tilt };
   };
   
-  // Convert skeleton shapes (drawn first, farthest back)
+  // Convert skeleton shapes (drawn first, farthest back). These are always
+  // the 2 large translucent "open" shapes - give them extra depth separation
+  // beyond the normal per-layer spacing so they don't visually intersect
+  // (overlapping semi-transparent surfaces sort inconsistently by view angle)
+  const SKELETON_EXTRA_GAP = 10;
   shapes.forEach((shape, i) => {
-    const success = create3DShape(shape, i, true, drawOrder * LAYER_SPACING);
+    const success = create3DShape(shape, i, true, drawOrder * LAYER_SPACING + i * SKELETON_EXTRA_GAP);
     if (success) {
       totalConverted++;
       conversionStats.skeletons++;
@@ -745,6 +749,9 @@ function unlitMat(name, rgba) {
   m.disableLighting = true;
   m.alpha = rgba.a;
   m.backFaceCulling = false;
+  // Exact flat color for OBJ export, so the exporter never has to guess a
+  // material's true color from lighting-affected properties
+  m.metadata = { exportColor: { r: rgba.r, g: rgba.g, b: rgba.b, a: rgba.a } };
   return m;
 }
 
@@ -754,13 +761,37 @@ function makeStrokeTube(name, localPts, radius, rgba, x, y, z, rotZ = 0) {
   const tube = BABYLON.MeshBuilder.CreateTube(name, {
     path: localPts,
     radius: Math.max(radius, 0.08),
-    tessellation: 8,
+    tessellation: 16, // was 8: visibly faceted/blocky on large or close-up curves
     cap: BABYLON.Mesh.CAP_ALL
   }, babylonScene);
   tube.position = new BABYLON.Vector3(x, y, z);
   tube.rotation.z = rotZ;
   tube.material = unlitMat(name + '_mat', rgba);
   return tube;
+}
+
+// Outlines a prism from all sides: matching perimeter tubes on the front and
+// back faces, plus a vertical tube at each corner connecting them (the
+// Z-axis edges) - without those, the depth walls between corners show as
+// bare, unbordered seams from oblique angles. `loopPts` is the front-face
+// outline path (local XY, z=0) exactly as passed to makeStrokeTube today.
+// `edgeCorners` lists which points get a vertical edge - pass a subset (or
+// none) for smooth/curved perimeters that have no true corners. Skip the
+// back tube on finely-tessellated curves (circle/arc paths): viewed near
+// edge-on, two close, near-parallel many-segment tubes interleave into a
+// herringbone/hatch pattern - a straight-edged loop (few points) doesn't
+// have enough segments for that to happen, so it's safe to double there.
+function addPrismOutline(prefix, loopPts, depth, swr, x, y, z, rotZ, edgeCorners = [], addBack = true) {
+  const frontZ = -(depth / 2 + 0.1);
+  const backZ = depth / 2 + 0.1;
+  makeStrokeTube(`${prefix}_front`, loopPts, swr, K3D_BLACK, x, y, z + frontZ, rotZ);
+  if (addBack) makeStrokeTube(`${prefix}_back`, loopPts, swr, K3D_BLACK, x, y, z + backZ, rotZ);
+  edgeCorners.forEach((v, i) => {
+    makeStrokeTube(`${prefix}_edgeZ${i}`, [
+      new BABYLON.Vector3(v.x, v.y, frontZ),
+      new BABYLON.Vector3(v.x, v.y, backZ)
+    ], swr, K3D_BLACK, x, y, z, rotZ);
+  });
 }
 
 // P5 arc angles (y-down) -> Babylon local points (Y flipped)
@@ -820,7 +851,7 @@ function create3DShape(shape, index, isSkeleton, layerZ = 0) {
       disc.rotation.x = Math.PI / 2;
       disc.position = new BABYLON.Vector3(xPos, yPos, zPos);
       disc.material = unlitMat(`mat_${index}`, fill);
-      makeStrokeTube(`outline_${index}`, arcPathLocal(s / 2, 0, Math.PI * 2, 64), swr, K3D_BLACK, xPos, yPos, zPos - depth / 2 - 0.1);
+      addPrismOutline(`outline_${index}`, arcPathLocal(s / 2, 0, Math.PI * 2, 64), depth, swr, xPos, yPos, zPos, 0, [], false);
       return true;
     }
 
@@ -837,7 +868,7 @@ function create3DShape(shape, index, isSkeleton, layerZ = 0) {
         new BABYLON.Vector3(w / 2, h / 2, 0), new BABYLON.Vector3(-w / 2, h / 2, 0),
         new BABYLON.Vector3(-w / 2, -h / 2, 0)
       ];
-      makeStrokeTube(`outline_${index}`, rp, swr, K3D_BLACK, xPos, yPos, zPos - depth / 2 - 0.1, rotZ);
+      addPrismOutline(`outline_${index}`, rp, depth, swr, xPos, yPos, zPos, rotZ, rp.slice(0, 4));
       return true;
     }
 
@@ -857,7 +888,7 @@ function create3DShape(shape, index, isSkeleton, layerZ = 0) {
         new BABYLON.Vector3(0, 2 * h / 3, 0),
         new BABYLON.Vector3(-s / 2, -h / 3, 0)
       ];
-      makeStrokeTube(`outline_${index}`, v, swr, K3D_BLACK, xPos, yPos, zPos - depth / 2 - 0.1, rotZ);
+      addPrismOutline(`outline_${index}`, v, depth, swr, xPos, yPos, zPos, rotZ, v.slice(0, 3));
       return true;
     }
 
@@ -866,8 +897,10 @@ function create3DShape(shape, index, isSkeleton, layerZ = 0) {
       if (shape.style === 'open') return createOpenShape3D(shape, index, xPos, yPos, zPos, s, rotZ);
       // Half-disc WEDGE (real 3D volume) - profile matches the 2D bottom-half arc exactly
       extrudePrism(`shape_${index}`, arcPathLocal(s / 2, 0, Math.PI, 48), depth, fill, xPos, yPos, zPos, rotZ);
-      // 2D stroke follows the curved edge only
-      makeStrokeTube(`outline_${index}`, arcPathLocal(s / 2, 0, Math.PI, 48), swr, K3D_BLACK, xPos, yPos, zPos - depth / 2 - 0.1, rotZ);
+      // 2D stroke follows the curved edge only (the flat diameter edge stays unstroked)
+      const semiArc = arcPathLocal(s / 2, 0, Math.PI, 48);
+      addPrismOutline(`outline_${index}`, semiArc, depth, swr, xPos, yPos, zPos, rotZ,
+        [semiArc[0], semiArc[semiArc.length - 1]], false);
       return true;
     }
 
@@ -993,7 +1026,7 @@ function createConcentricArc3D(shape, index, x, y, z, swr, rotZ) {
 function createOpenShape3D(shape, index, x, y, z, s, rotZ) {
   const S2 = shape.targetSize || 50; // 2D pixel size
   const PAD = 1.5;
-  const TEX = 512;
+  const TEX = 1536; // was 512: looked fuzzy up close in 3D (fixed texture res upscaled/magnified)
   const tex = new BABYLON.DynamicTexture(`openTex_${index}`, { width: TEX, height: TEX }, babylonScene, true);
   tex.hasAlpha = true;
   const ctx = tex.getContext();
@@ -1149,6 +1182,24 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ) {
   } else if (shape.type === 'semiCircle') {
     profile = arcPathLocal(s / 2, 0, Math.PI, 48); // bottom half, matches texture art
   }
+
+  // OBJ EXPORT: the front/back planes are a full padded RECTANGLE with the
+  // real silhouette only visible via texture alpha, which plain OBJ/MTL can't
+  // carry - every "open" shape would export as a plain rectangle with a grey
+  // fallback color. Tag the front plane with the true polygon footprint,
+  // real depth (so it's an actual solid prism, not a flat 0-thickness face),
+  // and a translucent flat color as a stand-in for the 2D open-edge gradient
+  // (OBJ/MTL has no per-pixel alpha); skip the back plane and fade-walls.
+  if (profile) {
+    const exportFillRGBA = p5ColToRGBA(shape.c);
+    front.metadata = {
+      exportColor: { r: exportFillRGBA.r, g: exportFillRGBA.g, b: exportFillRGBA.b, a: 0.5 },
+      exportPolygon: profile.map(p => ({ x: p.x, y: p.y })),
+      exportDepth: depth
+    };
+  }
+  back.metadata = { skipExport: true };
+
   if (profile) {
     profile.push(profile[0].clone()); // close the loop
     // Gradient direction in Babylon local coords (canvas y is flipped).
@@ -1169,8 +1220,16 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ) {
       return fillRGBA.a * 0.5 * Math.max(0, 1 - t / 0.9);
     };
     // Subdivide edges so alpha fades smoothly ALONG each wall, reaching 100%
-    // transparency at the open side (one alpha per long edge left visible bands)
-    const SUB = Math.max(1, Math.ceil(24 / (profile.length - 1)));
+    // transparency at the open side. On large shapes these walls can face the
+    // camera almost head-on from oblique angles, so a coarse subdivision
+    // (each with one flat averaged alpha) shows as visible banded stripes -
+    // subdivide finely enough that it reads as a smooth gradient instead.
+    const SUB = Math.max(1, Math.ceil(120 / (profile.length - 1)));
+    // Pulled slightly inside +/-depth/2 (instead of exactly matching it) so
+    // this wall never shares a coplanar Z with the front/back faces - at
+    // depth/2 exactly, z-fighting flickered over the outline baked into
+    // the front face's texture, making it look interrupted/broken up
+    const wz = depth / 2 * 0.96;
     let wallIdx = 0;
     for (let i = 0; i < profile.length - 1; i++) {
       const p1 = profile[i], p2 = profile[i + 1];
@@ -1182,8 +1241,8 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ) {
         if (a < 0.02) continue; // fully dissolved: the open side stays open
         const seg = BABYLON.MeshBuilder.CreateRibbon(`open_${index}_w${wallIdx}`, {
           pathArray: [
-            [new BABYLON.Vector3(q1.x, q1.y, -depth / 2), new BABYLON.Vector3(q2.x, q2.y, -depth / 2)],
-            [new BABYLON.Vector3(q1.x, q1.y, depth / 2), new BABYLON.Vector3(q2.x, q2.y, depth / 2)]
+            [new BABYLON.Vector3(q1.x, q1.y, -wz), new BABYLON.Vector3(q2.x, q2.y, -wz)],
+            [new BABYLON.Vector3(q1.x, q1.y, wz), new BABYLON.Vector3(q2.x, q2.y, wz)]
           ],
           sideOrientation: BABYLON.Mesh.DOUBLESIDE
         }, babylonScene);
@@ -1192,9 +1251,46 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ) {
         seg.material = unlitMat(`open_${index}_w${wallIdx}_mat`, {
           r: fillRGBA.r, g: fillRGBA.g, b: fillRGBA.b, a: a
         });
+        seg.metadata = { skipExport: true }; // fade decoration only; front polygon covers export
         wallIdx++;
       }
     }
+
+    // WRAP THE OUTLINE AROUND THE DEPTH: the black line was only baked into
+    // the flat front/back textures, so at oblique angles the wall's bare
+    // colored edge stuck out past it with no border. Trace the same
+    // non-open perimeter with real 3D tubes at both the front and back
+    // edges, so the boundary reads correctly wrapped around from any angle.
+    const n = profile.length - 1; // profile is closed-loop (last point = dup of first)
+    let openEdgeIdx = 0, minEdgeAlpha = Infinity;
+    for (let i = 0; i < n; i++) {
+      const p1 = profile[i], p2 = profile[i + 1];
+      const midAlpha = alphaAt({ x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 });
+      if (midAlpha < minEdgeAlpha) { minEdgeAlpha = midAlpha; openEdgeIdx = i; }
+    }
+    const outlinePath = [];
+    for (let k = 1; k <= n; k++) outlinePath.push(profile[(openEdgeIdx + k) % n].clone());
+    const edgeSwr = Math.max((shape.sw || 2) / K3D_SCALE / 2, 0.16);
+    const frontPath = outlinePath.map(p => new BABYLON.Vector3(p.x, p.y, -wz));
+    const backPath = outlinePath.map(p => new BABYLON.Vector3(p.x, p.y, wz));
+    makeStrokeTube(`open_${index}_edgeFront`, frontPath, edgeSwr, K3D_BLACK, x, y, z, rotZ);
+    makeStrokeTube(`open_${index}_edgeBack`, backPath, edgeSwr, K3D_BLACK, x, y, z, rotZ);
+    // Z-AXIS EDGES: front/back loops only outline the perimeter as seen face-on;
+    // without a tube connecting each corner's front point to its back point,
+    // the depth walls between corners still show as bare, unbordered seams
+    // when viewed from an oblique angle. Only at true corners though - the
+    // semiCircle's curved edge is ~48 points, and a radial tube at every one
+    // of those (crossed with the tangential front/back loops) reads as a
+    // grid of little bordered cells instead of a clean curved rim.
+    const zEdgePts = shape.type === 'semiCircle'
+      ? [outlinePath[0], outlinePath[outlinePath.length - 1]]
+      : outlinePath;
+    zEdgePts.forEach((p, k) => {
+      makeStrokeTube(`open_${index}_edgeZ${k}`, [
+        new BABYLON.Vector3(p.x, p.y, -wz),
+        new BABYLON.Vector3(p.x, p.y, wz)
+      ], edgeSwr, K3D_BLACK, x, y, z, rotZ);
+    });
   }
   return true;
 }
@@ -1285,7 +1381,7 @@ function lineTubeAbsolute(name, pts2D, w2D, col, layerZ, zTilt = 0) {
   const tube = BABYLON.MeshBuilder.CreateTube(name, {
     path: path,
     radius: radius,
-    tessellation: 8,
+    tessellation: 16, // was 8: visibly faceted/blocky on large or close-up curves
     cap: BABYLON.Mesh.CAP_ALL
   }, babylonScene);
   tube.material = unlitMat(name + '_mat', p5ColToRGBA(col));
@@ -1457,11 +1553,19 @@ window.isBabylonSceneReady = function () {
   return !!(babylonScene && babylonScene.meshes.some(m => !m.name.startsWith('skyFace_')));
 };
 
-// Best representative flat color for a mesh's material (matches how unlitMat
-// assigns emissiveColor = the true 2D paint color, with sensible fallbacks
-// for texture-based materials that have no flat color)
+// Best representative flat color for a mesh (checks the exact color tagged
+// by unlitMat()/createOpenShape3D() first, then falls back to material
+// properties/texture sampling for anything untagged)
 function meshExportColor(mesh) {
+  if (mesh.metadata && mesh.metadata.exportColor) {
+    const ec = mesh.metadata.exportColor;
+    return { c: new BABYLON.Color3(ec.r, ec.g, ec.b), a: ec.a !== undefined ? ec.a : 1 };
+  }
   const mat = mesh.material;
+  if (mat && mat.metadata && mat.metadata.exportColor) {
+    const ec = mat.metadata.exportColor;
+    return { c: new BABYLON.Color3(ec.r, ec.g, ec.b), a: ec.a !== undefined ? ec.a : 1 };
+  }
   if (mat && mat.emissiveColor && (mat.emissiveColor.r + mat.emissiveColor.g + mat.emissiveColor.b) > 0.004) {
     return { c: mat.emissiveColor, a: mat.alpha !== undefined ? mat.alpha : 1 };
   }
@@ -1505,24 +1609,168 @@ function downloadTextFile(filename, contents, mime) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+// Minimal dependency-free ZIP writer (STORE method, i.e. uncompressed - the
+// files are small text, so compression isn't worth the code). Needed because
+// browsers silently block a page's second auto-triggered download in the
+// same action: exporting .obj + .mtl separately meant the .mtl (color data)
+// never actually landed on disk, so Rhino always saw flat grey.
+function crc32(bytes) {
+  let table = crc32.table;
+  if (!table) {
+    table = crc32.table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[n] = c >>> 0;
+    }
+  }
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function buildZip(files) {
+  // files: [{ name, data: Uint8Array }]
+  const encoder = new TextEncoder();
+  const localParts = [], centralParts = [];
+  let offset = 0;
+
+  files.forEach(f => {
+    const nameBytes = encoder.encode(f.name);
+    const data = f.data;
+    const crc = crc32(data);
+    const localHeader = new DataView(new ArrayBuffer(30));
+    localHeader.setUint32(0, 0x04034b50, true);   // local file header signature
+    localHeader.setUint16(4, 20, true);            // version needed
+    localHeader.setUint16(6, 0, true);             // flags
+    localHeader.setUint16(8, 0, true);             // method: 0 = store
+    localHeader.setUint16(10, 0, true);            // mod time
+    localHeader.setUint16(12, 0, true);            // mod date
+    localHeader.setUint32(14, crc, true);
+    localHeader.setUint32(18, data.length, true);  // compressed size
+    localHeader.setUint32(22, data.length, true);  // uncompressed size
+    localHeader.setUint16(26, nameBytes.length, true);
+    localHeader.setUint16(28, 0, true);            // extra field length
+
+    localParts.push(new Uint8Array(localHeader.buffer), nameBytes, data);
+
+    const centralHeader = new DataView(new ArrayBuffer(46));
+    centralHeader.setUint32(0, 0x02014b50, true);  // central directory signature
+    centralHeader.setUint16(4, 20, true);
+    centralHeader.setUint16(6, 20, true);
+    centralHeader.setUint16(8, 0, true);
+    centralHeader.setUint16(10, 0, true);
+    centralHeader.setUint16(12, 0, true);
+    centralHeader.setUint16(14, 0, true);
+    centralHeader.setUint32(16, crc, true);
+    centralHeader.setUint32(20, data.length, true);
+    centralHeader.setUint32(24, data.length, true);
+    centralHeader.setUint16(28, nameBytes.length, true);
+    centralHeader.setUint16(30, 0, true);
+    centralHeader.setUint16(32, 0, true);
+    centralHeader.setUint16(34, 0, true);
+    centralHeader.setUint16(36, 0, true);
+    centralHeader.setUint32(38, 0, true);
+    centralHeader.setUint32(42, offset, true);     // offset of local header
+
+    centralParts.push(new Uint8Array(centralHeader.buffer), nameBytes);
+
+    offset += 30 + nameBytes.length + data.length;
+  });
+
+  const centralStart = offset;
+  let centralSize = 0;
+  centralParts.forEach(p => centralSize += p.length);
+
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0, 0x06054b50, true);
+  eocd.setUint16(4, 0, true);
+  eocd.setUint16(6, 0, true);
+  eocd.setUint16(8, files.length, true);
+  eocd.setUint16(10, files.length, true);
+  eocd.setUint32(12, centralSize, true);
+  eocd.setUint32(16, centralStart, true);
+  eocd.setUint16(20, 0, true);
+
+  return new Blob([...localParts, ...centralParts, new Uint8Array(eocd.buffer)], { type: 'application/zip' });
+}
+
+// Builds a solid prism (top cap + bottom cap + side walls) from a flat 2D
+// polygon (local XY, closed loop not required) extruded +/- depth/2 along Z.
+// Used to give "open" shapes real volume in the OBJ export, matching how
+// every other shape has actual depth rather than a flat 0-thickness face.
+function polygonPrismGeometry(poly2D, depth) {
+  const n = poly2D.length;
+  const half = depth / 2;
+  const positions = [];
+  const indices = [];
+  // Top cap (z = +half), bottom cap (z = -half): fan triangulated
+  for (let i = 0; i < n; i++) positions.push(poly2D[i].x, poly2D[i].y, half);
+  for (let i = 0; i < n; i++) positions.push(poly2D[i].x, poly2D[i].y, -half);
+  for (let i = 1; i + 1 < n; i++) indices.push(0, i, i + 1);               // top cap
+  for (let i = 1; i + 1 < n; i++) indices.push(n, n + i + 1, n + i);       // bottom cap (reversed)
+  // Side walls: one quad (2 triangles) per polygon edge
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    const t0 = i, t1 = j, b0 = n + i, b1 = n + j;
+    indices.push(t0, t1, b1, t0, b1, b0);
+  }
+  return { positions, indices };
+}
+
+function downloadZip(filename, files) {
+  const blob = buildZip(files);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // Exports every artwork mesh (skybox excluded) as a single OBJ + companion
 // MTL, one material per mesh so each shape keeps its flat 2D color in Rhino.
-// Babylon uses a left-handed coordinate system; OBJ/Rhino expect right-handed,
-// so Z is negated and triangle winding reversed to keep normals/faces correct.
+// Axes are remapped so the piece opens standing upright facing the viewer in
+// Rhino's FRONT view, not lying flat in Top view: Babylon's Y (2D "up") becomes
+// Rhino Z (up), and Babylon's Z (camera depth/layering) becomes Rhino Y (the
+// axis Front view looks along). This remap has the same net handedness flip
+// as a straight left-handed -> right-handed conversion, so the same triangle
+// winding reversal below keeps faces/normals correct.
+const EXPORT_OBJ_PASSWORD = '12345';
+
 window.exportSceneToOBJ = function () {
+  const entered = window.prompt('Enter password to export the 3D model:');
+  if (entered === null) return; // cancelled
+  if (entered !== EXPORT_OBJ_PASSWORD) {
+    alert('Incorrect password.');
+    return;
+  }
+
   if (!babylonScene) {
     console.warn('No 3D scene to export yet - enter 3D mode first');
     return;
   }
   const meshes = babylonScene.meshes.filter(m =>
-    !m.name.startsWith('skyFace_') && m.isEnabled() && m.getTotalVertices() > 0
+    !m.name.startsWith('skyFace_') && m.isEnabled() && m.getTotalVertices() > 0 &&
+    !(m.metadata && m.metadata.skipExport)
   );
   if (meshes.length === 0) {
     console.warn('Nothing to export - no artwork meshes found');
     return;
   }
 
-  const objLines = ['# Kandinsky 3D export', 'mtllib scene.mtl', ''];
+  // Unique, matching filenames every export - if the .obj always said
+  // "mtllib scene.mtl" but you'd already downloaded one before, the browser
+  // saves the new one as "scene (1).mtl" and the .obj silently points at a
+  // file that no longer matches, so Rhino can't find it and every shape
+  // falls back to flat grey. A timestamp keeps every pair self-consistent.
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const objFilename = `kandinsky-3d-${stamp}.obj`;
+  const mtlFilename = `kandinsky-3d-${stamp}.mtl`;
+
+  const objLines = ['# Kandinsky 3D export', `mtllib ${mtlFilename}`, ''];
   const mtlLines = [];
   let vertexOffset = 0;
   const seenColors = new Map(); // dedupe identical colors into one material
@@ -1530,8 +1778,21 @@ window.exportSceneToOBJ = function () {
   meshes.forEach((mesh, mi) => {
     mesh.computeWorldMatrix(true);
     const world = mesh.getWorldMatrix();
-    const positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
-    const indices = mesh.getIndices();
+
+    // "Open" shapes (openRect/openTriangle/openSemiCircle) tag their front
+    // plane with the true polygon footprint - plain OBJ/MTL can't carry the
+    // texture-alpha silhouette, so use the real shape outline (extruded into
+    // an actual solid prism, matching the real depth every other shape has)
+    // instead of the full padded rectangle the plane mesh actually is
+    let positions, indices;
+    if (mesh.metadata && mesh.metadata.exportPolygon) {
+      const built = polygonPrismGeometry(mesh.metadata.exportPolygon, mesh.metadata.exportDepth || 0);
+      positions = built.positions;
+      indices = built.indices;
+    } else {
+      positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
+      indices = mesh.getIndices();
+    }
     if (!positions || !indices || indices.length < 3) return;
 
     const { c, a } = meshExportColor(mesh);
@@ -1551,7 +1812,11 @@ window.exportSceneToOBJ = function () {
       );
     }
 
-    objLines.push(`o ${mesh.name.replace(/\s+/g, '_')}_${mi}`, `usemtl ${matName}`);
+    // Both "o" (object) and "g" (group) tags: Rhino's OBJ import dialog can
+    // optionally split objects into separate layers by object/group/material,
+    // so each shape stays independently selectable/colorable either way
+    const objName = `${mesh.name.replace(/\s+/g, '_')}_${mi}`;
+    objLines.push(`o ${objName}`, `g ${objName}`, `usemtl ${matName}`);
 
     const vertCount = positions.length / 3;
     for (let i = 0; i < vertCount; i++) {
@@ -1559,8 +1824,9 @@ window.exportSceneToOBJ = function () {
         new BABYLON.Vector3(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]),
         world
       );
-      // Left-handed -> right-handed: negate Z
-      objLines.push(`v ${p.x.toFixed(5)} ${p.y.toFixed(5)} ${(-p.z).toFixed(5)}`);
+      // Stand the piece up for Rhino's Front view: Rhino Y = Babylon Z (depth),
+      // Rhino Z = Babylon Y (up)
+      objLines.push(`v ${p.x.toFixed(5)} ${p.z.toFixed(5)} ${p.y.toFixed(5)}`);
     }
 
     for (let i = 0; i + 2 < indices.length; i += 3) {
@@ -1574,9 +1840,15 @@ window.exportSceneToOBJ = function () {
     vertexOffset += vertCount;
   });
 
-  downloadTextFile('kandinsky-3d.obj', objLines.join('\n') + '\n', 'text/plain');
-  downloadTextFile('scene.mtl', mtlLines.join('\n') + '\n', 'text/plain');
-  console.log(`Exported ${meshes.length} meshes to kandinsky-3d.obj / scene.mtl`);
+  // ONE zip download (not two separate file downloads) - browsers silently
+  // block a page's second auto-triggered download, which meant the .mtl
+  // (all the color data) was never actually reaching disk before
+  const encoder = new TextEncoder();
+  downloadZip(`kandinsky-3d-${stamp}.zip`, [
+    { name: objFilename, data: encoder.encode(objLines.join('\n') + '\n') },
+    { name: mtlFilename, data: encoder.encode(mtlLines.join('\n') + '\n') }
+  ]);
+  console.log(`Exported ${meshes.length} meshes to kandinsky-3d-${stamp}.zip (unzip, then import the .obj into Rhino)`);
 };
 
 console.log('✅ babylon3D.js loaded!');
