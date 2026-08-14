@@ -299,8 +299,16 @@ function checkCompletion() {
 // clicking "3D" itself fires p5's global mousePressed and spawns a shape.
 function isUiEvent(event) {
     if (typeof is3DMode !== 'undefined' && is3DMode) return true;
+    // USER MODE: no drawing until the setup screen has been dismissed, so a
+    // stray click behind/through the overlay can't start a composition with
+    // settings the user hasn't confirmed yet.
+    if (userSetupPending) return true;
+    // #palette-toast is a SIBLING of #controls, not a child - without it
+    // listed here, tapping the toast (the one palette affordance built for
+    // touch, where the desktop-only hamburger doesn't exist) fell through to
+    // p5 and started a new shape behind the panel it opened.
     return !!(event && event.target && event.target.closest &&
-        event.target.closest('#controls, #instructions, #menu-dropdown'));
+        event.target.closest('#controls, #instructions, #menu-dropdown, #setup-overlay, #palette-toast'));
 }
 
 function mouseDragged(event) {
@@ -468,6 +476,11 @@ function weightedRandom(options) {
 
 function handleDrag() {
   console.log('handleDrag()');
+  // USER MODE gate, enforced here rather than only in isUiEvent(): the TOUCH
+  // path (handleTouchMove) calls this directly and never consults
+  // isUiEvent, so a swipe on a phone would otherwise start drawing behind
+  // the setup overlay. This is the one choke point every entry path shares.
+  if (userSetupPending) return false;
   if (totalElementsCreated >= MAX_ELEMENTS) return false;
 
   let now = millis();
@@ -576,22 +589,27 @@ function createShapeElement(anchor) {
     // Definitive list for ornament shapes from KandinskyShape class
     availableTypes = ['circle', 'rect', 'triangle', 'semiCircle', 'openRect', 'openTriangle', 'openSemiCircle', 'halo', 'concentricCircle', 'concentricArc', 'squiggle', 'arc'];
   }
-
+  // USER MODE: every type stays available - the user's picks are FEATURED,
+  // never exclusive. Variety enforcement still introduces each type once,
+  // but preferred types are introduced FIRST so they establish the look
+  // early, and the weighted draw below then leans heavily toward them.
   const missingTypes = availableTypes.filter(t => !createdShapeTypes.has(t));
+  const missingPreferred = missingTypes.filter(isPreferredShape);
+  const introduceFrom = missingPreferred.length > 0 ? missingPreferred : missingTypes;
 
   if (missingTypes.length > 0) {
-    shapeType = random(missingTypes);
+    shapeType = random(introduceFrom);
     console.log(`  Enforcing variety: selected missing type '${shapeType}'`);
   } else {
     // All required types have been created, proceed with weighted random
     if (shapeCounter <= 2) {
-      shapeType = weightedRandom([
+      shapeType = weightedRandom(weightByPreference([
         { value: 'openRect', weight: 33 },
         { value: 'openTriangle', weight: 33 },
         { value: 'openSemiCircle', weight: 34 },
-      ]);
+      ]));
     } else {
-      shapeType = weightedRandom([
+      shapeType = weightedRandom(weightByPreference([
         { value: 'circle', weight: 6 },
         { value: 'rect', weight: 6 },
         { value: 'triangle', weight: 6 },
@@ -604,7 +622,7 @@ function createShapeElement(anchor) {
         { value: 'concentricArc', weight: 8 },
         { value: 'squiggle', weight: 8 },
         { value: 'arc', weight: 8 },
-      ]);
+      ]));
       if (shapeType && shapeType.value) shapeType = shapeType.value;
     }
   }
@@ -763,13 +781,26 @@ class LatticeAnim {
                                 this.v2.copy().mult(j+1)),
             p01 = p5.Vector.add(this.v1.copy().mult(i),
                                 this.v2.copy().mult(j+1));
-        // Generate completely unique color for each cell - full spectrum including whites/blacks
-        let col = color(
-          random(360),        // Full hue range (0-360)
-          random(0, 100),     // Full saturation range (0-100) - includes grays/whites
-          random(20, 90),     // Full brightness range (20-90) - includes darks and lights
-          this.fillAlpha      // Maintain proper alpha
-        );
+        // Cell colour drawn from the composition's PALETTE. This was a
+        // full-spectrum random(360) per cell ("completely unique colour for
+        // each cell"), which left every lattice a rainbow patchwork no
+        // matter what palette was chosen - the single most obviously
+        // off-palette element in the piece. The per-cell jitter below is
+        // deliberately wider than elsewhere so the mosaic keeps its lively,
+        // varied character, but the HUE stays on the palette.
+        let col;
+        if (artistMode) {
+          // Original rule: a completely unique full-spectrum colour per cell
+          col = color(random(360), random(0, 100), random(20, 90), this.fillAlpha);
+        } else {
+          const cellBase = random(palette);
+          col = color(
+            hue(cellBase),
+            constrain(saturation(cellBase) + random(-14, 14), 0, 100),
+            constrain(lightness(cellBase) + random(-20, 20), 12, 92),
+            this.fillAlpha      // Maintain proper alpha
+          );
+        }
         this.cells.push({ poly:[p00,p10,p11,p01], col });
       }
     }
@@ -884,6 +915,12 @@ class SpiralAnim {
 
     const revolutions = opts.revolutions || random(2, 5);
     const endRadius = opts.radius || random(BASE_UNIT * 0.04, BASE_UNIT * 0.08);
+    // Stored on the instance for captureLineReport - these were local-only,
+    // so every spiral's report fell back to its `|| 50` / `|| 3` defaults and
+    // the 3D mode rebuilt EVERY spiral at 50px/3 coils regardless of the
+    // real size drawn in 2D.
+    this.maxRadius = endRadius;
+    this.coils = revolutions;
 
     for (let i = 0; i <= this.steps; i++) {
       const angle = map(i, 0, this.steps, 0, TWO_PI * revolutions);
@@ -992,28 +1029,36 @@ class KandinskyShape {
     this.t     = 0;
     const maxSpeed = map(this.index, 3, 50, SHAPE_SPEED_MAX, SHAPE_SPEED_MAX * 2.5, true);
     this.speed = random(SHAPE_SPEED_MIN, maxSpeed);
-    const colorfulPalette = palette.filter(c => brightness(c) >= 15 && brightness(c) < 85);
+    // Fall back to the WHOLE palette when this brightness filter would strip
+    // it down to almost nothing - which it does for pale/pastel palettes,
+    // where most entries sit above the 85 cutoff. An emptied pool silently
+    // sent every shape down generateShapeColor's palette-less random path,
+    // so the softest palettes were exactly the ones least adhered to.
+    const brightEnough = palette.filter(c => brightness(c) >= 15 && brightness(c) < 85);
+    const colorfulPalette = brightEnough.length >= 2 ? brightEnough : palette.slice();
     this.palette = colorfulPalette;
 
     if (this.index <= 2) {
         let selectedColor;
         if (firstTwoShapeColors.length === 0) {
-            if (colorfulPalette.length > 0) {
-                selectedColor = random(colorfulPalette);
-            } else { 
-                let c1 = random(palette);
-                selectedColor = color(hue(c1), saturation(c1), random(40, 70));
-            }
-        } 
+            selectedColor = random(colorfulPalette);
+        }
         else {
-            let firstColor = firstTwoShapeColors[0];
-            let hueShift = random(90, 270); 
-            let newHue = (hue(firstColor) + hueShift) % 360;
-
-            let newSaturation = random(70, 100);
-            let newLightness = random(50, 85);
-
-            selectedColor = color(newHue, newSaturation, newLightness);
+            // Second skeleton shape: take the PALETTE entry that contrasts
+            // most with the first, rather than rotating the first colour's
+            // hue by an arbitrary 90-270 degrees. These two are the largest
+            // shapes in the composition, so an invented hue here was the
+            // most conspicuous break from the chosen palette of all.
+            const firstColor = firstTwoShapeColors[0];
+            if (artistMode) {
+                // Original rule: rotate the first shape's hue by an
+                // arbitrary 90-270 degrees, off-palette by design
+                selectedColor = color((hue(firstColor) + random(90, 270)) % 360,
+                                      random(70, 100), random(50, 85));
+            } else {
+                selectedColor = colorfulPalette.slice().sort((a, b) =>
+                    paletteColorDistance(b, firstColor) - paletteColorDistance(a, firstColor))[0];
+            }
         }
         this.c = selectedColor;
         this.c2 = selectedColor; 
@@ -1054,13 +1099,7 @@ class KandinskyShape {
         this.style = "normal";
         this.rings = floor(random(3, 8));
         this.diff = this.targetSize * random(0.01, 0.035);
-        this.concentricColors = [];
-        let lastColor = null;
-        for (let i = 0; i < this.rings; i++) {
-            const newColor = generateShapeColor(this.palette, lastColor);
-            this.concentricColors.push(newColor);
-            lastColor = newColor;
-        }
+        this.concentricColors = paletteRingColors(this.palette, this.rings);
     } else if (this.rawType === "concentricArc") {
         this.type = "concentricArc";
         this.style = "normal";
@@ -1068,24 +1107,20 @@ class KandinskyShape {
         this.diff = this.targetSize * random(0.03, 0.105);
         this.arcStart = random(TWO_PI);
         this.arcSweep = random(PI / 3, TWO_PI);
-        this.concentricColors = [];
-        let lastColor = null;
-        for (let i = 0; i < this.rings; i++) {
-            const newColor = generateShapeColor(this.palette, lastColor);
-            this.concentricColors.push(newColor);
-            lastColor = newColor;
-        }
+        this.concentricColors = paletteRingColors(this.palette, this.rings);
     } else if (this.rawType === "halo") {
         this.type = "circle";
         this.style = "halo";
         this.rings = floor(random(3, 6));
         this.haloColors = [];
         this.haloGradientAngles = [];
+        // >= 2, not > 0: this filter can leave a SINGLE entry (routinely, for
+        // pale or low-saturation palettes), and one entry made every ring of
+        // the halo the identical colour - the glow read as one flat disc.
         const haloPalette = this.palette.filter(c => brightness(c) < 75 && saturation(c) > 30);
-        const colorSource = haloPalette.length > 0 ? haloPalette : this.palette;
+        const colorSource = haloPalette.length >= 2 ? haloPalette : this.palette;
+        this.haloColors = paletteRingColors(colorSource, this.rings);
         for (let i = 0; i < this.rings; i++) {
-            const newColor = generateShapeColor(colorSource, this.haloColors[i - 1]);
-            this.haloColors.push(newColor);
             this.haloGradientAngles.push(random(TWO_PI));
         }
     } else if (this.rawType === "openRect") {
@@ -1426,7 +1461,10 @@ function reset() {
   firstTwoShapeColors = []; // Reset first two shape colors
 
   // Determine number of lattices (1, 2, or 3) and assign their slots.
-  const numLattices = floor(random(1, 4)); // 1, 2, or 3
+  // USER MODE: lattices aren't a KandinskyShape type - they're scheduled
+  // here by slot, so featuring them means generating more of them (see
+  // latticeCount) rather than re-weighting a draw. They always appear.
+  const numLattices = latticeCount();
   latticeSlots = [];
   let lastSlot = 3; // Start after the first two skeleton shapes
   for (let i = 0; i < numLattices; i++) {
@@ -1541,7 +1579,89 @@ function updateAnchorPositions() {
 // Centralized function to generate varied colors for all shapes.
 // Pass a palette to use it, or null to generate a fully random color.
 // Pass a colorToAvoid to ensure the new color is different.
+// Fisher-Yates on a copy, via random() so it still honours randomSeed
+// (p5's own shuffle() would too, but this keeps the dependency explicit).
+function shufflePalette(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = floor(random(i + 1));
+        const t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    return a;
+}
+
+// Colours for a stack of rings (concentricCircle / concentricArc / halo),
+// drawn as DISTINCT palette entries the way lattice cells spread across the
+// palette. Each ring used to be generated independently - which only avoided
+// the immediately previous ring, so with 3-8 rings against 5 colours one
+// entry could easily dominate a bullseye and the palette's spread never
+// showed. Deals the palette out shuffled and walks it, reshuffling when the
+// rings outnumber the colours, so every entry appears before any repeats.
+function paletteRingColors(pool, count) {
+    // Artist's Palette keeps the original per-ring free-ranging behaviour.
+    if (artistMode) {
+        const out = [];
+        let last = null;
+        for (let i = 0; i < count; i++) { const c = generateShapeColor(null, last); out.push(c); last = c; }
+        return out;
+    }
+    const src = (pool && pool.length > 0) ? pool : (palette || []);
+    if (src.length === 0) {
+        const out = [];
+        let last = null;
+        for (let i = 0; i < count; i++) { const c = generateShapeColor(null, last); out.push(c); last = c; }
+        return out;
+    }
+    const out = [];
+    let bag = [];
+    for (let i = 0; i < count; i++) {
+        if (bag.length === 0) {
+            bag = shufflePalette(src);
+            // don't let a reshuffle repeat the colour across the seam
+            if (out.length > 0 && bag.length > 1 && hue(bag[0]) === hue(out[out.length - 1])) bag.push(bag.shift());
+        }
+        const base = bag.shift();
+        // slight tonal jitter so repeated entries in a long stack still read
+        // as separate rings, with the hue staying exactly on the palette
+        out.push(color(
+            hue(base),
+            constrain(saturation(base) + random(-5, 5), 4, 100),
+            constrain(lightness(base) + random(-7, 7), 6, 94)
+        ));
+    }
+    return out;
+}
+
 function generateShapeColor(palette, colorToAvoid) {
+    // DRAW FROM THE PALETTE. This function accepted a `palette` argument and
+    // never read it - every colour came from the drifting global baseHue
+    // below instead - so the palette reached almost nothing in the
+    // composition. Harmless while palettes were an invisible internal
+    // detail; the moment the user could CHOOSE one, it meant their choice
+    // was ignored by nearly every shape.
+    const pool = (!artistMode && palette && palette.length > 0) ? palette : null;
+    if (pool) {
+        let candidates = pool.slice();
+        if (colorToAvoid && candidates.length > 2) {
+            // Prefer entries that contrast with the previous colour, so
+            // neighbouring shapes stay distinguishable without ever leaving
+            // the palette.
+            candidates.sort((a, b) => paletteColorDistance(b, colorToAvoid) - paletteColorDistance(a, colorToAvoid));
+            candidates = candidates.slice(0, Math.max(2, Math.ceil(candidates.length / 2)));
+        }
+        const base = random(candidates);
+        // Small tonal jitter so shapes don't read as flat repeated swatches.
+        // HUE is left exactly on the palette entry - that is what makes the
+        // composition legibly "this palette" rather than merely near it.
+        return color(
+            hue(base),
+            constrain(saturation(base) + random(-6, 6), 4, 100),
+            constrain(lightness(base) + random(-8, 8), 6, 94)
+        );
+    }
+
+    // No palette supplied (callers that deliberately pass null): original
+    // fully-random behaviour, unchanged.
     let newColor;
     let attempts = 0;
 
@@ -1561,32 +1681,296 @@ function generateShapeColor(palette, colorToAvoid) {
     return newColor;
 }
 
+// —————————————————————————————————————
+// USER MODE: pre-draw palette + shape preferences
+// —————————————————————————————————————
+// The user picks a palette and which shape types they want BEFORE drawing,
+// so a composition's look/feel is directed rather than fully random. Both
+// preferences are module state (not per-composition), so they survive
+// reset() - re-rolling the composition keeps the chosen look, which is the
+// whole point. `null`/empty on either means "no preference: behave exactly
+// as before," so classic random mode is still the untouched default path.
+// "ARTIST'S PALETTE": the original, unconstrained colour behaviour from
+// before palettes were selectable - shapes, lattice cells and the second
+// skeleton each invent their own colour across the full spectrum rather than
+// drawing from a five-colour set. Kept as a real mode rather than a bug,
+// because that free-ranging clash is a legitimate look (and the one the
+// piece was originally built around).
+let artistMode = false;
+let lockedPalette = null;        // array of p5 colors, or null for random-per-reset
+let preferredShapeTypes = null;  // array of type strings, or null for all
+let paletteCandidates = [];      // p5-color arrays backing the setup screen's swatches
+let userSetupPending = true;     // blocks drawing until the setup screen is dismissed
+
+// The user's picks are FEATURED, not exclusive: EVERY shape type still
+// appears in the composition, but a chosen one shows up far more often.
+// (This deliberately replaced an earlier filtering behaviour - excluding
+// types outright thinned compositions out and lost the variety the piece
+// depends on.)
+function isPreferredShape(t) {
+  return !!preferredShapeTypes && preferredShapeTypes.includes(t);
+}
+
+// How much likelier a preferred type is than an unpreferred one in the
+// weighted draw - high enough to genuinely dominate, while still leaving
+// every other type a real chance to turn up.
+const PREFERRED_WEIGHT_BOOST = 6;
+function weightByPreference(options) {
+  if (!preferredShapeTypes || preferredShapeTypes.length === 0) return options;
+  return options.map(o => isPreferredShape(o.value)
+    ? { value: o.value, weight: o.weight * PREFERRED_WEIGHT_BOOST }
+    : o);
+}
+
+// Lattices are scheduled by SLOT in reset() rather than drawn from a shape-
+// type list, so featuring them means generating MORE of them rather than
+// re-weighting a draw. They always appear either way; the preference only
+// shifts how many.
+function latticeCount() {
+  if (!preferredShapeTypes || preferredShapeTypes.length === 0) return floor(random(1, 4)); // classic: 1-3
+  return isPreferredShape('lattice') ? floor(random(2, 5)) : floor(random(1, 3));           // featured: 2-4, else 1-2
+}
+
+// Generate `n` candidate palettes for the setup screen using the REAL
+// generator below, so what the user previews is exactly what they get -
+// no separately-maintained preview implementation that could drift. Returns
+// hex strings for the HTML swatches; the p5 colors stay here.
+window.getPaletteCandidates = function (n = 6) {
+  paletteCandidates = [];
+  const prevLock = lockedPalette;
+  lockedPalette = null; // always generate fresh candidates, never echo the locked one
+  for (let i = 0; i < n; i++) paletteCandidates.push(getPalette());
+  lockedPalette = prevLock;
+  return paletteCandidates.map(p => p.map(c => c.toString('#rrggbb')));
+};
+
+// Apply the setup screen's choices and start a fresh composition.
+// paletteIndex: index into the last getPaletteCandidates() result, or null
+// for "surprise me" (a new random palette on every reset, the classic
+// behavior). shapeTypes: array of chosen type strings, or null for all.
+window.applyUserSettings = function (opts) {
+  const o = opts || {};
+  artistMode = !!o.artist;
+  lockedPalette = (!artistMode && o.paletteIndex != null && paletteCandidates[o.paletteIndex])
+    ? paletteCandidates[o.paletteIndex]
+    : null;
+  preferredShapeTypes = (Array.isArray(o.shapeTypes) && o.shapeTypes.length > 0)
+    ? o.shapeTypes.slice()
+    : null;
+  userSetupPending = false;
+  console.log('🎨 User settings applied:', {
+    palette: artistMode ? "artist's palette (original unconstrained colours)"
+      : lockedPalette ? lockedPalette.map(c => c.toString('#rrggbb')) : 'random each reset',
+    shapes: preferredShapeTypes || 'all types'
+  });
+  // Cancel any fade/reset cycle still in flight before resetting directly.
+  // Without this, a cycle started by "Reset Composition" would reach its
+  // blackout phase LATER and call reset() a second time, wiping the
+  // composition the user just started - and would leave the screen dimmed
+  // at whatever fadeAlpha it had reached.
+  resetCycleTimestamp = 0;
+  fadeAlpha = 0;
+  resetHasOccurred = false;
+  if (typeof fadeLayer !== 'undefined' && fadeLayer) fadeLayer.clear();
+  reset(); // start clean so the very first element already uses these settings
+};
+
+// ——— MID-COMPOSITION PALETTE CHANGE ———
+// Palettes related to the one currently in use, so a change part-way
+// through reads as the composition EVOLVING rather than restarting in an
+// unrelated key. Each rule transforms the active palette rather than
+// generating from scratch, so all five colours keep their existing
+// relationships (and their mutual distinctness, since hue rotations and
+// uniform tonal shifts preserve the separations getPalette established).
+const PALETTE_SUGGESTIONS = [
+  { label: 'Analogous',  hueShift: 32,  satMul: 1.0,  lightAdd: 0 },
+  { label: 'Complement', hueShift: 180, satMul: 1.0,  lightAdd: 0 },
+  { label: 'Triadic',    hueShift: 120, satMul: 1.0,  lightAdd: 0 },
+  { label: 'Softer',     hueShift: 0,   satMul: 0.5,  lightAdd: 14 },
+  { label: 'Deeper',     hueShift: 0,   satMul: 1.25, lightAdd: -16 },
+];
+
+// The palette actually in use right now (the locked one if there is one,
+// otherwise whatever this composition rolled).
+function activePalette() {
+  return (lockedPalette && lockedPalette.length > 0) ? lockedPalette : (palette || []);
+}
+
+// Populates paletteCandidates - the SAME array the setup screen's indices
+// refer to - so applying a suggestion goes through the existing path.
+window.getPaletteSuggestions = function () {
+  const base = activePalette();
+  if (!base.length) return [];
+  paletteCandidates = PALETTE_SUGGESTIONS.map(rule => base.map(c => color(
+    (hue(c) + rule.hueShift + 360) % 360,
+    constrain(saturation(c) * rule.satMul, 8, 100),
+    constrain(lightness(c) + rule.lightAdd, 12, 92)
+  )));
+  return paletteCandidates.map((p, i) => ({
+    label: PALETTE_SUGGESTIONS[i].label,
+    hex: p.map(c => c.toString('#rrggbb')),
+  }));
+};
+
+// Switch palette WITHOUT resetting. Everything already drawn keeps its
+// colours - lines, lattices and completed shapes are baked into persistent
+// graphics layers and cannot be recoloured retroactively - so the change
+// applies from here on, which is also the point: the composition shifts key
+// partway through rather than starting over.
+window.changePaletteFromHere = function (opts) {
+  const o = opts || {};
+  artistMode = !!o.artist;
+  lockedPalette = (!artistMode && o.paletteIndex != null && paletteCandidates[o.paletteIndex])
+    ? paletteCandidates[o.paletteIndex]
+    : null;
+  // `palette` is the global every element actually reads, so refresh it now
+  // instead of waiting for a reset that isn't coming.
+  palette = getPalette();
+  userSetupPending = false;
+  console.log('🎨 Palette changed mid-composition:', artistMode
+    ? "artist's palette" : palette.map(c => c.toString('#rrggbb')).join(' '));
+};
+
+// Progress readout for the UI - lets the palette hint appear once the
+// composition is genuinely under way rather than on an empty canvas.
+window.getCompositionProgress = function () {
+  return { created: totalElementsCreated, max: MAX_ELEMENTS, setupPending: userSetupPending };
+};
+
+// Re-open the setup screen: blocks drawing again until it's dismissed.
+window.beginUserSetup = function () { userSetupPending = true; };
+window.isUserSetupPending = function () { return userSetupPending; };
+
+// Perceptual-ish separation between two palette entries (hue wraps at 360).
+// Hue carries the most weight, then lightness, then saturation - matching
+// how obviously different two swatches READ side by side.
+function paletteColorDistance(a, b) {
+  const rawH = Math.abs(hue(a) - hue(b));
+  // Hue counts for less as colours desaturate: two greys of different hue
+  // look alike, two vivid ones don't. Without this the metric badly
+  // overstates how distinct a muted or pastel palette is.
+  const satFactor = 0.4 + 0.6 * ((saturation(a) + saturation(b)) / 200);
+  const dh = (Math.min(rawH, 360 - rawH) / 180) * satFactor;
+  const ds = Math.abs(saturation(a) - saturation(b)) / 100;
+  const dl = Math.abs(lightness(a) - lightness(b)) / 100;
+  return Math.sqrt(dh * dh * 1.4 + ds * ds * 0.5 + dl * dl * 1.0);
+}
+// TONES widen the palette space well beyond the old vivid-only range. The
+// generator used to floor saturation at 40, so every palette came out
+// saturated - which also made every muted/pastel Pantone name unreachable.
+// Each tone carries its own minimum-distance threshold: a pastel palette's
+// colours genuinely sit closer together (that is what makes it pastel), so
+// holding it to the vivid threshold would be impossible, not rigorous.
+const PALETTE_TONES = {
+  vivid: { satMin: 45, satMax: 95, lightMin: 30, lightMax: 88, minDist: 0.22 },
+  muted: { satMin: 18, satMax: 58, lightMin: 28, lightMax: 82, minDist: 0.17 },
+  soft:  { satMin: 12, satMax: 45, lightMin: 45, lightMax: 93, minDist: 0.13 },
+};
+
+// The palette generator exactly as it was before tones/stratification were
+// introduced - used by ARTIST'S PALETTE so that mode reproduces the original
+// look faithfully rather than approximating it.
+function getArtistPalette() {
+  const baseH = random(360);
+  const scheme = random(['mono', 'comp', 'split', 'triad', 'analog']);
+  const p = [];
+  const satMin = 40, satMax = 95, lightMin = 30, lightMax = 90;
+  let guard = 0;
+  while (p.length < 5 && guard++ < 500) {
+    let c;
+    if (scheme === 'mono') {
+      c = color(baseH, random(satMin, satMax), random(lightMin, lightMax));
+    } else if (scheme === 'comp') {
+      c = color((baseH + (p.length % 2) * 180) % 360, random(satMin, satMax), random(lightMin, lightMax));
+    } else if (scheme === 'split') {
+      c = color((baseH + (p.length % 3 > 0 ? 150 : 0) + (p.length % 3 === 2 ? 60 : 0)) % 360, random(satMin, satMax), random(lightMin, lightMax));
+    } else if (scheme === 'triad') {
+      c = color((baseH + (p.length % 3) * 120) % 360, random(satMin, satMax), random(lightMin, lightMax));
+    } else {
+      c = color((baseH + (p.length - 2) * 30 + 360) % 360, random(satMin, satMax), random(lightMin, lightMax));
+    }
+    if (brightness(c) < 95) p.push(c);
+  }
+  while (p.length < 5) p.push(color(baseH, satMin, lightMin)); // guard exhausted - never return a short palette
+  return p;
+}
+
 function getPalette() {
+  // A user-locked palette wins over the random generator, on every reset -
+  // that persistence is what makes the chosen look actually stick.
+  if (lockedPalette && lockedPalette.length > 0) return lockedPalette.slice();
+  if (artistMode) return getArtistPalette();
   let baseHue = random(360);
   let scheme = random(['mono', 'comp', 'split', 'triad', 'analog']);
   let p = [];
-  
-  // Expanded saturation and lightness ranges for more variety
-  const satMin = 40, satMax = 95;
-  const lightMin = 30, lightMax = 90;
 
-    while (p.length < 5) {
-    let newColor;
+  // Pick a TONE first (vivid / muted / soft-pastel), then work inside its
+  // own saturation + lightness ranges - see PALETTE_TONES.
+  const toneName = random(['vivid', 'vivid', 'muted', 'soft']); // vivid stays the most common
+  const tone = PALETTE_TONES[toneName];
+  const satMin = tone.satMin, satMax = tone.satMax;
+  const lightMin = tone.lightMin, lightMax = tone.lightMax;
+  const minDist = tone.minDist;
+  // Two constraints make five DISTINCT colours structurally guaranteed
+  // rather than merely likely:
+  //   1. Stratified lightness - slot i draws from its own fifth of the
+  //      range, so no two entries can share a lightness.
+  //   2. Alternating saturation bands - slot i takes a low or high
+  //      saturation band by parity.
+  // Lightness alone is not enough: five colours across a 60-point range sit
+  // at best 15 apart, and in the single-hue 'mono' scheme (no hue variation
+  // at all, no saturation rule) that was the ONLY separation available - so
+  // adjacent entries could land ~6 apart and render as the same colour
+  // twice. The alternating saturation supplies the extra separation exactly
+  // where hue can't.
+  const band = (lightMax - lightMin) / 5;
+  // Band width scales with the tone's own saturation range - a fixed 22
+  // points would overlap (and so stop separating anything) inside the
+  // narrower muted and soft ranges.
+  const satBandW = (satMax - satMin) * 0.4;
+  const satBand = i => (i % 2 === 0 ? [satMin, satMin + satBandW] : [satMax - satBandW, satMax]);
+
+  while (p.length < 5) {
+    const i = p.length;
+    const lo = lightMin + i * band, hi = lo + band;
+    const [sLo, sHi] = satBand(i);
+    let h;
     if (scheme === 'mono') {
-      newColor = color(baseHue, random(satMin, satMax), random(lightMin, lightMax));
+      h = baseHue;
     } else if (scheme === 'comp') {
-      newColor = color((baseHue + (p.length % 2) * 180) % 360, random(satMin, satMax), random(lightMin, lightMax));
+      h = (baseHue + (i % 2) * 180) % 360;
     } else if (scheme === 'split') {
-      newColor = color((baseHue + (p.length % 3 > 0 ? 150 : 0) + (p.length % 3 === 2 ? 60 : 0)) % 360, random(satMin, satMax), random(lightMin, lightMax));
+      h = (baseHue + (i % 3 > 0 ? 150 : 0) + (i % 3 === 2 ? 60 : 0)) % 360;
     } else if (scheme === 'triad') {
-      newColor = color((baseHue + (p.length % 3) * 120) % 360, random(satMin, satMax), random(lightMin, lightMax));
+      h = (baseHue + (i % 3) * 120) % 360;
     } else { // Analogous
-      newColor = color((baseHue + (p.length - 2) * 30 + 360) % 360, random(satMin, satMax), random(lightMin, lightMax));
+      h = (baseHue + (i - 2) * 30 + 360) % 360;
     }
 
-    if (brightness(newColor) < 95) {
-      p.push(newColor);
+    let chosen = null;
+    for (let attempt = 0; attempt < 40 && !chosen; attempt++) {
+      const cand = color(h, random(sLo, sHi), random(lo, hi));
+      if (brightness(cand) >= 95) continue;
+      if (p.every(o => paletteColorDistance(cand, o) >= minDist)) chosen = cand;
     }
+    // Fallback when the random search keeps colliding: walk a deterministic
+    // grid inside this slot's own bands and keep whichever candidate is
+    // FURTHEST from everything already placed. The old fallback took the
+    // band centre unconditionally - never distance-checked at all - which
+    // is precisely how near-duplicate pairs still slipped through.
+    if (!chosen) {
+      let bestScore = -1;
+      for (let a = 0; a <= 4; a++) {
+        for (let b = 0; b <= 4; b++) {
+          const cand = color(h, sLo + (sHi - sLo) * (a / 4), lo + (hi - lo) * (b / 4));
+          if (brightness(cand) >= 95) continue;
+          const score = p.length ? Math.min(...p.map(o => paletteColorDistance(cand, o))) : 1;
+          if (score > bestScore) { bestScore = score; chosen = cand; }
+        }
+      }
+      if (!chosen) chosen = color(h, (sLo + sHi) / 2, (lo + hi) / 2); // brightness rejected everything
+    }
+    p.push(chosen);
   }
   return p;
 }

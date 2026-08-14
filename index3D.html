@@ -91,6 +91,81 @@
       0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.35); }
       50% { box-shadow: 0 0 0 8px rgba(255, 255, 255, 0); }
     }
+    /* The three satellite buttons flanking the 2D/3D toggle. Identical
+       except for which side they sit on and which mode they belong to, so
+       they share one rule - three near-identical copies had already started
+       to drift. All are available on touch, unlike the desktop-only
+       hamburger menu, which is the only route to any of this on desktop. */
+    #palette-btn, #material-btn, #refresh-btn {
+      position: absolute;
+      bottom: 19px;
+      left: 50%;
+      z-index: 100;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      color: rgba(255, 255, 255, 0.7);
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 12px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      transition: background-color 0.3s, color 0.3s, opacity 0.3s;
+    }
+    #palette-btn:hover, #material-btn:hover, #refresh-btn:hover {
+      background: rgba(255, 255, 255, 0.35);
+      color: rgba(255, 255, 255, 1);
+    }
+    /* 2D pair: refresh left, palette right - both act on the 2D
+       composition, so both stand down in 3D. That leaves the bar reading
+       [refresh] [3D] [palette]: symmetric, 8px either side of the toggle. */
+    #refresh-btn { transform: translateX(-66px); }
+    #palette-btn { transform: translateX(30px); }
+    /* Materials takes the LEFT slot refresh vacates on entering 3D - the
+       pedestal and struts only exist there, and the palette has nothing to
+       change there, so the two swap in and out as exact counterparts. */
+    #material-btn { transform: translateX(-66px); display: none; }
+    body.in-3d #palette-btn,
+    body.in-3d #refresh-btn,
+    body.in-3d #palette-toast { display: none; }
+    body.in-3d #material-btn { display: flex; }
+
+    /* One-time, self-dismissing hint. Deliberately small and low-contrast:
+       a suggestion, not an interruption. */
+    #palette-toast {
+      position: absolute;
+      bottom: 68px;
+      left: 50%;
+      transform: translateX(-50%) translateY(6px);
+      z-index: 99;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(20, 20, 22, 0.62);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      color: rgba(255, 255, 255, 0.82);
+      font-family: 'Forum', serif;
+      font-size: 12px;
+      letter-spacing: 0.2px;
+      padding: 7px 14px;
+      border-radius: 20px;
+      backdrop-filter: blur(6px);
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.5s, transform 0.5s;
+      white-space: nowrap;
+      max-width: 90vw;
+    }
+    #palette-toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+      pointer-events: auto;
+    }
+    #palette-toast .fa-palette { opacity: 0.8; }
+
     #instructions {
       position: absolute;
       top: 60px;
@@ -184,6 +259,307 @@
       margin: 4px 2px;
       width: 100%;
     }
+
+    /* ——— USER MODE: stepped pre-draw setup ——— */
+    #setup-steps {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    #setup-steps .dot {
+      height: 3px;
+      flex: 1;
+      border-radius: 2px;
+      background: rgba(255, 255, 255, 0.16);
+      transition: background-color 0.3s;
+    }
+    #setup-steps .dot.done { background: rgba(255, 255, 255, 0.45); }
+    #setup-steps .dot.active { background: rgba(255, 255, 255, 0.92); }
+    .setup-step[hidden] { display: none; }
+    #setup-nav {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 20px;
+    }
+    #setup-status {
+      flex: 1;
+      font-size: 11.5px;
+      color: rgba(255, 255, 255, 0.42);
+    }
+    #setup-back, #setup-next {
+      font-family: 'Forum', serif;
+      border-radius: 8px;
+      cursor: pointer;
+      letter-spacing: 0.4px;
+    }
+    #setup-back {
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 13px;
+      padding: 9px 16px;
+    }
+    #setup-back:hover { background: rgba(255, 255, 255, 0.1); }
+    #setup-back[hidden] { display: none; }
+    #setup-next {
+      background: rgba(255, 255, 255, 0.92);
+      border: none;
+      color: rgba(18, 18, 20, 0.95);
+      font-size: 14px;
+      padding: 10px 22px;
+    }
+    #setup-next:hover { background: #fff; }
+    #setup-next:disabled { opacity: 0.35; cursor: not-allowed; }
+    /* shape picker */
+    #shape-rows { max-height: 44vh; overflow-y: auto; padding: 2px; }
+    .shape-row {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+      margin-bottom: 8px;
+    }
+    .shape-cell {
+      width: 88px;
+      flex: none;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 10px;
+      padding: 7px 4px 5px;
+      text-align: center;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.03);
+      transition: border-color 0.15s, background-color 0.15s, opacity 0.15s;
+      /* unfeatured, NOT excluded - these shapes still appear in the
+         composition, just less often, so they stay clearly legible */
+      opacity: 0.62;
+    }
+    .shape-cell.on {
+      opacity: 1;
+      border-color: rgba(255, 255, 255, 0.7);
+      background: rgba(255, 255, 255, 0.1);
+    }
+    .shape-cell:hover { border-color: rgba(255, 255, 255, 0.5); }
+    .shape-cell canvas { display: block; margin: 0 auto; width: 62px; height: 62px; }
+    .shape-cell .nm {
+      font-size: 10.5px;
+      color: rgba(255, 255, 255, 0.75);
+      margin-top: 3px;
+      letter-spacing: 0.2px;
+    }
+    #shape-quick { display: flex; gap: 8px; margin-bottom: 9px; align-items: center; }
+    #shape-quick button {
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      color: rgba(255, 255, 255, 0.6);
+      font-family: 'Forum', serif;
+      font-size: 11px;
+      padding: 3px 11px;
+      border-radius: 20px;
+      cursor: pointer;
+    }
+    #shape-quick button:hover { background: rgba(255, 255, 255, 0.1); }
+    /* live palette strip on the shapes step */
+    #palette-strip {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding: 8px 10px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.04);
+    }
+    #palette-strip .lbl {
+      font-size: 11.5px;
+      color: rgba(255, 255, 255, 0.5);
+      flex: none;
+    }
+    #strip-name {
+      font-size: 12.5px;
+      color: rgba(255, 255, 255, 0.85);
+      flex: 1;
+      letter-spacing: 0.3px;
+    }
+    #strip-swatches { display: flex; gap: 3px; flex: none; }
+    #strip-swatches span {
+      width: 20px; height: 20px; border-radius: 4px;
+      border: 1px solid rgba(0,0,0,0.25);
+    }
+    #strip-cycle {
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      color: rgba(255, 255, 255, 0.7);
+      font-family: 'Forum', serif;
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      cursor: pointer;
+      flex: none;
+    }
+    #strip-cycle:hover { background: rgba(255, 255, 255, 0.12); }
+    /* palette names on the palette step */
+    .palette-name {
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.72);
+      flex: none;
+      width: 118px;
+      text-align: left;
+      letter-spacing: 0.2px;
+    }
+
+    #setup-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 300;
+      background: rgba(12, 12, 14, 0.82);
+      backdrop-filter: blur(10px);
+      display: flex;
+      /* NOT align-items:center - with a scrolling flex container, a centred
+         item taller than the viewport overflows in BOTH directions and its
+         top becomes unreachable (you can't scroll up past the start). The
+         panel's own `margin:auto` centres it when there's room and collapses
+         to 0 when there isn't, which is the scrollable case. Landscape
+         phones hit this now that the panel has a third step. */
+      align-items: flex-start;
+      justify-content: center;
+      font-family: 'Forum', serif;
+      color: rgba(255, 255, 255, 0.9);
+      overflow-y: auto;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    #setup-overlay.hidden { display: none; }
+    #setup-panel {
+      margin: auto; /* see #setup-overlay's align-items note */
+      width: min(560px, 100%);
+      background: rgba(28, 28, 32, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 14px;
+      padding: 22px 24px 20px;
+      box-sizing: border-box;
+    }
+    #setup-panel h2 {
+      margin: 0 0 2px 0;
+      font-size: 22px;
+      font-weight: normal;
+      letter-spacing: 0.5px;
+    }
+    #setup-panel .sub {
+      margin: 0 0 18px 0;
+      font-size: 12.5px;
+      color: rgba(255, 255, 255, 0.55);
+    }
+    #setup-panel h3 {
+      margin: 16px 0 8px 0;
+      font-size: 13px;
+      font-weight: normal;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.5);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    #setup-shuffle {
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      color: rgba(255, 255, 255, 0.7);
+      font-family: 'Forum', serif;
+      font-size: 11px;
+      letter-spacing: 0.5px;
+      text-transform: none;
+      padding: 3px 10px;
+      border-radius: 20px;
+      cursor: pointer;
+    }
+    #setup-shuffle:hover { background: rgba(255, 255, 255, 0.12); }
+    #palette-list { display: flex; flex-direction: column; gap: 6px; }
+    .palette-option {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 5px 8px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background-color 0.15s, border-color 0.15s;
+    }
+    .palette-option:hover { background: rgba(255, 255, 255, 0.07); }
+    .palette-option.selected {
+      border-color: rgba(255, 255, 255, 0.75);
+      background: rgba(255, 255, 255, 0.1);
+    }
+    .palette-swatches { display: flex; flex: 1; height: 30px; border-radius: 5px; overflow: hidden; }
+    .palette-swatches span { flex: 1; }
+    .palette-option .tick {
+      width: 15px;
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.9);
+      text-align: center;
+      flex: none;
+    }
+    /* material picker (pedestal + struts) */
+    .mat-row { display: flex; gap: 8px; }
+    .mat-cell {
+      flex: 1 1 0;
+      min-width: 0;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 10px;
+      padding: 7px 6px 8px;
+      background: rgba(255, 255, 255, 0.03);
+      cursor: pointer;
+      text-align: center;
+      transition: border-color 0.15s, background-color 0.15s;
+    }
+    .mat-cell:hover { background: rgba(255, 255, 255, 0.08); }
+    .mat-cell.selected {
+      border-color: rgba(255, 255, 255, 0.78);
+      background: rgba(255, 255, 255, 0.1);
+    }
+    .mat-chip {
+      height: 42px;
+      border-radius: 7px;
+      /* a hairline dark edge so a pale slab still reads as an object
+         against the panel rather than bleeding into it */
+      border: 1px solid rgba(0, 0, 0, 0.4);
+      margin-bottom: 7px;
+    }
+    /* struts are rods, not slabs - show them as one */
+    .mat-row.struts .mat-chip {
+      width: 15px;
+      margin: 0 auto 7px;
+      border-radius: 8px;
+    }
+    .mat-cell .lbl {
+      font-size: 11.5px;
+      letter-spacing: 0.3px;
+      color: rgba(255, 255, 255, 0.7);
+      white-space: nowrap;
+    }
+    .mat-cell.selected .lbl { color: rgba(255, 255, 255, 0.95); }
+@media (max-width: 520px) {
+      #setup-panel { padding: 16px; }
+      #setup-panel h2 { font-size: 19px; }
+      /* Four strut options across a phone leaves ~56px of label room, and
+         "Clear resin" needs ~63px - with nowrap labels they overlapped each
+         other. Two-up keeps every label on one line. The 3 base options and
+         2 lighting options still fit across. */
+      .mat-row.struts { flex-wrap: wrap; }
+      .mat-row.struts .mat-cell { flex: 1 1 calc(50% - 4px); }
+      /* The toast's single line is ~330px; 90vw on a small phone is less
+         than that, and nowrap made it hang off both edges rather than clip. */
+      #palette-toast { white-space: normal; text-align: center; }
+    }
+    /* Touch devices: the 36px side buttons were under the 44px minimum
+       comfortable tap target, and they sit right beside a button that does
+       something quite different (leaving 3D). Offsets shift to keep the same
+       8px gap either side of the 44px-wide mode toggle. */
+    @media (pointer: coarse) {
+      #palette-btn, #material-btn, #refresh-btn { width: 44px; height: 44px; bottom: 15px; }
+      #palette-btn { transform: translateX(30px); }
+      #material-btn, #refresh-btn { transform: translateX(-74px); }
+    }
   </style>
 </head>
 <body>
@@ -195,22 +571,89 @@
       <i id="fullscreen-icon" class="fas fa-expand"></i>
     </button>
     <button id="mode-toggle-btn" disabled title="Toggle 3D mode">3D</button>
+    <button id="palette-btn" title="Change palette">
+      <i class="fas fa-palette"></i>
+    </button>
+    <button id="material-btn" title="Base &amp; strut materials">
+      <i class="fas fa-swatchbook"></i>
+    </button>
+    <button id="refresh-btn" title="Start a new composition">
+      <i class="fas fa-arrows-rotate"></i>
+    </button>
+  </div>
+
+  <div id="palette-toast">
+    <i class="fas fa-palette"></i>
+    <span>You can change the palette any time — the piece keeps what it has</span>
   </div>
 
   <div id="menu-dropdown" class="desktop-only">
     <button id="menu-export-obj" disabled>Export 3D Model (.OBJ)</button>
     <hr>
+    <button id="menu-setup">New Composition…</button>
+    <button id="menu-palette">Change Palette…</button>
+    <button id="menu-materials">Materials…</button>
     <button id="menu-reset">Reset Composition</button>
   </div>
 
+  <!-- USER MODE: stepped setup - palette, then shapes, then preview -->
+  <div id="setup-overlay">
+    <div id="setup-panel">
+      <div id="setup-steps">
+        <div class="dot active"></div><div class="dot"></div><div class="dot"></div>
+      </div>
+
+      <div class="setup-step" data-step="0">
+        <h2>Choose a palette</h2>
+        <p class="sub">Every colour in your composition is drawn from these five.</p>
+        <div id="palette-list"></div>
+        <h3 style="justify-content:flex-start;gap:10px">
+          <button id="setup-shuffle" type="button">Shuffle palettes</button>
+        </h3>
+      </div>
+
+      <div class="setup-step" data-step="1" hidden>
+        <h2>Feature your shapes</h2>
+        <p class="sub">Every shape type still appears — the ones you pick lead the composition.</p>
+        <div id="palette-strip">
+          <span class="lbl">Palette</span>
+          <span id="strip-name"></span>
+          <span id="strip-swatches"></span>
+          <button id="strip-cycle" type="button">Next palette</button>
+        </div>
+        <div id="shape-quick">
+          <button id="shape-all" type="button">Feature all</button>
+          <button id="shape-none" type="button">No preference</button>
+        </div>
+        <div id="shape-rows"></div>
+      </div>
+
+      <div class="setup-step" data-step="2" hidden>
+        <h2>Materials &amp; light</h2>
+        <p class="sub">The pedestal, its support struts, and how the piece is lit — the parts of the sculpture your palette doesn’t decide. All of it appears when you enter 3D.</p>
+        <h3>Base</h3>
+        <div class="mat-row" id="mat-base"></div>
+        <h3>Struts</h3>
+        <div class="mat-row struts" id="mat-strut"></div>
+        <h3>Lighting</h3>
+        <div class="mat-row" id="mat-light"></div>
+      </div>
+
+      <div id="setup-nav">
+        <button id="setup-back" type="button" hidden>Back</button>
+        <div id="setup-status"></div>
+        <button id="setup-next" type="button">Next</button>
+      </div>
+    </div>
+  </div>
+
   <div id="instructions">
-    <h4>🎮 3D Flight Controls</h4>
-    <p class="desktop-ctrl"><strong>Drag</strong> - Look around (360&deg;)</p>
-    <p class="desktop-ctrl"><strong>WASD</strong> - Move around</p>
-    <p class="desktop-ctrl"><strong>Q/E</strong> - Up/Down</p>
+    <h4>🎮 3D Controls</h4>
+    <p class="desktop-ctrl"><strong>Drag</strong> - Orbit around the sculpture</p>
+    <p class="desktop-ctrl"><strong>Scroll</strong> - Zoom in/out</p>
     <p class="desktop-ctrl"><strong>ESC</strong> - Return to 2D</p>
-    <p class="touch-ctrl"><strong>Touch &amp; drag</strong> - Move (anywhere)</p>
-    <p class="touch-ctrl"><strong>Two fingers</strong> - Look around</p>
+    <p class="touch-ctrl"><strong>Swipe</strong> - Orbit around the sculpture</p>
+    <p class="touch-ctrl"><strong>Pinch</strong> - Zoom in/out</p>
   </div>
 
   <!-- Babylon.js -->
@@ -226,7 +669,8 @@
   <script src="https://www.gstatic.com/firebasejs/9.6.10/firebase-storage-compat.js"></script>
 
   <!-- App scripts: ONE project for all devices, scaled by viewport size.
-       Mobile-specific controls (touch look/move) live in babylon3D.js -->
+       The 3D orbit camera in babylon3D.js handles mouse/touch identically
+       (Babylon's ArcRotateCamera default input), no device branching needed -->
   <script src="config.js"></script>
   <script src="shapes.js" defer></script>
   <script src="audio.js" defer></script>
@@ -243,6 +687,28 @@
         document.querySelectorAll('.desktop-only').forEach(el => el.style.display = 'none');
       }
     });
+  </script>
+
+  <script>
+    // Hard-disable native pinch-to-zoom on the page. The viewport meta's
+    // user-scalable=no and canvas { touch-action: none } (index3D.html head)
+    // are the standard way to do this, but modern iOS Safari ignores
+    // user-scalable=no for accessibility and can still zoom the whole page
+    // during a 3D-mode pinch - stacking on top of the camera's own pinch
+    // zoom, which is what actually read as "zooming into the browser
+    // window" rather than the camera moving. gesturestart/gesturechange are
+    // Safari's non-standard pinch events (fire even where touch-action is
+    // respected); the multi-touch touchmove guard is the same fix for any
+    // other engine that doesn't fully honor touch-action.
+    document.addEventListener('gesturestart', (e) => e.preventDefault());
+    document.addEventListener('gesturechange', (e) => e.preventDefault());
+    document.addEventListener('touchmove', (e) => {
+      if (e.touches.length > 1) e.preventDefault();
+    }, { passive: false });
+    // Chrome/Firefox TRACKPAD pinch (reported as ctrl+wheel, no separate
+    // pinch event on those engines) is handled in babylon3D.js instead of
+    // here - it needs the camera reference to also boost the zoom amount,
+    // not just block the browser's native page-zoom reaction to it.
   </script>
 
   <script>
@@ -280,8 +746,845 @@
         }
         menuDropdown.classList.remove('show');
       });
+
+      const setupBtn = document.getElementById('menu-setup');
+      if (setupBtn) {
+        setupBtn.addEventListener('click', () => {
+          menuDropdown.classList.remove('show');
+          if (typeof window.openUserSetup === 'function') window.openUserSetup();
+        });
+      }
+      const paletteBtn = document.getElementById('menu-palette');
+      if (paletteBtn) {
+        paletteBtn.addEventListener('click', () => {
+          menuDropdown.classList.remove('show');
+          if (typeof window.openPaletteChange === 'function') window.openPaletteChange();
+        });
+      }
+      const materialsBtn = document.getElementById('menu-materials');
+      if (materialsBtn) {
+        materialsBtn.addEventListener('click', () => {
+          menuDropdown.classList.remove('show');
+          if (typeof window.openMaterialChange === 'function') window.openMaterialChange();
+        });
+      }
     });
   </script>
+
+  <script>
+    // ——— USER MODE: stepped, live pre-draw setup ———
+    // Two steps: pick a palette, then pick shapes - drawn as real previews
+    // in that palette, updating live as the palette changes (the strip at
+    // the top of step 2 switches palettes without going back). Palette
+    // candidates come from the sketch's OWN generator
+    // (window.getPaletteCandidates), so the colours previewed here are
+    // exactly the ones the composition will use.
+    document.addEventListener('DOMContentLoaded', () => {
+      const overlay = document.getElementById('setup-overlay');
+      const listEl = document.getElementById('palette-list');
+      const rowsEl = document.getElementById('shape-rows');
+      const dots = document.querySelectorAll('#setup-steps .dot');
+      const steps = document.querySelectorAll('.setup-step');
+      const backBtn = document.getElementById('setup-back');
+      const nextBtn = document.getElementById('setup-next');
+      const statusEl = document.getElementById('setup-status');
+      const paletteStepEl = document.querySelector('.setup-step[data-step="0"]');
+      const titleEl = paletteStepEl && paletteStepEl.querySelector('h2');
+      const subEl = paletteStepEl && paletteStepEl.querySelector('.sub');
+      const SETUP_TITLE = titleEl ? titleEl.textContent : '';
+      const SETUP_SUB = subEl ? subEl.textContent : '';
+      const stripName = document.getElementById('strip-name');
+      const stripSw = document.getElementById('strip-swatches');
+      if (!overlay) return;
+
+      // Pantone-style reference names. Approximate hexes - these exist to
+      // give each palette a memorable identity, not to be a colour-accurate
+      // Pantone reproduction. Spans vivid, muted AND pale families, because
+      // the generator now produces all three tones (see PALETTE_TONES);
+      // when it was vivid-only, every muted name here was unreachable.
+      const PANTONE = [
+        // — vivid —
+        ['Classic Blue', '#0f4c81'], ['Living Coral', '#ff6f61'], ['Ultra Violet', '#5f4b8b'],
+        ['Greenery', '#88b04b'], ['Emerald', '#009874'], ['Tangerine Tango', '#dd4124'],
+        ['Turquoise', '#45b5aa'], ['Radiant Orchid', '#b163a3'], ['Honeysuckle', '#d94f70'],
+        ['Blue Iris', '#5a5b9f'], ['Chili Pepper', '#9b1b30'], ['Very Peri', '#6667ab'],
+        ['Viva Magenta', '#bb2649'], ['Illuminating', '#f5df4d'], ['True Red', '#bf1932'],
+        ['Fuchsia Rose', '#c74375'], ['Blue Atoll', '#00b1d2'], ['Dazzling Blue', '#3850a0'],
+        ['Lapis Blue', '#004b85'], ['Flame', '#f2552c'], ['Snorkel Blue', '#034f84'],
+        ['Buttercup', '#fae03c'], ['Green Flash', '#79c753'], ['Aurora Red', '#b93a32'],
+        ['Grenadine', '#dc4c46'], ['Cherry Tomato', '#eb3c27'], ['Nebulas Blue', '#3f69aa'],
+        ['Ceylon Yellow', '#d9a404'], ['Russet Orange', '#e47a2e'], ['Crocus Petal', '#b57edc'],
+        ['Quetzal Green', '#006865'], ['Valiant Poppy', '#bc322c'], ['Turmeric', '#fe840e'],
+        ['Aspen Gold', '#ffd662'], ['Biking Red', '#77212e'], ['Eden', '#264e36'],
+        ['Samba', '#a2242f'], ['Mimosa', '#f0c05a'], ['Bodacious', '#b08bbb'],
+        ['Golden Lime', '#9a9738'], ['Navy Peony', '#223a5e'], ['Shaded Spruce', '#005f6a'],
+        ['Meadow Violet', '#7b52ab'], ['Electric Green', '#00b34a'], ['Saffron', '#f4a900'],
+        ['Vibrant Yellow', '#ffd500'], ['Deep Ultramarine', '#2b3a8f'], ['Jade Cream', '#00a170'],
+        ['Scarlet Sage', '#a0242c'], ['Peacock Blue', '#00758f'], ['Amberglow', '#dc793e'],
+        ['Cyber Lime', '#a4d233'], ['Magenta Purple', '#6c244c'], ['Orange Tiger', '#f96714'],
+        ['Persian Red', '#c0362c'], ['Kelly Green', '#00a94f'], ['Marina', '#4f84c4'],
+        ['Pink Peacock', '#c62168'], ['Aquamarine', '#3fbfb2'], ['Bright Marigold', '#ff9800'],
+        // — mid / rich —
+        ['Marsala', '#955251'], ['Iced Coffee', '#b18f6a'], ['Butterum', '#c68f65'],
+        ['Dusty Cedar', '#a75d67'], ['Spicy Mustard', '#d8ae47'], ['Martini Olive', '#716b56'],
+        ['Warm Taupe', '#af9483'], ['Riverside', '#4c6a92'], ['Meerkat', '#9c6b4f'],
+        ['Rocky Road', '#5a4741'], ['Deep Lichen Green', '#7a8b78'], ['Sharkskin', '#838487'],
+        ['Ultimate Gray', '#939597'], ['Lilac Gray', '#9896a4'], ['Little Boy Blue', '#6e9bc5'],
+        ['Blooming Dahlia', '#ec9787'], ['Cornsilk', '#edd9a3'], ['Mocha Mousse', '#a47864'],
+        ['Terracotta', '#a95c48'], ['Sage Leaf', '#8a9a5b'], ['Slate Rose', '#9d7b7b'],
+        ['Bistre Brown', '#7a5c48'], ['Storm Blue', '#54697f'], ['Moss Stone', '#6b7a4f'],
+        ['Antique Bronze', '#8a7048'], ['Plum Wine', '#7d4a5a'], ['Harbour Mist', '#8fa1a8'],
+        // — pale / pastel —
+        ['Rose Quartz', '#f7cac9'], ['Serenity', '#92a8d1'], ['Sand Dollar', '#decdbe'],
+        ['Peach Fuzz', '#ffbe98'], ['Aqua Sky', '#7bc4c4'], ['Cerulean', '#9bb7d4'],
+        ['Placid Blue', '#8db4d2'], ['Hemlock', '#97c1a9'], ['Peach Echo', '#f7786b'],
+        ['Limpet Shell', '#98ddde'], ['Airy Blue', '#92b6d5'], ['Sweet Lilac', '#e8b5ce'],
+        ['Ballet Slipper', '#efd9d1'], ['Almost Mauve', '#ecdfdd'], ['Pastel Lilac', '#c5b0d5'],
+        ['Mellow Yellow', '#f2e59a'], ['Bleached Sand', '#e5d4c0'], ['Pale Marigold', '#f6d6a5'],
+        ['Misted Jade', '#b8d8c7'], ['Powder Blue', '#b5cdd8'], ['Pink Salt', '#f2c9c1'],
+        ['Sea Foam', '#c5e0d8'], ['Pistachio Shell', '#d6dfae'], ['Frosted Lavender', '#cfc6de'],
+        ['Vanilla Cream', '#f0e2c8'], ['Whisper Green', '#d5e2cd'], ['Shell Coral', '#f4bfae'],
+      ];
+      const toRGB = hex => {
+        const h = String(hex).replace('#', '');
+        return [parseInt(h.slice(0, 2), 16) || 0, parseInt(h.slice(2, 4), 16) || 0, parseInt(h.slice(4, 6), 16) || 0];
+      };
+      // Each entry is classified by its OWN colour into a tonal family, so a
+      // palette can be matched to a name that genuinely looks like it. An
+      // earlier version bolted a statistical adjective onto the front of
+      // these ("Slate Pastel Lilac", "Deep Aqua Sky", "Burnished
+      // Illuminating") - the adjective had no relationship to the noun, and
+      // several Pantone names already carry their own tonal word, so the
+      // results read as word salad rather than names.
+      const rgbDist = (a, c) => {           // weighted RGB, cheap approximation of perceived difference
+        const rm = (a[0] + c[0]) / 2;
+        const dr = a[0] - c[0], dg = a[1] - c[1], db = a[2] - c[2];
+        return (2 + rm / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rm) / 256) * db * db;
+      };
+      const hsl2rgb = (h, s, l) => {
+        h = ((h % 360) + 360) % 360; s /= 100; l /= 100;
+        const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = l - c / 2;
+        let r, g, b;
+        if (h < 60) [r, g, b] = [c, x, 0]; else if (h < 120) [r, g, b] = [x, c, 0];
+        else if (h < 180) [r, g, b] = [0, c, x]; else if (h < 240) [r, g, b] = [0, x, c];
+        else if (h < 300) [r, g, b] = [x, 0, c]; else [r, g, b] = [c, 0, x];
+        return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+      };
+      const rgb2hsl = ([r, g, b]) => {
+        r /= 255; g /= 255; b /= 255;
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn, l = (mx + mn) / 2;
+        let h = 0, s = 0;
+        if (d) {
+          s = d / (1 - Math.abs(2 * l - 1));
+          h = mx === r ? 60 * (((g - b) / d) % 6) : mx === g ? 60 * ((b - r) / d + 2) : 60 * ((r - g) / d + 4);
+        }
+        return [(h + 360) % 360, s * 100, l * 100];
+      };
+      // One classifier used for BOTH the Pantone entries and the palette, so
+      // a pale palette can only ever draw a pale name and a vivid one a
+      // vivid name. This is what keeps the name looking like the palette.
+      function toneOf(rgb) {
+        const [, s, l] = rgb2hsl(rgb);
+        if (l > 72 || (s < 25 && l > 55)) return 'pale';
+        if (s > 52 && l >= 22 && l <= 70) return 'vivid';
+        return 'mid';
+      }
+      const PANTONE_TONED = PANTONE.map(([name, hex]) => {
+        const rgb = toRGB(hex);
+        return { name, rgb, tone: toneOf(rgb) };
+      });
+      // Closest names within the palette's own tonal family, nearest first.
+      function nearestNames(rgb, k) {
+        const tone = toneOf(rgb);
+        const pool = PANTONE_TONED.filter(e => e.tone === tone);
+        const use = pool.length >= 5 ? pool : PANTONE_TONED;
+        return use
+          .map(e => ({ name: e.name, d: rgbDist(rgb, e.rgb) }))
+          .sort((a, b) => a.d - b.d)
+          .slice(0, k)
+          .map(e => e.name);
+      }
+
+      // A palette's CHARACTERISTIC colour: the saturation-weighted circular
+      // mean of its hues, leaning toward its most saturated member.
+      // Deliberately NOT one of the five swatches - naming a palette after a
+      // single colour in it describes that swatch, not the set.
+      function paletteStats(hexes) {
+        const hsls = hexes.map(h => rgb2hsl(toRGB(h)));
+        let sx = 0, sy = 0, wsum = 0, sSum = 0, lSum = 0;
+        hsls.forEach(([h, s, l]) => {
+          const w = (s / 100) * (1 - Math.abs(l / 100 - 0.5) * 0.8) + 0.05; // vivid mid-tones steer the hue
+          sx += Math.cos(h * Math.PI / 180) * w;
+          sy += Math.sin(h * Math.PI / 180) * w;
+          wsum += w; sSum += s; lSum += l;
+        });
+        const meanHue = (Math.atan2(sy / wsum, sx / wsum) * 180 / Math.PI + 360) % 360;
+        const meanSat = sSum / hsls.length, meanLight = lSum / hsls.length;
+        const dom = hsls.slice().sort((a, b) => b[1] - a[1])[0];
+        const charSat = (meanSat + dom[1]) / 2, charLight = (meanLight + dom[2]) / 2;
+        let hueSpread = 0;
+        for (let i = 0; i < hsls.length; i++) {
+          for (let j = i + 1; j < hsls.length; j++) {
+            const d = Math.abs(hsls[i][0] - hsls[j][0]);
+            hueSpread = Math.max(hueSpread, Math.min(d, 360 - d));
+          }
+        }
+        // The member furthest in hue from the palette's centre - its accent,
+        // used for the paired name below.
+        let accent = hsls[0], far = -1;
+        hsls.forEach(c => {
+          const d = Math.abs(c[0] - meanHue);
+          const dd = Math.min(d, 360 - d);
+          if (dd > far) { far = dd; accent = c; }
+        });
+        return {
+          rgb: hsl2rgb(meanHue, charSat, charLight),
+          accentRgb: hsl2rgb(accent[0], accent[1], accent[2]),
+          hueSpread,
+        };
+      }
+
+      // A palette that spans two clearly different hues is named for BOTH -
+      // "Emerald & Viva Magenta" describes a set in a way no single colour
+      // name can. Single-hue and analogous palettes take one name, since a
+      // pair would just be the same colour twice. Uniqueness is guaranteed:
+      // walk out through progressively further names in the same tonal
+      // family, then pair up, and only as a final backstop add a numeral.
+      function namePalette(hexes, used) {
+        const st = paletteStats(hexes);
+        const near = nearestNames(st.rgb, 14);
+        const taken = n => used && used.has(n);
+        if (st.hueSpread >= 120) {
+          const acc = nearestNames(st.accentRgb, 6);
+          for (const p of near) {
+            for (const a of acc) {
+              if (p === a) continue;
+              const full = `${p} & ${a}`;
+              if (!taken(full)) return full;
+            }
+          }
+        }
+        for (const n of near) if (!taken(n)) return n;
+        const acc2 = nearestNames(st.accentRgb, 8);
+        for (const p of near) for (const a of acc2) {
+          if (p === a) continue;
+          const full = `${p} & ${a}`;
+          if (!taken(full)) return full;
+        }
+        let i = 2;
+        while (taken(`${near[0]} ${i}`)) i++;
+        return `${near[0]} ${i}`;
+      }
+
+      // value must match the sketch's own shape-type strings exactly.
+      // 'lattice' is special: the sketch schedules lattices by SLOT rather
+      // than picking them from a shape-type list, so it reads this choice
+      // through its own latticesEnabled() check.
+      const SHAPE_TYPES = [
+        { value: 'openRect', label: 'Open Rect' },
+        { value: 'openTriangle', label: 'Open Tri' },
+        { value: 'openSemiCircle', label: 'Open Arch' },
+        { value: 'rect', label: 'Rect' },
+        { value: 'triangle', label: 'Triangle' },
+        { value: 'circle', label: 'Circle' },
+        { value: 'semiCircle', label: 'Half Circle' },
+        { value: 'concentricCircle', label: 'Bullseye' },
+        { value: 'concentricArc', label: 'Arc Rings' },
+        { value: 'halo', label: 'Halo' },
+        { value: 'squiggle', label: 'Squiggle' },
+        { value: 'arc', label: 'Arc' },
+        { value: 'lattice', label: 'Lattice' },
+      ];
+
+      let step = 0;
+      let mode = 'setup';        // 'setup' = full wizard, 'change' = palette-only, mid-composition
+      let suggestionLabels = null; // relation labels when showing suggestions
+      let candidates = [];
+      let names = [];
+      let selectedPalette = null;                             // index, or null = surprise me
+      const chosen = new Set(SHAPE_TYPES.map(s => s.value));  // all on by default
+
+      // Colours to DRAW with. "Surprise me" still needs something concrete
+      // to show, so it borrows the first candidate as an example.
+      const ARTIST_SPECTRUM = ['#e34a4a', '#e3a34a', '#5fc45f', '#4aa8e3', '#7a5fd0', '#c94ab5', '#e3e34a'];
+      const previewColors = () => {
+        if (selectedPalette === 'artist') return ARTIST_SPECTRUM;
+        if (selectedPalette != null && candidates[selectedPalette]) return candidates[selectedPalette];
+        return candidates[0] || ['#c8553d', '#588b8b', '#f2d492', '#4a5859', '#a26769'];
+      };
+
+      const hexA = (hex, a) => {
+        const [r, g, b] = toRGB(hex);
+        return `rgba(${r},${g},${b},${a})`;
+      };
+
+      // ——— physical shape previews ———
+      // Mirrors the 2D sketch's own silhouettes: translucent fill, black
+      // outline, open shapes fading along a gradient with the open edge
+      // left unstroked, concentrics stacked largest-to-smallest.
+      function drawShape(ctx, type, cols, S) {
+        const cx = S / 2, cy = S / 2, R = S * 0.34;
+        const lw = Math.max(S * 0.028, 1.2);
+        const c0 = cols[0], c1 = cols[1] || cols[0], c2 = cols[2] || cols[0];
+        const TAU = Math.PI * 2;
+        ctx.clearRect(0, 0, S, S);
+        ctx.lineWidth = lw;
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = 'rgba(0,0,0,0.88)';
+
+        const tri = () => {
+          ctx.beginPath();
+          for (let i = 0; i < 3; i++) {
+            const a = -Math.PI / 2 + i * TAU / 3;
+            const x = cx + R * Math.cos(a), y = cy + R * Math.sin(a);
+            i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+          }
+          ctx.closePath();
+        };
+        const fadeGrad = (x0, y0, x1, y1, col) => {
+          const g = ctx.createLinearGradient(x0, y0, x1, y1);
+          g.addColorStop(0, hexA(col, 0.85));
+          g.addColorStop(0.9, hexA(col, 0));
+          g.addColorStop(1, hexA(col, 0));
+          return g;
+        };
+
+        switch (type) {
+          case 'circle':
+            ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU);
+            ctx.fillStyle = hexA(c0, 0.8); ctx.fill(); ctx.stroke();
+            break;
+          case 'rect':
+            ctx.beginPath(); ctx.rect(cx - R, cy - R * 0.6, R * 2, R * 1.2);
+            ctx.fillStyle = hexA(c0, 0.8); ctx.fill(); ctx.stroke();
+            break;
+          case 'triangle':
+            tri(); ctx.fillStyle = hexA(c0, 0.8); ctx.fill(); ctx.stroke();
+            break;
+          case 'semiCircle':
+            ctx.beginPath(); ctx.arc(cx, cy - R * 0.35, R, 0, Math.PI); ctx.closePath();
+            ctx.fillStyle = hexA(c0, 0.8); ctx.fill(); ctx.stroke();
+            break;
+          case 'openRect': {
+            const x = cx - R, y = cy - R * 0.6, w = R * 2, h = R * 1.2;
+            ctx.fillStyle = fadeGrad(x, y, x + w, y, c0);
+            ctx.fillRect(x, y, w, h);
+            ctx.beginPath();                       // open edge = the faded right side
+            ctx.moveTo(x + w, y); ctx.lineTo(x, y); ctx.lineTo(x, y + h); ctx.lineTo(x + w, y + h);
+            ctx.stroke();
+            break;
+          }
+          case 'openTriangle': {
+            ctx.save(); tri(); ctx.clip();
+            ctx.fillStyle = fadeGrad(cx, cy - R, cx, cy + R, c0);
+            ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
+            ctx.restore();
+            const p = [];
+            for (let i = 0; i < 3; i++) {
+              const a = -Math.PI / 2 + i * TAU / 3;
+              p.push([cx + R * Math.cos(a), cy + R * Math.sin(a)]);
+            }
+            ctx.beginPath();                       // leave the bottom edge open
+            ctx.moveTo(p[2][0], p[2][1]); ctx.lineTo(p[0][0], p[0][1]); ctx.lineTo(p[1][0], p[1][1]);
+            ctx.stroke();
+            break;
+          }
+          case 'openSemiCircle': {
+            const yc = cy - R * 0.35;
+            ctx.save();
+            ctx.beginPath(); ctx.arc(cx, yc, R, 0, Math.PI); ctx.closePath(); ctx.clip();
+            ctx.fillStyle = fadeGrad(cx, yc + R, cx, yc, c0);
+            ctx.fillRect(cx - R, yc, R * 2, R);
+            ctx.restore();
+            ctx.beginPath(); ctx.arc(cx, yc, R, 0, Math.PI); ctx.stroke(); // arc only, flat side open
+            break;
+          }
+          case 'halo': {
+            const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
+            g.addColorStop(0, hexA(c0, 0.8));
+            g.addColorStop(0.55, hexA(c0, 0.3));
+            g.addColorStop(1, hexA(c0, 0));
+            ctx.fillStyle = g;
+            ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.fill();
+            ctx.lineWidth = Math.max(lw * 0.7, 1);
+            [0.6, 0.3].forEach((f, i) => {
+              ctx.beginPath(); ctx.arc(cx, cy, R * f, 0, TAU);
+              ctx.fillStyle = hexA(i ? c2 : c1, 0.75); ctx.fill(); ctx.stroke();
+            });
+            break;
+          }
+          case 'concentricCircle':
+            for (let i = 4; i > 0; i--) {
+              ctx.beginPath(); ctx.arc(cx, cy, R * i / 4, 0, TAU);
+              ctx.fillStyle = hexA(cols[(4 - i) % cols.length], 0.9); ctx.fill();
+            }
+            break;
+          case 'concentricArc':
+            ctx.lineWidth = Math.max(lw * 1.1, 1.4);
+            for (let i = 4; i > 0; i--) {
+              ctx.beginPath(); ctx.arc(cx, cy + R * 0.45, R * i / 4, Math.PI, TAU);
+              ctx.strokeStyle = hexA(cols[(4 - i) % cols.length], 0.95); ctx.stroke();
+            }
+            break;
+          case 'squiggle': {
+            ctx.beginPath();
+            for (let i = 0; i <= 40; i++) {
+              const t = i / 40, x = cx - R + t * R * 2;
+              const y = cy + Math.sin(t * Math.PI * 3) * R * 0.45;
+              i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+            }
+            ctx.strokeStyle = hexA(c0, 0.95);
+            ctx.lineWidth = Math.max(lw * 1.5, 1.6);
+            ctx.lineCap = 'round';
+            ctx.stroke();
+            break;
+          }
+          case 'arc':
+            ctx.beginPath(); ctx.arc(cx, cy, R, Math.PI * 0.15, Math.PI * 1.25);
+            ctx.strokeStyle = hexA(c0, 0.95);
+            ctx.lineWidth = Math.max(lw * 1.5, 1.6);
+            ctx.lineCap = 'round';
+            ctx.stroke();
+            break;
+          case 'lattice': {
+            // A slightly-rotated grid of solid cells with dark gaps, matching
+            // the sketch's own lattice ensemble.
+            const N = 4, cell = (R * 1.9) / N;
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.rotate(-0.16);
+            ctx.translate(-(cell * N) / 2, -(cell * N) / 2);
+            for (let r = 0; r < N; r++) {
+              for (let q = 0; q < N; q++) {
+                ctx.fillStyle = hexA(cols[(r * N + q) % cols.length], 0.92);
+                ctx.fillRect(q * cell + 0.8, r * cell + 0.8, cell - 1.6, cell - 1.6);
+              }
+            }
+            ctx.restore();
+            break;
+          }
+        }
+      }
+
+      // ——— step 1: palettes ———
+      function renderPalettes(keepSelection, useSuggestions) {
+        const prev = keepSelection ? selectedPalette : null;
+        let got = [];
+        suggestionLabels = null;
+        if (useSuggestions && typeof window.getPaletteSuggestions === 'function') {
+          try {
+            const sug = window.getPaletteSuggestions();
+            got = sug.map(x => x.hex);
+            suggestionLabels = sug.map(x => x.label);
+          } catch (e) { got = []; }
+        }
+        if (!got.length && typeof window.getPaletteCandidates === 'function') {
+          try { got = window.getPaletteCandidates(5); } catch (e) { got = []; }
+        }
+        if (!got.length) { // p5 not ready yet - retry rather than show an empty list
+          listEl.innerHTML = '<div class="sub" style="padding:6px 2px">Preparing palettes…</div>';
+          setTimeout(() => renderPalettes(keepSelection), 250);
+          return;
+        }
+        candidates = got;
+        const used = new Set();
+        names = candidates.map(hexes => {
+          const n = namePalette(hexes, used);
+          used.add(n);
+          return n;
+        });
+        listEl.innerHTML = '';
+        candidates.forEach((hexes, i) => {
+          const row = document.createElement('div');
+          row.className = 'palette-option';
+          row.innerHTML = '<div class="tick"></div>';
+          const nm = document.createElement('div');
+          nm.className = 'palette-name';
+          // In suggestion mode the RELATION to the current palette is the
+          // useful label ("Softer", "Complement"); a Pantone name would say
+          // nothing about how it relates to what's already on the canvas.
+          nm.textContent = suggestionLabels ? suggestionLabels[i] : names[i];
+          const sw = document.createElement('div');
+          sw.className = 'palette-swatches';
+          hexes.forEach(h => {
+            const s = document.createElement('span');
+            s.style.backgroundColor = h;
+            sw.appendChild(s);
+          });
+          row.appendChild(nm);
+          row.appendChild(sw);
+          row.addEventListener('click', () => selectPalette(i));
+          listEl.appendChild(row);
+        });
+        const rnd = document.createElement('div');
+        rnd.className = 'palette-option';
+        rnd.innerHTML = '<div class="tick"></div>';
+        const label = document.createElement('div');
+        label.style.cssText = 'flex:1;font-size:13px;color:rgba(255,255,255,0.65)';
+        label.textContent = 'Surprise me — a new palette each time';
+        rnd.appendChild(label);
+        rnd.addEventListener('click', () => selectPalette(null));
+        listEl.appendChild(rnd);
+
+        // ARTIST'S PALETTE - the original unconstrained behaviour, where
+        // every element invents its own colour across the full spectrum
+        // instead of drawing from a five-colour set.
+        const art = document.createElement('div');
+        art.className = 'palette-option';
+        art.innerHTML = '<div class="tick"></div>';
+        const artName = document.createElement('div');
+        artName.className = 'palette-name';
+        artName.textContent = "Artist's Palette";
+        const artSw = document.createElement('div');
+        artSw.className = 'palette-swatches';
+        artSw.style.background = 'linear-gradient(90deg,#e34a4a,#e3a34a,#e3e34a,#5fc45f,#4aa8e3,#7a5fd0,#c94ab5,#e34a4a)';
+        art.appendChild(artName);
+        art.appendChild(artSw);
+        art.addEventListener('click', () => selectPalette('artist'));
+        listEl.appendChild(art);
+
+        selectPalette(prev != null && candidates[prev] ? prev : (prev === 'artist' ? 'artist' : null));
+      }
+
+      function selectPalette(i) {
+        selectedPalette = i;
+        const rows = listEl.querySelectorAll('.palette-option');
+        // last two rows are the specials: "surprise me", then "artist's palette"
+        const artistRow = rows.length - 1, randomRow = rows.length - 2;
+        rows.forEach((r, idx) => {
+          const isThis = i === 'artist' ? (idx === artistRow)
+            : i === null ? (idx === randomRow)
+            : (idx === i);
+          r.classList.toggle('selected', isThis);
+          r.querySelector('.tick').textContent = isThis ? '✓' : '';
+        });
+        refreshStrip();
+        if (step === 1) renderShapes(); // live: shapes retint immediately
+        updateStatus();
+      }
+
+      // ——— step 2: shapes, live in the chosen palette ———
+      function refreshStrip() {
+        if (!stripName) return;
+        const cols = previewColors();
+        stripName.textContent = selectedPalette === 'artist'
+          ? "Artist's Palette — full spectrum"
+          : selectedPalette == null
+            ? `${names[0] || 'Random'} — surprise me`
+            : (names[selectedPalette] || '');
+        stripSw.innerHTML = '';
+        cols.forEach(h => {
+          const s = document.createElement('span');
+          s.style.backgroundColor = h;
+          stripSw.appendChild(s);
+        });
+      }
+
+      // Split n items into rows that are as EVEN as possible - 13 shapes at
+      // 5 per row becomes 5/4/4, never 5/5/3 with a stub row on the end.
+      function evenRows(n, maxCols) {
+        const rows = Math.max(1, Math.ceil(n / maxCols));
+        const base = Math.floor(n / rows), extra = n % rows;
+        return Array.from({ length: rows }, (_, i) => base + (i < extra ? 1 : 0));
+      }
+
+      function renderShapes() {
+        const cols = previewColors();
+        const CELL = 88, GAP = 8;
+        const avail = rowsEl.clientWidth || 512;
+        const maxCols = Math.max(2, Math.min(SHAPE_TYPES.length, Math.floor((avail + GAP) / (CELL + GAP))));
+        const counts = evenRows(SHAPE_TYPES.length, maxCols);
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const S = 62;
+
+        rowsEl.innerHTML = '';
+        let k = 0;
+        counts.forEach(count => {
+          const row = document.createElement('div');
+          row.className = 'shape-row';
+          for (let j = 0; j < count; j++, k++) {
+            const s = SHAPE_TYPES[k];
+            const cell = document.createElement('div');
+            cell.className = 'shape-cell' + (chosen.has(s.value) ? ' on' : '');
+            const cv = document.createElement('canvas');
+            cv.width = S * dpr; cv.height = S * dpr;
+            const ctx = cv.getContext('2d');
+            ctx.scale(dpr, dpr);
+            // rotate the palette per shape so the grid reads as a set, not
+            // thirteen repetitions of one colour
+            const off = k % cols.length;
+            drawShape(ctx, s.value, cols.slice(off).concat(cols.slice(0, off)), S);
+            const nm = document.createElement('div');
+            nm.className = 'nm';
+            nm.textContent = s.label;
+            cell.appendChild(cv); cell.appendChild(nm);
+            cell.addEventListener('click', () => {
+              if (chosen.has(s.value)) chosen.delete(s.value); else chosen.add(s.value);
+              cell.classList.toggle('on', chosen.has(s.value));
+              updateStatus();
+            });
+            row.appendChild(cell);
+          }
+          rowsEl.appendChild(row);
+        });
+      }
+
+      // ——— navigation ———
+      // ——— materials (pedestal + struts) ———
+      // The options and the current selection both come from babylon3D.js
+      // (window.getMaterialOptions/getSculptureMaterials), so the swatches
+      // here can't drift from what actually gets built - same arrangement as
+      // the palettes coming from the sketch's own generator.
+      const matBaseEl = document.getElementById('mat-base');
+      const matStrutEl = document.getElementById('mat-strut');
+      const matLightEl = document.getElementById('mat-light');
+      // Lighting isn't a material, so it has no entry in babylon3D.js's
+      // option tables - but it belongs in this panel and uses the same
+      // swatch control, so its two choices live here. Each swatch previews
+      // the actual effect: flat paper wash vs. a lit pool against darkness.
+      const LIGHT_OPTIONS = [
+        { id: 'daylight', label: 'Daylight', swatch: 'linear-gradient(180deg,#f0e5cc,#e2d3b4)' },
+        { id: 'spotlight', label: 'Spotlight', swatch: 'radial-gradient(circle at 50% 36%,#f4e8ce 0%,#9c8d71 34%,#3a3630 66%,#131318 100%)' }
+      ];
+      let matOptions = { base: [], strut: [], light: LIGHT_OPTIONS };
+      let matChoice = { base: null, strut: null, light: null };
+
+      function renderMaterials() {
+        if (typeof window.getMaterialOptions !== 'function') return;
+        matOptions = { ...window.getMaterialOptions(), light: LIGHT_OPTIONS };
+        matChoice = window.getSculptureMaterials();
+        matChoice.light = (typeof window.getSpotlightMode === 'function' && window.getSpotlightMode())
+          ? 'spotlight' : 'daylight';
+        const build = (host, list, key, onPick) => {
+          if (!host) return;
+          host.innerHTML = '';
+          list.forEach(o => {
+            const cell = document.createElement('div');
+            cell.className = 'mat-cell' + (matChoice[key] === o.id ? ' selected' : '');
+            const chip = document.createElement('div');
+            chip.className = 'mat-chip';
+            chip.style.background = o.swatch;
+            const lbl = document.createElement('div');
+            lbl.className = 'lbl';
+            lbl.textContent = o.label;
+            cell.appendChild(chip);
+            cell.appendChild(lbl);
+            cell.addEventListener('click', () => {
+              // Applies immediately - if the 3D view is already open behind
+              // this panel, the sculpture changes as you click.
+              onPick(o.id);
+              renderMaterials();
+              updateStatus();
+            });
+            host.appendChild(cell);
+          });
+        };
+        build(matBaseEl, matOptions.base, 'base', id => window.setSculptureMaterials({ ...matChoice, base: id }));
+        build(matStrutEl, matOptions.strut, 'strut', id => window.setSculptureMaterials({ ...matChoice, strut: id }));
+        build(matLightEl, LIGHT_OPTIONS, 'light', id => {
+          if (typeof window.setSpotlightMode === 'function') window.setSpotlightMode(id === 'spotlight');
+        });
+      }
+
+      function materialLabel(key) {
+        const o = (matOptions[key] || []).find(x => x.id === matChoice[key]);
+        return o ? o.label : '';
+      }
+
+      function updateStatus() {
+        if (step === 2) {
+          statusEl.textContent = matChoice.base
+            ? `${materialLabel('base')} base · ${materialLabel('strut')} struts · ${materialLabel('light')}`
+            : '';
+          nextBtn.disabled = false;
+        } else if (step === 0) {
+          const nm = suggestionLabels
+            ? (selectedPalette != null && selectedPalette !== 'artist' ? suggestionLabels[selectedPalette] : '')
+            : (names[selectedPalette] || '');
+          statusEl.textContent = selectedPalette === 'artist'
+            ? "Every element picks its own colour — the original, unconstrained look"
+            : selectedPalette == null
+              ? (mode === 'change' ? 'A fresh palette from here on' : 'A new palette each composition')
+              : (mode === 'change'
+                  ? `“${nm}” from here on — everything already drawn keeps its colours`
+                  : `“${nm}” locked for every composition`);
+          nextBtn.disabled = false;
+        } else {
+          // Nothing is ever excluded now, so an empty set is a valid
+          // choice - it just means "no preference, an even mix"
+          statusEl.textContent = chosen.size === 0
+            ? 'No preference — an even mix of every shape'
+            : `${chosen.size} of ${SHAPE_TYPES.length} shapes featured`;
+          nextBtn.disabled = false;
+        }
+      }
+
+      function goTo(n) {
+        // 'change' and 'materials' are each ONE step on their own - the
+        // composition is already mid-flight, so there's nothing to step
+        // through, and the progress dots would be meaningless.
+        const single = mode === 'change' ? 0 : (mode === 'materials' ? 2 : null);
+        step = single !== null ? single : Math.max(0, Math.min(2, n));
+        steps.forEach(el => { el.hidden = Number(el.dataset.step) !== step; });
+        dots.forEach((d, i) => {
+          d.hidden = single !== null;
+          d.classList.toggle('active', i === step);
+          d.classList.toggle('done', i < step);
+        });
+        backBtn.hidden = step === 0 || single !== null;
+        nextBtn.textContent = mode === 'change' ? 'Use From Here'
+          : mode === 'materials' ? 'Done'
+            : (step === 2 ? 'Start Drawing' : 'Next');
+        if (step === 1) { refreshStrip(); renderShapes(); } // redraw: palette may have changed
+        if (step === 2) renderMaterials();
+        updateStatus();
+      }
+
+      backBtn.addEventListener('click', () => goTo(step - 1));
+      nextBtn.addEventListener('click', () => {
+        if (mode === 'change') {
+          if (typeof window.changePaletteFromHere === 'function') {
+            window.changePaletteFromHere({
+              artist: selectedPalette === 'artist',
+              paletteIndex: selectedPalette === 'artist' ? null : selectedPalette,
+            });
+          }
+          overlay.classList.add('hidden');
+          return;
+        }
+        if (mode === 'materials') {
+          // Already applied live on every click - nothing to commit.
+          overlay.classList.add('hidden');
+          return;
+        }
+        if (step < 2) { goTo(step + 1); return; }
+        if (typeof window.applyUserSettings === 'function') {
+          window.applyUserSettings({
+            artist: selectedPalette === 'artist',
+            paletteIndex: selectedPalette === 'artist' ? null : selectedPalette,
+            // all-on is the same as no preference - send null so the sketch
+            // takes its untouched classic path
+            shapeTypes: chosen.size === SHAPE_TYPES.length ? null : Array.from(chosen)
+          });
+        }
+        overlay.classList.add('hidden');
+      });
+      document.getElementById('setup-shuffle').addEventListener('click', () => renderPalettes(false, false));
+      // Live palette switching from the shapes step - no need to go back
+      document.getElementById('strip-cycle').addEventListener('click', () => {
+        if (!candidates.length) return;
+        // cycle: candidates -> surprise me -> artist's palette -> back
+        const order = candidates.map((_, i) => i).concat([null, 'artist']);
+        const at = order.findIndex(v => v === selectedPalette);
+        selectPalette(order[(at + 1) % order.length]);
+      });
+      document.getElementById('shape-all').addEventListener('click', () => {
+        SHAPE_TYPES.forEach(s => chosen.add(s.value));
+        renderShapes(); updateStatus();
+      });
+      document.getElementById('shape-none').addEventListener('click', () => {
+        chosen.clear();
+        renderShapes(); updateStatus();
+      });
+      window.addEventListener('resize', () => { if (step === 1) renderShapes(); });
+
+      window.openUserSetup = function () {
+        mode = 'setup';
+        if (titleEl) titleEl.textContent = SETUP_TITLE;
+        if (subEl) subEl.textContent = SETUP_SUB;
+        if (typeof window.beginUserSetup === 'function') window.beginUserSetup();
+        overlay.classList.remove('hidden');
+        renderPalettes(true, false);
+        goTo(0);
+      };
+
+      // Mid-composition palette change: palette step only, seeded with
+      // palettes RELATED to the one currently in use.
+      window.openPaletteChange = function () {
+        mode = 'change';
+        if (typeof window.beginUserSetup === 'function') window.beginUserSetup(); // pause drawing while open
+        overlay.classList.remove('hidden');
+        titleEl.textContent = 'Change palette';
+        subEl.textContent = 'Suggestions based on your current palette. Everything already drawn keeps its colours.';
+        renderPalettes(false, true);
+        goTo(0);
+      };
+
+      // Materials on their own, any time. Deliberately does NOT call
+      // beginUserSetup: materials have no bearing on what the 2D sketch
+      // draws, so there's nothing to pause - and pausing here would leave
+      // drawing stopped, since only applyUserSettings/changePaletteFromHere
+      // ever clear that flag.
+      window.openMaterialChange = function () {
+        mode = 'materials';
+        overlay.classList.remove('hidden');
+        goTo(2);
+      };
+
+      const materialFab = document.getElementById('material-btn');
+      if (materialFab) materialFab.addEventListener('click', () => window.openMaterialChange());
+
+      // Start a new composition. Same call the desktop menu's "Reset
+      // Composition" makes - this is the only route to it on touch, where
+      // the hamburger is hidden. resetComposition() guards its own re-entry
+      // (`if (resetCycleTimestamp > 0) return`), so an impatient double-tap
+      // can't stack two cycles, and the fade to black IS the feedback - no
+      // spinner needed for something that visibly takes over the screen.
+      const refreshFab = document.getElementById('refresh-btn');
+      if (refreshFab) refreshFab.addEventListener('click', () => {
+        hideToast();
+        if (typeof window.resetComposition === 'function') window.resetComposition();
+      });
+
+      // ——— palette button + one-time hint ———
+      const paletteFab = document.getElementById('palette-btn');
+      const toast = document.getElementById('palette-toast');
+      const openChange = () => {
+        hideToast();
+        window.openPaletteChange();
+      };
+      if (paletteFab) paletteFab.addEventListener('click', openChange);
+      if (toast) toast.addEventListener('click', openChange);
+
+      let toastTimer = null;
+      function showToast() {
+        if (!toast) return;
+        toast.classList.add('show');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toast.classList.remove('show'), 7000);
+      }
+      function hideToast() {
+        if (!toast) return;
+        clearTimeout(toastTimer);
+        toast.classList.remove('show');
+      }
+
+      // Surface the hint ONCE per composition, and only once enough has been
+      // drawn that changing the palette is a meaningful choice - on an empty
+      // canvas it would just be noise. Re-arms when a new composition starts
+      // (element count drops).
+      const HINT_AFTER_ELEMENTS = 10;
+      let hintShown = false, lastCreated = 0;
+      setInterval(() => {
+        if (typeof window.getCompositionProgress !== 'function') return;
+        let p;
+        try { p = window.getCompositionProgress(); } catch (e) { return; }
+        if (!p) return;
+        if (p.created < lastCreated) hintShown = false;   // composition restarted
+        lastCreated = p.created;
+        if (hintShown || p.setupPending) return;
+        if (!overlay.classList.contains('hidden')) return;      // setup panel is up
+        if (document.body.classList.contains('in-3d')) return;  // nothing to change in 3D
+        if (p.created >= HINT_AFTER_ELEMENTS && p.created < p.max) {
+          hintShown = true;
+          showToast();
+        }
+      }, 1200);
+
+      renderPalettes(false, false);
+      goTo(0);
+    });
+</script>
 
   <script>
     // Fullscreen Button Logic
