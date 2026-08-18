@@ -126,6 +126,7 @@ function activate3DMode() {
   // Update button
   const toggleBtn = document.getElementById('mode-toggle-btn');
   toggleBtn.textContent = '2D';
+  toggleBtn.dataset.tip = 'Back to the canvas'; // hover label tracks what the button now does
   
   console.log('3D mode activated!');
 }
@@ -153,6 +154,7 @@ function deactivate3DMode() {
   // Update button
   const toggleBtn = document.getElementById('mode-toggle-btn');
   toggleBtn.textContent = '3D';
+  toggleBtn.dataset.tip = 'Explore in 3D';
   
   console.log('Returned to 2D mode');
 }
@@ -501,6 +503,37 @@ function renderSphereBackgroundTo2D(targetLayer, bigCanvas, viewW, viewH) {
 }
 window.renderSphereBackgroundTo2D = renderSphereBackgroundTo2D;
 
+// ===== Scramble mode =====
+// The 2D composition holds every shape parallel to the picture plane, so an
+// orbit to the side shows only edges. Scramble tips each Tier-1 shape by
+// SCRAMBLE_MIN_DEG..SCRAMBLE_MAX_DEG on X and then on Y (random sign each) -
+// recognisably the same composition, with real faces visible from the side. The tilt is stored per NODE and
+// composed into the same orientation quaternion the strut/anchor math reads
+// (supportDistanceWorld and friends), so rebuilding the scene recomputes
+// every strut, wire anchor and the base drop against the TILTED geometry -
+// the supports genuinely support the new orientations rather than pointing
+// at where the flat shapes used to be.
+let scrambleMode = false;
+// Per-axis tilt range in degrees. Each axis rolls independently in
+// [MIN, MAX] with a random sign, so the combined tilt can reach a bit
+// beyond MAX when both axes land high.
+const SCRAMBLE_MIN_DEG = 1;
+const SCRAMBLE_MAX_DEG = 33;
+function rollScrambleQuat() {
+  const tilt = () => (SCRAMBLE_MIN_DEG + Math.random() * (SCRAMBLE_MAX_DEG - SCRAMBLE_MIN_DEG))
+    * (Math.PI / 180) * (Math.random() < 0.5 ? -1 : 1);
+  return BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, tilt())
+    .multiply(BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, tilt()));
+}
+window.getScrambleMode = function () { return scrambleMode; };
+// Toggling rebuilds the whole 3D scene (convertShapesTo3D already tears down
+// and reconstructs cleanly - it's the same path the 2D->3D toggle uses).
+// Each activation re-rolls the tilts: it is a scramble, not a pose.
+window.setScrambleMode = function (on) {
+  scrambleMode = !!on;
+  if (babylonScene) convertShapesTo3D();
+};
+
 function convertShapesTo3D() {
   if (!babylonScene) {
     console.error('Babylon scene not ready');
@@ -673,6 +706,11 @@ function convertShapesTo3D() {
   const baseNode = createBaseTier1Node(tier1Nodes);
   if (baseNode) tier1Nodes.push(baseNode);
 
+  // Scramble tilts are rolled BEFORE placement so buildElementTree's own
+  // overlap/floor checks (which read orientation through
+  // supportDistanceWorld) already see the tilted extents. The base never
+  // scrambles - it is the one thing that must stay flat on the ground.
+  tier1Nodes.forEach(n => { n.scrambleQuat = (scrambleMode && !n.isBase) ? rollScrambleQuat() : null; });
   buildElementTree(tier1Nodes); // mutates every node's resolved x/y/z in place - x/y = origX/origY unchanged, only z is resolved
   console.log(`📐 Placed ${tier1Nodes.length} Tier-1 shape(s) at their exact original 2D positions, depth-only resolved`);
 
@@ -755,7 +793,7 @@ function convertShapesTo3D() {
   shapes.forEach((shape, i) => {
     const node = skeletonNodeFor[i];
     const success = create3DShape(shape, i, node ? -node.z : 0, node ? node.contactDir : null,
-      node ? { x: node.x, y: node.y } : null);
+      node ? { x: node.x, y: node.y } : null, node ? node.scrambleQuat : null);
     if (success) {
       totalConverted++;
       conversionStats.skeletons++;
@@ -796,7 +834,8 @@ function convertShapesTo3D() {
       if (anchor && anchor.primaryAnchorWorld) markerPoint = anchor.primaryAnchorWorld;
       anchorTarget = anchor ? anchor.targetNode : null;
     }
-    const success = create3DShape(shape, i + shapes.length, layerZ, contactDir, resolvedXY);
+    const success = create3DShape(shape, i + shapes.length, layerZ, contactDir, resolvedXY,
+      node ? node.scrambleQuat : null);
     if (success) {
       totalConverted++;
       conversionStats.ornaments++;
@@ -842,7 +881,8 @@ function convertShapesTo3D() {
   // Lattices (Tier 1 - real volume, mutual non-overlap already resolved above)
   lattices.forEach((lattice, i) => {
     const node = latticeNodeFor[i];
-    const success = create3DLattice(lattice, i, node ? -node.z : 0, node ? { x: node.x, y: node.y } : null);
+    const success = create3DLattice(lattice, i, node ? -node.z : 0, node ? { x: node.x, y: node.y } : null,
+      node ? node.scrambleQuat : null);
     if (success) {
       totalConverted++;
       conversionStats.lattices++;
@@ -1721,6 +1761,119 @@ function bodyColor3D(rgba) {
 // without visually competing with the rings it's supporting.
 const CLEAR_RESIN_COLOR = { r: 0.93, g: 0.96, b: 0.99, a: 0.05 };
 
+// ===== Volume density gradient (EXPORT ONLY) =====
+// On screen a body is 60% translucent, and that is what makes it read as a
+// volume: you see through it to its far wall and the layering does the work.
+// The AR export can't use that - USDZ_BODY_OPACITY is 1 because translucent
+// surfaces in RealityKit pick up environment reflection and washed every
+// vivid colour to pastel, and 50+ of them sort badly. With translucency gone
+// nothing conveyed volume at all, so shapes exported flat and plasticky.
+//
+// This replaces it: colour becomes a FUNCTION OF 3D POSITION - dense and
+// saturated at the core, lifting toward the rim, like pigment suspended in
+// cast resin. Because the field is evaluated in the mesh's own local space,
+// every face of a shape agrees with every other, so the object reads as one
+// carved solid instead of six independently painted faces. That is the whole
+// point; a per-face material can't express it.
+//
+// This is a deliberate divergence from the app's rendering, not drift: the
+// two are conveying the same property through different means because one of
+// them can afford translucency and the other cannot.
+// Gentler and with a much broader dense plateau than the first pass, for the
+// same reason as the opacity note below: on a flat face most of the surface
+// sits at high `t`, so a strong ramp starting early bleaches the majority of
+// every shape and reads as an unfinished fill rather than as depth.
+const USDZ_GRADIENT_STRENGTH = 0.35; // 0 = flat (feature off), 1 = full falloff
+const USDZ_GRADIENT_CORE = 0.55;     // t at or below this stays fully dense
+const USDZ_GRADIENT_LIFT = 0.45;     // how far the rim lifts toward white
+const USDZ_RAMP_TEXELS = 256;        // width of the 1-D ramp PNG
+// Per-mesh tessellation ceiling, SOFT: once reached, the remaining triangles
+// of that pass are emitted unsplit, so the real total can overshoot by the
+// tail of one level (measured ~13%). USDA is ASCII, so every added triangle
+// costs real bytes and parse time on the phone - this is what stops a dense
+// composition producing a file the device won't open.
+const USDZ_GRADIENT_MAX_TRIS = 2000;
+
+// Marks a mesh as a solid coloured BODY, i.e. something the density gradient
+// should fill. Deliberately NOT applied to: black outlines and wires (crisp
+// opaque strokes are part of the 2D look), the struts and base (their own
+// materials), or the three CLEAR_RESIN_COLOR volumes, which are meant to be
+// nearly invisible and which a gradient would only make noticeable.
+// The clear-resin volumes (5% alpha) exist to suggest "there is clear material
+// holding this together" in a scene where bodies are translucent. In AR bodies
+// are OPAQUE, so the resin contributes nothing visible - while its surfaces sit
+// coplanar with the shape they wrap (the semiCircle ghost is a full disc over a
+// half-disc), which is a textbook z-fighting pair and the likeliest cause of
+// the shimmer on open semicircles. Dropped from USDZ, kept in OBJ so the Rhino
+// output is unchanged.
+function tagResinVolume(mesh) {
+  if (!mesh) return mesh;
+  mesh.metadata = Object.assign({}, mesh.metadata, { skipUsdz: true });
+  return mesh;
+}
+
+function tagVolumeBody(mesh) {
+  if (!mesh) return mesh;
+  mesh.metadata = Object.assign({}, mesh.metadata, { volumeGradient: true });
+  return mesh;
+}
+
+// Local-space centre, plus BOTH the bounding-corner radius (used to size
+// tessellation) and the range of distances that actually occur on the
+// surface (used to normalise the ramp).
+//
+// Those two are very different numbers, and using the wrong one flattens the
+// effect: a cube's centroid is buried inside the solid, so its nearest
+// SURFACE point sits at 0.58 of the corner radius. Normalising against the
+// corner radius would confine every visible pixel to the 0.58-1.0 part of
+// the ramp - the dense core would exist only inside the material, where
+// nobody can see it. Normalising against the observed range instead means
+// every shape uses the full ramp whatever its proportions, so a flat disc
+// and a chunky prism both read properly.
+function densityField(positions) {
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < positions.length; i += 3) {
+    const x = positions[i], y = positions[i + 1], z = positions[i + 2];
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+  }
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+  const R = Math.max(Math.hypot(maxX - cx, maxY - cy, maxZ - cz), 1e-6);
+  let dMin = Infinity, dMax = 0;
+  for (let i = 0; i < positions.length; i += 3) {
+    const d = Math.hypot(positions[i] - cx, positions[i + 1] - cy, positions[i + 2] - cz);
+    if (d < dMin) dMin = d;
+    if (d > dMax) dMax = d;
+  }
+  if (!isFinite(dMin)) dMin = 0;
+  return { cx, cy, cz, R, dMin, dMax: Math.max(dMax, dMin + 1e-6) };
+}
+
+// 0 at the densest point of the surface, 1 at the furthest. Deliberately NOT
+// eased here - the easing curve lives in the ramp texture, so `t` only ever
+// has to interpolate linearly between vertices, which a GPU does exactly.
+function densityAt(field, x, y, z) {
+  const d = Math.hypot(x - field.cx, y - field.cy, z - field.cz);
+  const t = (d - field.dMin) / (field.dMax - field.dMin);
+  return t < 0 ? 0 : t > 1 ? 1 : t;
+}
+
+// The colour at a given t: full strength through the core, lifting toward
+// white past USDZ_GRADIENT_CORE. saturate3D is reused so the dense end keeps
+// exactly the saturation compensation every other body colour gets.
+function densityColorAt(rgba, t) {
+  const span = 1 - USDZ_GRADIENT_CORE;
+  const k = span <= 0 ? 0 : Math.max(0, Math.min(1, (t - USDZ_GRADIENT_CORE) / span));
+  // smoothstep - a broad dense core with the falloff gathered near the rim,
+  // which reads as pigment density rather than as a linear wash.
+  const eased = k * k * (3 - 2 * k) * USDZ_GRADIENT_STRENGTH;
+  const core = saturate3D(rgba);
+  const lift = (v) => v + (1 - v) * USDZ_GRADIENT_LIFT * eased;
+  return { r: lift(core.r), g: lift(core.g), b: lift(core.b), a: rgba.a };
+}
+
 function p5ColToRGBA(c) {
   // Handle p5.Color object
   if (c && c.levels) {
@@ -2300,6 +2453,12 @@ const BASE_MARGIN = 4;
 //   MULTIPLIES the material's own emissive tone, so if a Babylon build ever
 //   skips the Fresnel block the strut still renders its correct flat metal
 //   colour - just without the sheen.
+// Bump this whenever the exporter changes. It is reported ON SCREEN when the
+// AR model is built (not just to the console, which is unreachable from a
+// phone without Web Inspector), so "am I actually running the new code?" is
+// answerable in one tap. A stale stamp means cached JS, not a failed fix.
+const USDZ_EXPORTER_BUILD = 'both-windings-blended';
+
 const SCULPTURE_MATERIAL_STORAGE_KEY = 'kandinsky3d.materials';
 
 const BASE_MATERIAL_OPTIONS = [
@@ -2533,7 +2692,12 @@ function baseSurfaceMaterial() {
     m.disableLighting = true;
   }
   // Flat stand-in colour for OBJ export - plain MTL can't carry the veining.
-  m.metadata = { exportColor: { r: opt.body.r, g: opt.body.g, b: opt.body.b, a: 1 } };
+  // `usd` drives the AR/USDZ export: real stone and wood are lit, not
+  // self-lit, so emission stays low (see meshUsdSurface).
+  m.metadata = {
+    exportColor: { r: opt.body.r, g: opt.body.g, b: opt.body.b, a: 1 },
+    usd: { metallic: 0, roughness: opt.kind === 'wood' ? 0.55 : 0.3, emissive: 0 }
+  };
   sculptureMatCache.base = m;
   sculptureMatCache.baseTex = tex;
   return m;
@@ -2548,7 +2712,13 @@ function strutSurfaceMaterial(grounded) {
   if (sculptureMatCache[key]) return sculptureMatCache[key];
   const opt = grounded ? strutMaterialOption() : STRUT_MATERIAL_OPTIONS.find(o => o.id === 'black');
   const m = unlitMat(`strut_mat_${key}_${opt.id}`, opt.kind === 'resin' ? opt.tone : { ...opt.tone, a: 1 });
-  if (opt.kind !== 'resin') applyMetalFinish(m, opt);
+  if (opt.kind !== 'resin') {
+    applyMetalFinish(m, opt);
+    // Real metal in AR: fully metallic, and NOT emissive - it should catch
+    // the room's light rather than glow, which is the whole point of seeing
+    // brass or steel on an actual desk.
+    m.metadata.usd = { metallic: 1, roughness: 0.25, emissive: 0 };
+  }
   sculptureMatCache[key] = m;
   return m;
 }
@@ -2618,6 +2788,8 @@ function blackWireMaterial(alpha) {
   if (blackWireMats.has(key)) return blackWireMats.get(key);
   const m = unlitMat(`blackwire_mat_${key}`, { ...BLACK_WIRE_METAL.tone, a: alpha });
   applyMetalFinish(m, BLACK_WIRE_METAL);
+  m.metadata.usd = { metallic: 1, roughness: 0.38, emissive: 0 }; // blackened steel, same family as the struts
+
   blackWireMats.set(key, m);
   return m;
 }
@@ -3102,6 +3274,10 @@ function createBaseMesh3D(node) {
   const botCap = BABYLON.MeshBuilder.CreateGround('base_solid_capBot', { width: w, height: d }, babylonScene);
   botCap.position = new BABYLON.Vector3(wc.x, botY, wc.z);
   botCap.material = slabMat;
+  // The one texture worth carrying into AR: it sits on real solid geometry
+  // with no alpha cutout, so none of the padded-rectangle failure modes that
+  // forced open shapes back to flat colour apply here.
+  [sides, topCap, botCap].forEach(m => { m.metadata = { usdTexture: true }; });
   baseSurfaceMeshes.push(sides, topCap, botCap);
 
   // Black outline on EVERY real edge, not just the outermost ones - each
@@ -3519,7 +3695,8 @@ function supportDistanceWorld(nodeInfo, tiltDir, worldDir) {
   const quat = (tiltDir && nodeInfo.localProfile)
     ? computeContactTilt(nodeInfo.shapeType, nodeInfo.s, nodeInfo.rotZ, tiltDir)
     : null;
-  const q = quat || nodeInfo.fixedOrientation || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, nodeInfo.rotZ || 0);
+  let q = quat || nodeInfo.fixedOrientation || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, nodeInfo.rotZ || 0);
+  if (nodeInfo.scrambleQuat) q = nodeInfo.scrambleQuat.multiply(q); // scramble composes on top, matching create3DShape
   const localDir = worldToLocalDir(worldDir, q);
   return profileSupportDistance(profile, localDir, zHalf);
 }
@@ -3542,7 +3719,8 @@ function trueLowestReach(nodeInfo, tiltDir) {
   const quat = (tiltDir && nodeInfo.localProfile)
     ? computeContactTilt(nodeInfo.shapeType, nodeInfo.s, nodeInfo.rotZ, tiltDir)
     : null;
-  const q = quat || nodeInfo.fixedOrientation || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, nodeInfo.rotZ || 0);
+  let q = quat || nodeInfo.fixedOrientation || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, nodeInfo.rotZ || 0);
+  if (nodeInfo.scrambleQuat) q = nodeInfo.scrambleQuat.multiply(q); // scramble composes on top, matching create3DShape
   let maxDrop = 0;
   profile.vertices.forEach(v => {
     const world = rotateVecByQuat({ x: v.x, y: v.y, z: 0 }, q);
@@ -3640,7 +3818,8 @@ function clearWireZTilt(samplePixelPts, deltaPixel, touchZ, anchorT, zTilt, tier
 function semiCircleAwareDistance(nodeInfo, worldDir) {
   const baseDist = supportDistanceWorld(nodeInfo, nodeInfo.contactDir, worldDir);
   if (nodeInfo.shapeType !== 'semiCircle') return baseDist;
-  const q = nodeInfo.fixedOrientation || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, nodeInfo.rotZ || 0);
+  let q = nodeInfo.fixedOrientation || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, nodeInfo.rotZ || 0);
+  if (nodeInfo.scrambleQuat) q = nodeInfo.scrambleQuat.multiply(q);
   const localDir = worldToLocalDir(worldDir, q);
   const inPlaneLen = Math.hypot(localDir.x, localDir.y);
   if (inPlaneLen > 1e-6 && localDir.y / inPlaneLen > 0.05) {
@@ -3650,7 +3829,7 @@ function semiCircleAwareDistance(nodeInfo, worldDir) {
   return baseDist;
 }
 
-function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY = null) {
+function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY = null, scrambleQuat = null) {
   if (!shape || !babylonScene) {
     console.warn('Cannot create shape - missing shape or scene');
     return false;
@@ -3684,8 +3863,17 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
   // unaffected - meshX/Y/Z/RotZ just fall back to the plain xPos/yPos/zPos/rotZ
   // used everywhere today.
   const contactQuat = contactDir ? computeContactTilt(shape.type, s, rotZ, contactDir) : null;
+  // Scramble composes ON TOP of whatever base orientation the shape has -
+  // the contact tilt when there is one (contactQuat already includes rotZ),
+  // plain Rz otherwise - using the same expression the support math uses,
+  // so struts and meshes can never disagree about where a face points.
+  let orientQuat = contactQuat;
+  if (scrambleQuat) {
+    orientQuat = scrambleQuat.multiply(
+      contactQuat || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, rotZ));
+  }
   let tiltNode = null;
-  if (contactQuat) {
+  if (orientQuat) {
     // Pivot at the shape's TRUE geometric center, not its anchor point -
     // for circle/rect/triangle/semiCircle these coincide (zOffset 0), but
     // concentricCircle's anchor sits off-center from its ring stack
@@ -3698,7 +3886,7 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
     const trueCenterZ = zPos - (vol ? vol.zOffset : 0);
     tiltNode = new BABYLON.TransformNode(`tilt_${index}`, babylonScene);
     tiltNode.position = new BABYLON.Vector3(xPos, yPos, trueCenterZ);
-    tiltNode.rotationQuaternion = contactQuat;
+    tiltNode.rotationQuaternion = orientQuat;
   }
   const meshX = tiltNode ? 0 : xPos;
   const meshY = tiltNode ? 0 : yPos;
@@ -3711,9 +3899,9 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
       if (shape.style === 'halo') {
         return createHalo3D(shape, index, xPos, yPos, zPos, s, swr);
       }
-      const disc = BABYLON.MeshBuilder.CreateCylinder(`shape_${index}`, {
+      const disc = tagVolumeBody(BABYLON.MeshBuilder.CreateCylinder(`shape_${index}`, {
         diameter: s, height: depth, tessellation: 64
-      }, babylonScene);
+      }, babylonScene));
       disc.rotation.x = Math.PI / 2;
       disc.position = new BABYLON.Vector3(meshX, meshY, meshZ);
       disc.material = unlitMat(`mat_${index}`, fill);
@@ -3726,7 +3914,7 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
     if (shape.type === 'rect') {
       if (shape.style === 'open') return createOpenShape3D(shape, index, meshX, meshY, meshZ, s, meshRotZ, tiltNode);
       const w = s, h = s * 0.6;
-      const box = BABYLON.MeshBuilder.CreateBox(`shape_${index}`, { width: w, height: h, depth: depth }, babylonScene);
+      const box = tagVolumeBody(BABYLON.MeshBuilder.CreateBox(`shape_${index}`, { width: w, height: h, depth: depth }, babylonScene));
       box.position = new BABYLON.Vector3(meshX, meshY, meshZ);
       box.rotation.z = meshRotZ;
       box.material = unlitMat(`mat_${index}`, fill);
@@ -3745,11 +3933,11 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
       if (shape.style === 'open') return createOpenShape3D(shape, index, meshX, meshY, meshZ, s, meshRotZ, tiltNode);
       const h = s * Math.sqrt(3) / 2;
       // Triangular PRISM (real 3D volume) - exact same profile as the 2D triangle
-      extrudePrism(`shape_${index}`, [
+      tagVolumeBody(extrudePrism(`shape_${index}`, [
         new BABYLON.Vector3(-s / 2, -h / 3, 0),
         new BABYLON.Vector3(s / 2, -h / 3, 0),
         new BABYLON.Vector3(0, 2 * h / 3, 0)
-      ], depth, fill, meshX, meshY, meshZ, meshRotZ, tiltNode);
+      ], depth, fill, meshX, meshY, meshZ, meshRotZ, tiltNode));
       const v = [
         new BABYLON.Vector3(-s / 2, -h / 3, 0),
         new BABYLON.Vector3(s / 2, -h / 3, 0),
@@ -3778,12 +3966,12 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
         // geometry, not a repeat of that.
         if (success) {
           const ghostFill = CLEAR_RESIN_COLOR; // colorless (not tinted with the shape's own hue) - same neutral clear-resin material used elsewhere in the piece
-          extrudePrism(`shape_${index}_ghost`, arcPathLocal(s / 2, 0, Math.PI * 2, 96), depth, ghostFill, meshX, meshY, meshZ, meshRotZ, tiltNode);
+          tagResinVolume(extrudePrism(`shape_${index}_ghost`, arcPathLocal(s / 2, 0, Math.PI * 2, 96), depth, ghostFill, meshX, meshY, meshZ, meshRotZ, tiltNode));
         }
         return success;
       }
       // Half-disc WEDGE (real 3D volume) - profile matches the 2D bottom-half arc exactly
-      extrudePrism(`shape_${index}`, arcPathLocal(s / 2, 0, Math.PI, 48), depth, fill, meshX, meshY, meshZ, meshRotZ, tiltNode);
+      tagVolumeBody(extrudePrism(`shape_${index}`, arcPathLocal(s / 2, 0, Math.PI, 48), depth, fill, meshX, meshY, meshZ, meshRotZ, tiltNode));
       // 2D stroke follows the curved edge only (the flat diameter edge stays unstroked)
       const semiArc = arcPathLocal(s / 2, 0, Math.PI, 48);
       addPrismOutline(`outline_${index}`, semiArc, depth, swr, meshX, meshY, meshZ, meshRotZ,
@@ -3815,9 +4003,9 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
     }
 
     // ---- fallback: plain disc ----
-    const disc = BABYLON.MeshBuilder.CreateCylinder(`shape_${index}`, {
+    const disc = tagVolumeBody(BABYLON.MeshBuilder.CreateCylinder(`shape_${index}`, {
       diameter: s, height: 0.3, tessellation: 64
-    }, babylonScene);
+    }, babylonScene));
     disc.rotation.x = Math.PI / 2;
     disc.position = new BABYLON.Vector3(xPos, yPos, zPos);
     disc.material = unlitMat(`mat_${index}`, fill);
@@ -3893,9 +4081,9 @@ function createHalo3D(shape, index, x, y, z, s, swr) {
       front += 8 * 0.03; // same total depth budget the old 8-layer stack used - keeps haloRingSpan's formula (and the shell/anchor math built on it) unchanged
     } else {
       // Thin solid cylinder per ring = real 3D volume
-      const disc = BABYLON.MeshBuilder.CreateCylinder(`halo_${index}_${i}`, {
+      const disc = tagVolumeBody(BABYLON.MeshBuilder.CreateCylinder(`halo_${index}_${i}`, {
         diameter: radius * 2, height: 0.4, tessellation: 64
-      }, babylonScene);
+      }, babylonScene));
       disc.rotation.x = Math.PI / 2;
       disc.position = new BABYLON.Vector3(x, y, z - front);
       disc.material = unlitMat(`haloMat_${index}_${i}`, muted);
@@ -3914,7 +4102,7 @@ function createHalo3D(shape, index, x, y, z, s, swr) {
   // reading as a flat plate trailing behind them.
   const shellMargin = Math.max(0.4, maxR * 0.06);
   const shellDepth = front + shellMargin * 2;
-  extrudePrism(`haloResin_${index}`, arcPathLocal(maxR, 0, Math.PI * 2, 64), shellDepth, CLEAR_RESIN_COLOR, x, y, z - front / 2);
+  tagResinVolume(extrudePrism(`haloResin_${index}`, arcPathLocal(maxR, 0, Math.PI * 2, 64), shellDepth, CLEAR_RESIN_COLOR, x, y, z - front / 2));
 
   return true;
 }
@@ -3933,9 +4121,9 @@ function createConcentricCircle3D(shape, index, x, y, z, tiltNode = null) {
     const radius = i * diff3;
     if (radius <= 0) continue;
     // Thin solid cylinder per ring = real 3D volume
-    const disc = BABYLON.MeshBuilder.CreateCylinder(`concentric_${index}_${i}`, {
+    const disc = tagVolumeBody(BABYLON.MeshBuilder.CreateCylinder(`concentric_${index}_${i}`, {
       diameter: radius * 2, height: 0.5, tessellation: 64
-    }, babylonScene);
+    }, babylonScene));
     disc.rotation.x = Math.PI / 2;
     // Smaller rings drawn later in 2D = slightly in front here. When tilted
     // (contact placement gave this shape a real touching neighbor), the ring
@@ -3975,7 +4163,7 @@ function createConcentricArc3D(shape, index, x, y, z, swr, rotZ, tiltNode = null
   const resinDepth = Math.max(0.8, outerR * 2 * 0.12); // must match computeShapeProfile3D's concentricArc zHalf*2
   const arcPts = arcPathLocal(outerR, a0, a1, 48);
   const wedgeProfile = [new BABYLON.Vector3(0, 0, 0), ...arcPts];
-  extrudePrism(`concentricArcResin_${index}`, wedgeProfile, resinDepth, CLEAR_RESIN_COLOR, meshX, meshY, meshZ, meshRotZ, tiltNode);
+  tagResinVolume(extrudePrism(`concentricArcResin_${index}`, wedgeProfile, resinDepth, CLEAR_RESIN_COLOR, meshX, meshY, meshZ, meshRotZ, tiltNode));
   // No outline - a real black edge read as too heavy/solid for something meant
   // to look like clear resin. The near-invisible fill plus the rings it holds
   // is enough to convey "there's material here," per the user's call.
@@ -4177,9 +4365,25 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ, tiltNode = null) {
     front.metadata = {
       exportColor: { r: exportFillRGBA.r, g: exportFillRGBA.g, b: exportFillRGBA.b, a: 0.5 },
       exportPolygon: profile.map(p => ({ x: p.x, y: p.y })),
-      exportDepth: depth
+      exportDepth: depth,
+      // Treated as a solid BODY on export, exactly like every closed shape.
+      // exportPolygon already substitutes a real closed prism here, so there
+      // is nothing about an open shape that needs different handling - and
+      // without this tag it was the only artwork left on the PBR-lit path
+      // while everything else went unlit, so it alone still shaded by face
+      // orientation and its front face went dark. It now gets the same unlit
+      // material, the same density ramp and the same tessellation.
+      volumeGradient: true,
+      // The substituted prism is built centred on local zero, but this plane
+      // is parked at meshZ - depth/2 (it's the FRONT face, not the middle),
+      // so transforming by its matrix would land the fill half a depth
+      // behind its own outline - the outline tubes are placed at meshZ.
+      // Shift local Z by +depth/2 to put the prism back on the true centre.
+      exportZOffset: depth / 2
     };
   }
+  // Skipped by BOTH exporters: the front plane's polygon substitution
+  // already produces a real solid prism covering front, back and walls.
   back.metadata = { skipExport: true };
 
   if (profile) {
@@ -5145,7 +5349,7 @@ function computeConnectorAnchor(kind, raw, globalIndex, tier1Placed, forcedTarge
 // K3D_SCALE, negate Y) - simpler and safer than re-deriving a shared
 // rotation, since each cell's own points already encode the lattice's true
 // orientation exactly, whatever it is.
-function create3DLattice(lattice, index, layerZ = 0, resolvedXY = null) {
+function create3DLattice(lattice, index, layerZ = 0, resolvedXY = null, scrambleQuat = null) {
   if (!lattice || !babylonScene) {
     console.warn('Cannot create lattice - missing lattice or scene');
     return false;
@@ -5160,7 +5364,19 @@ function create3DLattice(lattice, index, layerZ = 0, resolvedXY = null) {
   // full Tier-1 tree participant, not read from lattice.x/y directly.
   const x = resolvedXY ? resolvedXY.x : (lattice.x - window.innerWidth / 2) / K3D_SCALE;
   const y = resolvedXY ? resolvedXY.y : -(lattice.y - window.innerHeight / 2) / K3D_SCALE;
+
+  // Scramble: one pivot at the lattice centre carries the tilt for every
+  // cell and frame ribbon; the geometry below is then built at the local
+  // origin instead of at (x, y, z). Named tilt_* so convertShapesTo3D's
+  // teardown disposes it with the other tilt nodes.
+  const latticeParent = scrambleQuat ? new BABYLON.TransformNode(`tilt_lattice_${index}`, babylonScene) : null;
+  const lx = latticeParent ? 0 : x, ly = latticeParent ? 0 : y;
   const z = -layerZ;
+  if (latticeParent) {
+    latticeParent.position = new BABYLON.Vector3(x, y, z);
+    latticeParent.rotationQuaternion = scrambleQuat;
+  }
+  const lz = latticeParent ? 0 : z;
 
   // "The entire ensemble should be half as deep as a standard rect" - same
   // size basis (latticeLocalGeometry's rotated-frame bounding box) the
@@ -5198,7 +5414,7 @@ function create3DLattice(lattice, index, layerZ = 0, resolvedXY = null) {
     // layered, softly-blended look ("the beauty of the 2D representation") -
     // now the shared global body treatment instead of a lattice-only 0.85.
     const rgba = bodyColor3D(p5ColToRGBA(col));
-    extrudePrism(`lattice_${index}_${ci}`, shrunkPts, depth, rgba, x, y, z);
+    tagVolumeBody(extrudePrism(`lattice_${index}_${ci}`, shrunkPts, depth, rgba, lx, ly, lz, 0, latticeParent));
 
     // Black ring frame filling the shrink gap - a CreateRibbon surface
     // stretched between the cell's full-size outer boundary and its shrunk
@@ -5212,13 +5428,14 @@ function create3DLattice(lattice, index, layerZ = 0, resolvedXY = null) {
     const outerLoop = p => [...pts.map(v => new BABYLON.Vector3(v.x, v.y, p)), new BABYLON.Vector3(pts[0].x, pts[0].y, p)];
     const innerLoop = p => [...shrunkPts.map(v => new BABYLON.Vector3(v.x, v.y, p)), new BABYLON.Vector3(shrunkPts[0].x, shrunkPts[0].y, p)];
     const FRAME_Z_PAD = 0.02;
-    [z - depth / 2 - FRAME_Z_PAD, z + depth / 2 + FRAME_Z_PAD].forEach((pz, side) => {
+    [lz - depth / 2 - FRAME_Z_PAD, lz + depth / 2 + FRAME_Z_PAD].forEach((pz, side) => {
       const ribbon = BABYLON.MeshBuilder.CreateRibbon(`latticeFrame_${index}_${ci}_${side}`, {
         pathArray: [outerLoop(pz), innerLoop(pz)],
         sideOrientation: BABYLON.Mesh.DOUBLESIDE
       }, babylonScene);
-      ribbon.position = new BABYLON.Vector3(x, y, 0);
+      ribbon.position = new BABYLON.Vector3(lx, ly, 0);
       ribbon.material = unlitMat(`latticeFrame_${index}_${ci}_${side}_mat`, K3D_BLACK);
+      if (latticeParent) ribbon.parent = latticeParent;
     });
     built++;
   });
@@ -5299,7 +5516,11 @@ function crc32(bytes) {
   return (crc ^ 0xFFFFFFFF) >>> 0;
 }
 
-function buildZip(files) {
+// `alignDataTo`: USDZ requires every file's DATA to begin on a 64-byte
+// boundary, and the only legal place to insert that slack is the local
+// header's extra field - so it's padded with zero bytes to suit. 0 disables
+// it (the .obj/.mtl zip has no such requirement).
+function buildZip(files, alignDataTo = 0, mime = 'application/zip') {
   // files: [{ name, data: Uint8Array }]
   const encoder = new TextEncoder();
   const localParts = [], centralParts = [];
@@ -5319,10 +5540,15 @@ function buildZip(files) {
     localHeader.setUint32(14, crc, true);
     localHeader.setUint32(18, data.length, true);  // compressed size
     localHeader.setUint32(22, data.length, true);  // uncompressed size
+    let extraLen = 0;
+    if (alignDataTo > 0) {
+      const dataStart = offset + 30 + nameBytes.length;
+      extraLen = (alignDataTo - (dataStart % alignDataTo)) % alignDataTo;
+    }
     localHeader.setUint16(26, nameBytes.length, true);
-    localHeader.setUint16(28, 0, true);            // extra field length
+    localHeader.setUint16(28, extraLen, true);      // extra field = alignment padding
 
-    localParts.push(new Uint8Array(localHeader.buffer), nameBytes, data);
+    localParts.push(new Uint8Array(localHeader.buffer), nameBytes, new Uint8Array(extraLen), data);
 
     const centralHeader = new DataView(new ArrayBuffer(46));
     centralHeader.setUint32(0, 0x02014b50, true);  // central directory signature
@@ -5345,7 +5571,7 @@ function buildZip(files) {
 
     centralParts.push(new Uint8Array(centralHeader.buffer), nameBytes);
 
-    offset += 30 + nameBytes.length + data.length;
+    offset += 30 + nameBytes.length + extraLen + data.length;
   });
 
   const centralStart = offset;
@@ -5362,9 +5588,1129 @@ function buildZip(files) {
   eocd.setUint32(16, centralStart, true);
   eocd.setUint16(20, 0, true);
 
-  return new Blob([...localParts, ...centralParts, new Uint8Array(eocd.buffer)], { type: 'application/zip' });
+  return new Blob([...localParts, ...centralParts, new Uint8Array(eocd.buffer)], { type: mime });
 }
 
+// The geometry an exporter should actually write for a mesh, in the mesh's
+// LOCAL space - shared by OBJ and USDZ. For "open" shapes the live mesh is a
+// texture-alpha cutout plane, so its real polygon footprint is substituted
+// and re-centred (see exportZOffset).
+function exportGeometryFor(mesh) {
+  let geom;
+  if (mesh.metadata && mesh.metadata.exportPolygon) {
+    const built = polygonPrismGeometry(mesh.metadata.exportPolygon, mesh.metadata.exportDepth || 0);
+    const dz = mesh.metadata.exportZOffset || 0;
+    if (dz) for (let i = 2; i < built.positions.length; i += 3) built.positions[i] += dz;
+    geom = built;
+  } else {
+    geom = {
+      positions: mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind),
+      indices: mesh.getIndices()
+    };
+  }
+  // Runs AFTER the polygon substitution, so an open shape tessellates its
+  // true prism rather than the padded plane it is on screen.
+  if (mesh.metadata && mesh.metadata.volumeGradient) geom = tessellateForGradient(geom);
+  return geom;
+}
+
+// Splits triangles 1->4 until no edge is longer than R/6, so a radial density
+// field has vertices to interpolate between.
+//
+// Why this is needed at all: a box's four face corners are all EQUIDISTANT
+// from its centroid, so a radial field evaluated only at the corners
+// interpolates to a perfectly flat face - the gradient would simply vanish on
+// exactly the shapes it matters most for. (A purely LINEAR ramp needs no
+// subdivision, since barycentric interpolation of a position-linear function
+// is exact. A radial one does.)
+//
+// Export-only, so it costs the running app nothing - which is what makes it
+// affordable to add vertices this freely.
+function tessellateForGradient(geom) {
+  const { positions, indices } = geom;
+  if (!positions || !indices || indices.length < 3) return geom;
+  const field = densityField(positions);
+  const maxEdge = field.R / 6;
+
+  let pos = Array.from(positions);
+  let idx = Array.from(indices);
+  // Dedupe split points by midpoint key so neighbouring triangles share the
+  // new vertex - without this the mesh cracks apart along every split edge.
+  const midCache = new Map();
+  const midpoint = (a, b) => {
+    const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+    const hit = midCache.get(key);
+    if (hit !== undefined) return hit;
+    const ax = pos[a * 3], ay = pos[a * 3 + 1], az = pos[a * 3 + 2];
+    const bx = pos[b * 3], by = pos[b * 3 + 1], bz = pos[b * 3 + 2];
+    const m = pos.length / 3;
+    pos.push((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
+    midCache.set(key, m);
+    return m;
+  };
+  const edgeLen = (a, b) => Math.hypot(
+    pos[a * 3] - pos[b * 3], pos[a * 3 + 1] - pos[b * 3 + 1], pos[a * 3 + 2] - pos[b * 3 + 2]
+  );
+
+  // Breadth-first: one full pass per level, bailing the moment the budget is
+  // reached so a pathological mesh can't blow the file up.
+  for (let level = 0; level < 4; level++) {
+    if (idx.length / 3 >= USDZ_GRADIENT_MAX_TRIS) break;
+    let split = false;
+    const next = [];
+    for (let t = 0; t + 2 < idx.length; t += 3) {
+      const a = idx[t], b = idx[t + 1], c = idx[t + 2];
+      const longest = Math.max(edgeLen(a, b), edgeLen(b, c), edgeLen(c, a));
+      if (longest <= maxEdge || next.length / 3 >= USDZ_GRADIENT_MAX_TRIS) {
+        next.push(a, b, c);
+        continue;
+      }
+      const ab = midpoint(a, b), bc = midpoint(b, c), ca = midpoint(c, a);
+      // Winding preserved on all four children - the export relies on
+      // winding alone for face direction (it writes no normals).
+      next.push(a, ab, ca, ab, b, bc, ca, bc, c, ab, bc, ca);
+      split = true;
+    }
+    idx = next;
+    if (!split) break;
+  }
+  return { positions: pos, indices: idx };
+}
+
+// Every artwork mesh, skybox excluded - shared by the OBJ and USDZ exporters
+// so the two can never disagree about what "the sculpture" is.
+// The identical mesh set for OBJ and USDZ - the two exporters should be
+// looking at the same sculpture, and divergence here is what let the USDZ
+// path drift into failure modes OBJ had never had.
+function collectExportMeshes() {
+  return babylonScene.meshes.filter(m =>
+    !m.name.startsWith('skyFace_') && m.isEnabled() && m.getTotalVertices() > 0 &&
+    !(m.metadata && m.metadata.skipExport)
+  );
+}
+
+// ===== USDZ export / iOS AR Quick Look =====
+// iOS Safari has NO WebXR, so there is no in-page AR on iPhone at all. The
+// only route is Apple's AR Quick Look: hand it a .usdz and the system viewer
+// handles surface detection, placement and scaling natively. A .usdz is just
+// an UNCOMPRESSED zip (see buildZip's alignDataTo) holding an ASCII .usda.
+//
+// The piece is unlit and emissive on screen; AR Quick Look is fully lit PBR.
+// A flat colour dropped into a real room's lighting goes muddy, so each
+// material carries a share of its colour as EMISSION to keep the self-lit
+// look - see meshUsdSurface and the `metadata.usd` hints on the base, strut
+// and wire materials.
+const USDZ_TARGET_SIZE_M = 0.32;  // longest dimension in metres - desk-sized
+
+// PBR stand-in for a mesh's flat colour. `metadata.usd` on a material
+// overrides the defaults (metals set metallic/roughness and drop emission,
+// since they SHOULD react to the room's light rather than glow).
+// On screen the shape bodies are 60% opaque so you can read the layering
+// through them. In AR that same stack of 50+ translucent meshes has to be
+// depth-sorted by a real-time renderer, and the result is mush - washed-out
+// colour and faces winking through each other. A physical resin sculpture on
+// a desk also simply reads more solid than the screen version. So anything
+// meant to be a BODY is pushed close to opaque, while genuinely near-
+// invisible things (the clear-resin strut option at 0.14, concentricArc's
+// wedge at 0.05) keep their transparency - they'd become ugly solids
+// otherwise. Tune with these two.
+// Bodies are translucent again, but only because the thing that ruined it the
+// first time is now suppressed at the source.
+//
+// The wash was NOT the background showing through - in the dark Object-mode
+// view the shapes were still pastel. It was the SPECULAR lobe: a dielectric
+// in UsdPreviewSurface carries an F0 reflection derived from `ior`, and
+// RealityKit lights it with environment IBL. On an opaque surface that reads
+// as a sheen; on a translucent one it lands on top of whatever shows through,
+// adding white to every body. Killing that lobe (see the specular-workflow
+// block in buildUsda) removes the cause rather than the symptom, so
+// translucency costs colour fidelity no more.
+// Body translucency - BLENDED, matching the app's BODY_ALPHA_3D (0.6), so a
+// shape's full volume reads exactly as it does on screen: front, back and
+// side walls all visible through each other.
+//
+// Why plain blending is safe HERE, when it burned us before: alpha blending
+// is only order-dependent when the stacked layers have DIFFERENT colours,
+// and a renderer never sorts the triangles inside one mesh. But a body
+// blending with ITSELF - front wall over back wall, same unlit colour, same
+// alpha - composites to the identical result in either order. The app relies
+// on exactly this (Babylon doesn't sort intra-mesh triangles either). Every
+// earlier "translucency looks broken" had a different, since-fixed cause
+// that made the two walls DIFFERENT: PBR lit them by orientation, specular
+// IBL whitened whatever faced the room, inverted winding removed one of
+// them, and an opacity wired to a texture stopped depth writes entirely.
+// With bodies unlit, specular dead and winding fixed, the commutativity
+// argument holds and blending is the right tool again.
+//
+// Where two DIFFERENT-coloured bodies overlap, per-mesh sort order can still
+// pick wrong at oblique angles - the app has the same ambiguity (see the
+// alpha-blend comment near the top of this file) and it reads fine there.
+const USDZ_BODY_OPACITY = 0.6;
+// The dither cutout is kept as a fallback (flip to true) but OFF: at phone
+// viewing distance the mask read as grain/noise, not glass.
+const USDZ_DITHER = false;
+// Cutout cells per metre of real-world size. Too coarse and the pattern reads
+// as visible grain; too fine and the phone's texture filtering averages the
+// mask away to a flat value, at which point the threshold test turns the
+// whole surface uniformly solid or invisible. ~700 puts a cell near 1.4mm,
+// small enough to read as glass at arm's length and large enough to survive
+// mip filtering.
+const USDZ_DITHER_CELLS_PER_M = 700;
+const USDZ_DITHER_TILE = 8; // dither matrix is TILE x TILE
+// Opacity across the density ramp. This is what stops the shapes reading as
+// EMPTY, and it is doing the job real volumetric absorption would.
+//
+// A translucent shell is visibly hollow: you see through the near wall to the
+// far one and the shape reads as an empty box, whatever colour its surfaces
+// are. Genuine Beer-Lambert absorption - thicker parts blocking more light -
+// isn't expressible in USDZ for a mesh. But thickness correlates with the
+// density field we already have: a shape is thick through its core and thin
+// at its edges. So the core is driven fully OPAQUE, which hides the far wall
+// exactly where you'd be looking through the most material, and the rim stays
+// see-through. The result reads as a solid piece of cast resin with soft
+// edges rather than a hollow shell - and unlike slicing or nested shells it
+// costs no extra geometry and cannot sort badly, because it changes only a
+// single alpha channel in the ramp.
+// UNIFORM by default, and that is the correction to a mistake worth recording:
+// fading alpha with distance-from-centre HOLLOWS OUT FLAT SHAPES. A thin slab
+// is mostly "far from centre" - only a small disc around its middle is near -
+// so a radial falloff eats nearly the whole face, leaving a complete black
+// outline around a fill that stops short of it. Open shapes, being the
+// flattest things in the piece, vanished almost entirely: "shape faces are
+// not complete, open shapes are empty".
+//
+// Radial distance is a fine proxy for thickness on a CHUNKY body and a bad
+// one on a flat plate, and this piece is mostly flat plates. So opacity is
+// left uniform and the volume cue is carried by COLOUR alone. Set RIM below
+// CORE only if you want deliberately vignetted edges.
+const USDZ_CORE_OPACITY = 1;
+const USDZ_RIM_OPACITY = 1;
+const USDZ_GLASS_BELOW = 0.25;   // at or under this it was meant to be barely-there - left alone
+const USDZ_OPAQUE_ABOVE = 0.995; // outlines, struts, the base: solid on screen, solid in AR
+// Emission fights the whole point of AR. Quick Look estimates the REAL light
+// direction and intensity in your room and lights the model with it - but an
+// emissive surface is self-lit and simply ignores that, so a high emissive
+// left the piece looking like a flat sticker floating on the desk instead of
+// an object sitting in the room. A whisper is kept so the darkest colours
+// don't go dead in a dim room; the room does the rest.
+const USDZ_EMISSIVE = 0.05;
+
+// Artwork bodies are exported UNLIT, exactly as unlitMat draws them on screen
+// - see the long note in buildUsda's material block for why every earlier
+// attempt to imitate that through PBR shading failed. Set false to hand the
+// bodies back to physical lighting (they will then shade by orientation, and
+// colour will depend on which way each face points).
+const USDZ_UNLIT_BODIES = true;
+
+function meshUsdSurface(mesh) {
+  const { c, a } = meshExportColor(mesh);
+  const hint = (mesh.material && mesh.material.metadata && mesh.material.metadata.usd) || {};
+  const opacity = a <= USDZ_GLASS_BELOW ? a
+    : a >= USDZ_OPAQUE_ABOVE ? 1
+      : USDZ_BODY_OPACITY;
+  return {
+    r: c.r, g: c.g, b: c.b, a: opacity,
+    metallic: hint.metallic !== undefined ? hint.metallic : 0,
+    roughness: hint.roughness !== undefined ? hint.roughness : 0.55,
+    emissive: hint.emissive !== undefined ? hint.emissive : USDZ_EMISSIVE
+  };
+}
+
+function usdVec(x, y, z, dp) { return `(${x.toFixed(dp)}, ${y.toFixed(dp)}, ${z.toFixed(dp)})`; }
+
+// Does this mesh's winding face OUTWARD? Decided per mesh from its own signed
+// volume rather than by assuming a convention - which is the point, because
+// the file mixes two conventions and guessing has cost several rounds:
+//
+//   - extrudePrism builds DOUBLESIDE, i.e. both windings in one mesh. Its
+//     halves cancel to ~zero volume, and it renders correctly either way.
+//   - CreateBox / CreateCylinder default to FRONTSIDE, a single winding, so
+//     they are the only bodies that can expose a mistake - and they did:
+//     inverted, a closed prism shows you its far interior wall through a
+//     missing near face, which reads as an open bowl and changes as you move.
+//
+// V = 1/6 sum(p0 . (p1 x p2)) is positive for outward-facing triangles in a
+// right-handed space. Near-zero means flat or double-sided - ambiguous, so
+// leave those alone and let `doubleSided` carry them.
+function windingIsOutward(pts, indices) {
+  let v = 0;
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < pts.length; i += 3) {
+    if (pts[i] < minX) minX = pts[i]; if (pts[i] > maxX) maxX = pts[i];
+    if (pts[i + 1] < minY) minY = pts[i + 1]; if (pts[i + 1] > maxY) maxY = pts[i + 1];
+    if (pts[i + 2] < minZ) minZ = pts[i + 2]; if (pts[i + 2] > maxZ) maxZ = pts[i + 2];
+  }
+  const diag = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) || 1;
+  // Measured about the mesh's OWN centre, which is not optional: the formula
+  // sums tetrahedra from the origin, so a FLAT sheet sitting away from the
+  // origin returns the volume of the pyramid under it - a confident,
+  // meaningless sign. Centred, a flat sheet lies in a plane through the
+  // origin and correctly returns zero, while a closed body still returns its
+  // true volume. Without this the base's flat ground caps would be "corrected"
+  // and the slab would break open again.
+  const ox = (minX + maxX) / 2, oy = (minY + maxY) / 2, oz = (minZ + maxZ) / 2;
+  for (let t = 0; t + 2 < indices.length; t += 3) {
+    const a = indices[t] * 3, b = indices[t + 1] * 3, c = indices[t + 2] * 3;
+    const ax = pts[a] - ox, ay = pts[a + 1] - oy, az = pts[a + 2] - oz;
+    const bx = pts[b] - ox, by = pts[b + 1] - oy, bz = pts[b + 2] - oz;
+    const cx = pts[c] - ox, cy = pts[c + 1] - oy, cz = pts[c + 2] - oz;
+    v += ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx);
+  }
+  v /= 6;
+  // 0.5% of the bounding cube - well above float noise, well below any real
+  // closed volume.
+  if (Math.abs(v) < diag * diag * diag * 0.005) return null; // ambiguous
+  return v > 0;
+}
+
+// The canvas behind a DynamicTexture, or null for anything else.
+function usdTextureCanvas(mesh) {
+  const mat = mesh.material;
+  const tex = mat && (mat.diffuseTexture || mat.emissiveTexture);
+  if (!tex || typeof tex.getContext !== 'function') return null;
+  try {
+    const ctx = tex.getContext();
+    return (ctx && ctx.canvas) ? ctx.canvas : null;
+  } catch (e) { return null; }
+}
+
+// A 1-D image of the density ramp: dense core at u=0, lifted rim at u=1.
+// The gradient is a single scalar along an axis, which this represents
+// exactly - and it means the EASING CURVE lives in the image, so the
+// per-vertex `t` only ever has to interpolate linearly between vertices
+// (which a GPU does exactly, needing no extra subdivision to look smooth).
+// It also reuses the stReader -> UsdUVTexture network the base already
+// proved, instead of opening a UsdPrimvarReader_float3 path whose Quick Look
+// support is inconsistent.
+function buildRampCanvas(rgba, opacity) {
+  const cv = document.createElement('canvas');
+  cv.width = USDZ_RAMP_TEXELS;
+  cv.height = 1;
+  const ctx = cv.getContext('2d');
+  for (let i = 0; i < USDZ_RAMP_TEXELS; i++) {
+    const t = i / (USDZ_RAMP_TEXELS - 1);
+    const c = densityColorAt(rgba, t);
+    // PREMULTIPLIED by the body alpha. The ghost-plane episode proved this
+    // renderer composites emission WITHOUT scaling it by opacity (a fully
+    // transparent texel still painted). So for a translucent emissive body,
+    // correct "over" compositing has to be built into the colour itself:
+    // emit C*a here and let the material's scalar opacity fade the
+    // background underneath. If bodies come out too dim on device, raise
+    // this factor toward 1 - do not touch the opacity, which controls how
+    // much of the room shows through.
+    const pre = opacity;
+    ctx.clearRect(i, 0, 1, 1);
+    ctx.fillStyle = `rgba(${Math.round(c.r * pre * 255)},${Math.round(c.g * pre * 255)},${Math.round(c.b * pre * 255)},1)`;
+    ctx.fillRect(i, 0, 1, 1);
+  }
+  return cv;
+}
+
+// An ordered (Bayer) dither tile whose ALPHA is the cutout mask: `coverage`
+// of the cells survive, the rest are discarded by opacityThreshold. Ordered
+// rather than random so the surviving pixels spread evenly instead of
+// clumping into visible blotches.
+function buildDitherCanvas(coverage) {
+  const N = USDZ_DITHER_TILE;
+  const cv = document.createElement('canvas');
+  cv.width = N; cv.height = N;
+  const ctx = cv.getContext('2d');
+  // Standard recursive Bayer construction:
+  //   M(2n) = [ 4M    4M+2 ]
+  //           [ 4M+3  4M+1 ]
+  // Getting this wrong is not subtle - a botched matrix produced alternating
+  // full rows, which would have read as horizontal STRIPES across every
+  // shape rather than as even grain.
+  let m = [[0]];
+  for (let size = 1; size < N; size *= 2) {
+    const next = [];
+    for (let y = 0; y < size * 2; y++) next[y] = [];
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const v = m[y][x] * 4;
+        next[y][x] = v;
+        next[y][x + size] = v + 2;
+        next[y + size][x] = v + 3;
+        next[y + size][x + size] = v + 1;
+      }
+    }
+    m = next;
+  }
+  const bayer = m.map(row => row.map(v => v / (N * N)));
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      // White RGB - only the alpha channel is read, as the cutout mask.
+      ctx.fillStyle = `rgba(255,255,255,${bayer[y][x] < coverage ? 1 : 0})`;
+      ctx.clearRect(x, y, 1, 1);
+      ctx.fillRect(x, y, 1, 1);
+    }
+  }
+  return cv;
+}
+
+function canvasToPngBytes(canvas) {
+  const dataUrl = canvas.toDataURL('image/png');
+  const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// Pulls every exportable mesh into USD space and normalises the whole piece
+// to a desk-sized object standing on the origin plane.
+function collectUsdParts() {
+  const meshes = collectExportMeshes().filter(m => !(m.metadata && m.metadata.skipUsdz));
+  const parts = [];
+  const textures = new Map(); // canvas -> { name, data }
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+  meshes.forEach(mesh => {
+    mesh.computeWorldMatrix(true);
+    const world = mesh.getWorldMatrix();
+    // GEOMETRY MATCHES THE OBJ EXPORT by default, and that is deliberate.
+    // Texturing an "open" shape does carry its alpha gradient, but it also
+    // means exporting the mesh's real geometry - which is a PADDED RECTANGLE
+    // with the silhouette cut out by alpha. Anything that then fails to
+    // respect that alpha (emission, a renderer's blend mode, a UV
+    // orientation guess) leaves the whole rectangle visible as a clear plane
+    // slicing through the piece. The OBJ path never had that failure mode
+    // because it substitutes the true polygon prism and never emits a padded
+    // rectangle at all.
+    //
+    // So: the proven path is the default, and texturing is opt-in via
+    // `metadata.usdTexture` - currently only the base, whose texture sits on
+    // real solid geometry with no cutout involved and so carries none of
+    // that risk. The cost is that open shapes export as uniform prisms
+    // rather than fading out.
+    const wantsTexture = !!(mesh.metadata && mesh.metadata.usdTexture);
+    const canvas = wantsTexture ? usdTextureCanvas(mesh) : null;
+    const uvs = canvas ? mesh.getVerticesData(BABYLON.VertexBuffer.UVKind) : null;
+    const textured = !!(canvas && uvs && uvs.length);
+
+    let positions, indices;
+    if (textured) {
+      positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
+      indices = mesh.getIndices();
+    } else {
+      ({ positions, indices } = exportGeometryFor(mesh));
+    }
+    if (!positions || !indices || indices.length < 3) return;
+
+    let texName = null;
+    if (textured) {
+      if (!textures.has(canvas)) {
+        try {
+          textures.set(canvas, {
+            name: `textures/tex_${textures.size}.png`,
+            data: canvasToPngBytes(canvas)
+          });
+        } catch (e) {
+          console.warn('USDZ: texture encode failed, falling back to flat colour', e);
+        }
+      }
+      const entry = textures.get(canvas);
+      if (entry) texName = entry.name;
+    }
+
+    // Density gradient. Note this deliberately does NOT go through the
+    // `textured` branch above: that branch bypasses exportGeometryFor and
+    // would resurrect the padded-rectangle ghost planes. A gradient mesh
+    // takes the normal geometry path and gains only `st`.
+    let gradField = null;
+    let selfLit = false;
+    let ditherName = null;
+    if (!textured && mesh.metadata && mesh.metadata.volumeGradient) {
+      const base = meshExportColor(mesh);
+      const rgba = { r: base.c.r, g: base.c.g, b: base.c.b, a: base.a };
+      const bodyAlpha = meshUsdSurface(mesh).a;
+      // Key on colour AND opacity, so every shape sharing both shares one ramp.
+      const key = 'ramp_' + [rgba.r, rgba.g, rgba.b, bodyAlpha].map(v => v.toFixed(3)).join('_');
+      if (!textures.has(key)) {
+        try {
+          textures.set(key, {
+            name: `textures/ramp_${textures.size}.png`,
+            data: canvasToPngBytes(buildRampCanvas(rgba, bodyAlpha))
+          });
+        } catch (e) {
+          console.warn('USDZ: ramp encode failed, falling back to flat colour', e);
+        }
+      }
+      const entry = textures.get(key);
+      if (entry) {
+        texName = entry.name;
+        selfLit = USDZ_UNLIT_BODIES;
+        // One cutout mask shared by the whole model.
+        if (USDZ_DITHER && USDZ_BODY_OPACITY < 0.999) {
+          if (!textures.has('dither')) {
+            try {
+              textures.set('dither', {
+                name: 'textures/dither.png',
+                data: canvasToPngBytes(buildDitherCanvas(USDZ_BODY_OPACITY))
+              });
+            } catch (e) { console.warn('USDZ: dither encode failed', e); }
+          }
+          if (textures.has('dither')) ditherName = textures.get('dither').name;
+        }
+        // Field from the FINAL (tessellated) local positions, so the added
+        // vertices are included in the observed distance range.
+        gradField = densityField(positions);
+      }
+    }
+
+    const pts = [];
+    for (let i = 0; i < positions.length; i += 3) {
+      const v = BABYLON.Vector3.TransformCoordinates(
+        new BABYLON.Vector3(positions[i], positions[i + 1], positions[i + 2]), world);
+      // Babylon's scene is LEFT-handed; USD is right-handed, Y up. Negating Z
+      // converts between them, and the triangle winding is reversed below to
+      // match - without that flip every face would point inward.
+      const x = v.x, y = v.y, z = -v.z;
+      pts.push(x, y, z);
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+
+    // NO explicit normals. The Z negation above mirrors the geometry, so
+    // both the winding AND the normals have to be flipped to stay in
+    // agreement - and if they disagree even slightly, faces light as though
+    // they point the wrong way: a lid reads as an open hole, and a single
+    // shape shades patchily face to face. Letting USD derive normals from
+    // the winding makes the winding the ONE source of truth, which is also
+    // exactly what the proven OBJ path does (it writes no `vn` either).
+    // Flat/faceted shading is the cost, and it's the right cost here: every
+    // material in this scene is unlit and flat on screen anyway.
+    // USD samples st with (0,0) at the image's LOWER-left; a canvas is drawn
+    // from its top-left, so v is flipped. If a texture ever appears upside
+    // down, this is the line.
+    let st = null;
+    if (gradField) {
+      // (t, 0.5) - a 1-D lookup, so no v flip applies here.
+      st = [];
+      for (let i = 0; i < positions.length; i += 3) {
+        st.push(densityAt(gradField, positions[i], positions[i + 1], positions[i + 2]), 0.5);
+      }
+    } else if (texName && uvs) {
+      st = [];
+      for (let i = 0; i < uvs.length; i += 2) st.push(uvs[i], 1 - uvs[i + 1]);
+    }
+    // false = this mesh's triangles face inward and must be reversed on the
+    // way out; null = flat or double-sided, leave the winding untouched.
+    const outward = windingIsOutward(pts, indices);
+    const surf = meshUsdSurface(mesh);
+    // TRANSLUCENT bodies ship BOTH windings, exactly like the extrudePrism
+    // bodies (which are DOUBLESIDE in Babylon and arrive here pre-doubled).
+    // The evidence that forced this: opaque single-winding meshes - the
+    // black outline tubes - render correctly from every angle, so winding
+    // and culling are right for the opaque pass. But on the BLENDED pass,
+    // single-winding faces showed only from the far side ("I can only see
+    // the front from the back, and the back from the front") - RealityKit's
+    // transparent pass draws one side of each surface, and not the one the
+    // opaque rules predict, `doubleSided = true` notwithstanding. Rather
+    // than fight which side that is, give every triangle a reversed twin:
+    // whichever side the pass culls, each face keeps a drawable copy from
+    // every viewpoint. Meshes where windingIsOutward returns null are
+    // either flat or ALREADY doubled - skipped, no re-doubling.
+    let outIdx = indices;
+    if (surf.a < 0.999 && outward !== null && mesh.metadata && mesh.metadata.volumeGradient) {
+      outIdx = Array.from(indices);
+      for (let t = 0; t + 2 < indices.length; t += 3) {
+        outIdx.push(indices[t], indices[t + 2], indices[t + 1]);
+      }
+    }
+    parts.push({
+      pts, indices: outIdx, st, texName, selfLit, ditherName,
+      flipWinding: outward === false,
+      texCutout: !!(textured && mesh.metadata && mesh.metadata.usdTextureCutout),
+      surf
+    });
+  });
+
+  if (!parts.length) return null;
+
+  // Scale the longest dimension to USDZ_TARGET_SIZE_M, centre it on X/Z and
+  // drop its lowest point to y=0 so AR Quick Look seats it on the surface
+  // rather than burying or floating it.
+  const spanX = maxX - minX, spanY = maxY - minY, spanZ = maxZ - minZ;
+  const scale = USDZ_TARGET_SIZE_M / Math.max(spanX, spanY, spanZ, 1e-6);
+  const cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+  parts.forEach(part => {
+    const lo = { x: Infinity, y: Infinity, z: Infinity };
+    const hi = { x: -Infinity, y: -Infinity, z: -Infinity };
+    for (let i = 0; i < part.pts.length; i += 3) {
+      const x = part.pts[i] = (part.pts[i] - cx) * scale;
+      const y = part.pts[i + 1] = (part.pts[i + 1] - minY) * scale;
+      const z = part.pts[i + 2] = (part.pts[i + 2] - cz) * scale;
+      if (x < lo.x) lo.x = x; if (x > hi.x) hi.x = x;
+      if (y < lo.y) lo.y = y; if (y > hi.y) hi.y = y;
+      if (z < lo.z) lo.z = z; if (z > hi.z) hi.z = z;
+    }
+    // Each mesh needs its OWN bounds - handing every prim the whole model's
+    // extent is wrong and makes a renderer's culling and bounds maths lie.
+    part.min = lo;
+    part.max = hi;
+
+    // Cutout-mask UVs, in metres, so cell size is a real-world quantity and
+    // every shape gets the same visual grain regardless of its size. All
+    // three axes contribute with different weights: a straight XY projection
+    // would collapse to a constant on any face perpendicular to it, leaving
+    // that face either fully solid or fully cut away.
+    if (part.ditherName) {
+      const k = USDZ_DITHER_CELLS_PER_M / USDZ_DITHER_TILE;
+      part.st1 = [];
+      for (let i = 0; i < part.pts.length; i += 3) {
+        const x = part.pts[i], y = part.pts[i + 1], z = part.pts[i + 2];
+        part.st1.push((x + z * 0.5) * k, (y + z * 0.37) * k);
+      }
+    }
+  });
+  return {
+    parts,
+    textures: Array.from(textures.values()),
+    extent: [
+      { x: -spanX * scale / 2, y: 0, z: -spanZ * scale / 2 },
+      { x: spanX * scale / 2, y: spanY * scale, z: spanZ * scale / 2 }
+    ]
+  };
+}
+
+// ASCII USD (.usda). AR Quick Look accepts it inside a .usdz, which avoids
+// having to write the binary crate format.
+function buildUsda() {
+  const collected = collectUsdParts();
+  if (!collected) return null;
+  const { parts, extent, textures } = collected;
+
+  // One material per distinct surface - the exporter's own dedupe, matching
+  // how the OBJ side collapses identical colours into one `newmtl`.
+  const matIds = new Map();
+  parts.forEach(p => {
+    const s = p.surf;
+    const key = [s.r, s.g, s.b, s.a, s.metallic, s.roughness, s.emissive]
+      .map(v => v.toFixed(3)).join('_') + '|' + (p.texName || '') + '|' + (p.selfLit ? 's' : '')
+      + '|' + (p.ditherName || '');
+    if (!matIds.has(key)) matIds.set(key, { name: `mat_${matIds.size}`, surf: s, tex: p.texName, cutout: p.texCutout, selfLit: p.selfLit, dither: p.ditherName });
+    p.matName = matIds.get(key).name;
+  });
+
+  const L = [];
+  L.push('#usda 1.0');
+  L.push('(');
+  L.push('    defaultPrim = "Sculpture"');
+  L.push('    metersPerUnit = 1');
+  L.push('    upAxis = "Y"');
+  L.push(')');
+  L.push('');
+  L.push('def Xform "Sculpture"');
+  L.push('{');
+  L.push('    def Scope "Materials"');
+  L.push('    {');
+  matIds.forEach(({ name, surf, tex, cutout, selfLit, dither }) => {
+    const e = surf.emissive;
+    const base = `</Sculpture/Materials/${name}`;
+    L.push(`        def Material "${name}"`);
+    L.push('        {');
+    L.push(`            token outputs:surface.connect = ${base}/Shader.outputs:surface>`);
+    if (tex) {
+      // st reader -> texture -> surface. The texture's ALPHA channel is what
+      // carries an open shape's fade, so it drives opacity as well as colour.
+      L.push('            def Shader "stReader"');
+      L.push('            {');
+      L.push('                uniform token info:id = "UsdPrimvarReader_float2"');
+      L.push('                token inputs:varname = "st"');
+      L.push('                float2 outputs:result');
+      L.push('            }');
+      L.push('            def Shader "tex"');
+      L.push('            {');
+      L.push('                uniform token info:id = "UsdUVTexture"');
+      L.push(`                asset inputs:file = @${tex}@`);
+      L.push(`                float2 inputs:st.connect = ${base}/stReader.outputs:result>`);
+      L.push('                token inputs:wrapS = "clamp"');
+      L.push('                token inputs:wrapT = "clamp"');
+      L.push('                float3 outputs:rgb');
+      L.push('                float outputs:a');
+      L.push('            }');
+    }
+    if (dither) {
+      // Reads primvars:st1, NOT st - the mask tiles in world space while the
+      // colour ramp is a 1-D lookup along the density axis.
+      L.push('            def Shader "stReaderMask"');
+      L.push('            {');
+      L.push('                uniform token info:id = "UsdPrimvarReader_float2"');
+      L.push('                token inputs:varname = "st1"');
+      L.push('                float2 outputs:result');
+      L.push('            }');
+      L.push('            def Shader "mask"');
+      L.push('            {');
+      L.push('                uniform token info:id = "UsdUVTexture"');
+      L.push(`                asset inputs:file = @${dither}@`);
+      L.push(`                float2 inputs:st.connect = ${base}/stReaderMask.outputs:result>`);
+      L.push('                token inputs:wrapS = "repeat"');
+      L.push('                token inputs:wrapT = "repeat"');
+      L.push('                float outputs:a');
+      L.push('            }');
+    }
+    L.push('            def Shader "Shader"');
+    L.push('            {');
+    L.push('                uniform token info:id = "UsdPreviewSurface"');
+
+    // ===== UNLIT bodies =====
+    // The artwork is drawn UNLIT on screen (see unlitMat: emissiveColor set,
+    // diffuseColor black, disableLighting true), so a surface shows its exact
+    // colour from every angle. UsdPreviewSurface is PBR, and every problem in
+    // this export came from that one mismatch: colour washing to pastel,
+    // colour appearing only on faces turned toward a window, shapes reading as
+    // hollow. Each of those was PBR shading doing its job on something that
+    // was never meant to be shaded.
+    //
+    // The answer is not to tune PBR into an imitation of unlit - it is to ask
+    // USD for unlit directly, which it can express exactly:
+    //   diffuseColor = black   -> no lit contribution at all
+    //   emissiveColor = colour -> the surface simply IS its colour
+    //   specular workflow, black specular, ior 1 -> no environment sheen
+    // That is the same recipe as unlitMat, so the sculpture in AR now matches
+    // the sculpture on screen by construction rather than by approximation.
+    //
+    // Applied ONLY to the artwork. The marble base and the brass/steel struts
+    // stay physically lit: they are meant to read as real materials sitting in
+    // your room, catching your actual light, and neither has ever been the
+    // thing that looked wrong.
+    if (selfLit) {
+      L.push('                color3f inputs:diffuseColor = (0, 0, 0)');
+      if (tex) {
+        L.push(`                color3f inputs:emissiveColor.connect = ${base}/tex.outputs:rgb>`);
+        // CONNECTING opacity to a texture marks the material TRANSPARENT, and
+        // that classification is made from the wiring, not from the values -
+        // so a ramp whose every texel is alpha 1.0 still lands in the blended
+        // queue, where it stops writing depth. Nothing then occludes anything,
+        // and you see straight through a solid shape to its own far wall:
+        // "we only see the colour of the right side from the right, the
+        // backside from the front". Fully opaque bodies must therefore state
+        // a scalar opacity and leave the texture's alpha channel unwired.
+        if (dither) {
+          // Fallback mode (USDZ_DITHER): alpha-MASKED reads as opaque and
+          // writes depth while discarding a pixel pattern. Rejected as the
+          // default - the pattern read as grain at phone distance.
+          L.push(`                float inputs:opacity.connect = ${base}/mask.outputs:a>`);
+          L.push('                float inputs:opacityThreshold = 0.5');
+        } else {
+          // Scalar (value-based) opacity: 1 stays truly opaque and writes
+          // depth; a body's 0.6 goes to the blended queue - intended, that
+          // IS the translucency, the same number as the app's BODY_ALPHA_3D.
+          L.push(`                float inputs:opacity = ${surf.a.toFixed(3)}`);
+        }
+      } else {
+        L.push(`                color3f inputs:emissiveColor = ${usdVec(surf.r * surf.a, surf.g * surf.a, surf.b * surf.a, 4)}`); // premultiplied, same as the ramp
+        L.push(`                float inputs:opacity = ${surf.a.toFixed(3)}`);
+      }
+      L.push('                float inputs:metallic = 0');
+      L.push('                float inputs:roughness = 1');
+      // Without this the room still lays a specular sheen over the emission,
+      // which is the whitening that started this whole hunt.
+      L.push('                int inputs:useSpecularWorkflow = 1');
+      L.push('                color3f inputs:specularColor = (0, 0, 0)');
+      L.push('                float inputs:ior = 1');
+    } else {
+      // Physically lit: the base and the metals.
+      if (tex) {
+        L.push(`                color3f inputs:diffuseColor.connect = ${base}/tex.outputs:rgb>`);
+        // Same trap as above - the opaque marble base must not be wired to an
+        // alpha channel, or it joins the blended queue and stops occluding.
+        if (surf.a >= 0.999) {
+          L.push('                float inputs:opacity = 1');
+        } else {
+          L.push(`                float inputs:opacity.connect = ${base}/tex.outputs:a>`);
+        }
+      } else {
+        L.push(`                color3f inputs:diffuseColor = ${usdVec(surf.r, surf.g, surf.b, 4)}`);
+        L.push(`                float inputs:opacity = ${surf.a.toFixed(3)}`);
+      }
+      // emissiveColor is NOT multiplied by opacity. On an alpha-CUTOUT texture
+      // the geometry is a padded rectangle whose silhouette exists only in the
+      // alpha channel, so a flat emissive term paints the whole rectangle -
+      // transparent parts included - and drags a ghost plane through the piece.
+      L.push(`                color3f inputs:emissiveColor = ${cutout ? '(0, 0, 0)' : usdVec(surf.r * e, surf.g * e, surf.b * e, 4)}`);
+      L.push(`                float inputs:metallic = ${surf.metallic.toFixed(3)}`);
+      L.push(`                float inputs:roughness = ${surf.roughness.toFixed(3)}`);
+    }
+    L.push('                token outputs:surface');
+    L.push('            }');
+    L.push('        }');
+  });
+  L.push('    }');
+
+  parts.forEach((part, i) => {
+    const counts = [];
+    const idx = [];
+    // Winding is decided PER MESH by its own signed volume (see
+    // windingIsOutward) rather than by a single global rule. The file mixes
+    // DOUBLESIDE and FRONTSIDE builders, so no one rule is right for all of
+    // them - which is exactly why guessing kept fixing one set of shapes and
+    // breaking another.
+    for (let t = 0; t + 2 < part.indices.length; t += 3) {
+      counts.push(3);
+      if (part.flipWinding) idx.push(part.indices[t], part.indices[t + 2], part.indices[t + 1]);
+      else idx.push(part.indices[t], part.indices[t + 1], part.indices[t + 2]);
+    }
+    const pts = [];
+    for (let k = 0; k < part.pts.length; k += 3) {
+      pts.push(usdVec(part.pts[k], part.pts[k + 1], part.pts[k + 2], 4));
+    }
+    // `prepend apiSchemas = ["MaterialBindingAPI"]` is NOT optional: without
+    // it a strict consumer ignores `rel material:binding` outright and
+    // renders the whole model in default grey.
+    L.push(`    def Mesh "mesh_${i}" (`);
+    L.push('        prepend apiSchemas = ["MaterialBindingAPI"]');
+    L.push('    )');
+    L.push('    {');
+    L.push(`        uniform token subdivisionScheme = "none"`); // otherwise Quick Look smooths every hard edge away
+    L.push('        uniform bool doubleSided = true'); // `1` is int-typed in strict USDA parsers
+    L.push(`        float3[] extent = [${usdVec(part.min.x, part.min.y, part.min.z, 4)}, ${usdVec(part.max.x, part.max.y, part.max.z, 4)}]`);
+    L.push(`        int[] faceVertexCounts = [${counts.join(', ')}]`);
+    L.push(`        int[] faceVertexIndices = [${idx.join(', ')}]`);
+    L.push(`        point3f[] points = [${pts.join(', ')}]`);
+    if (part.st) {
+      const uv = [];
+      for (let k = 0; k < part.st.length; k += 2) {
+        uv.push(`(${part.st[k].toFixed(4)}, ${part.st[k + 1].toFixed(4)})`);
+      }
+      L.push(`        texCoord2f[] primvars:st = [${uv.join(', ')}] (`);
+      L.push('            interpolation = "vertex"');
+      L.push('        )');
+    }
+    // Second UV set, read only by the cutout mask - it tiles at a real world
+    // scale and has nothing to do with the colour ramp's 1-D lookup.
+    if (part.st1) {
+      const uv = [];
+      for (let k = 0; k < part.st1.length; k += 2) {
+        uv.push(`(${part.st1[k].toFixed(3)}, ${part.st1[k + 1].toFixed(3)})`);
+      }
+      L.push(`        texCoord2f[] primvars:st1 = [${uv.join(', ')}] (`);
+      L.push('            interpolation = "vertex"');
+      L.push('        )');
+    }
+    L.push(`        rel material:binding = </Sculpture/Materials/${part.matName}>`);
+    L.push('    }');
+  });
+
+  L.push('}');
+  L.push('');
+  return { usda: L.join('\n'), textures };
+}
+
+// ===== AR diagnostic grid =====
+// Nine identical green cubes, each built with ONE different material or
+// geometry recipe, on an opaque slab. Exists because remote diagnosis from
+// photos kept failing: several recipes produce superficially similar
+// symptoms, and only seeing them SIDE BY SIDE in one frame, one lighting,
+// one angle, separates them. The cube that looks like the app's translucency
+// (every face visible, evenly tinted) names the recipe the real exporter
+// should use.
+//
+// Layout: 3 columns x 3 rows on a slab. The tall corner POST marks the
+// front-left corner; rows are told apart by cube HEIGHT (front row shortest,
+// back row tallest), columns run left-to-right away from the post.
+//
+//   front (short):  A opaque control | B current recipe, flat | C current recipe, ramp tex
+//   mid (medium):   D lit diffuse    | E emissive, no premult | F diffuse + weak emissive
+//   back (tall):    G open-shape prism geom | H doubled winding | I tessellated
+//   (G, H, I all use B's material - they vary GEOMETRY only.)
+function buildDiagnosticUsda() {
+  const C = { r: 0.15, g: 0.65, b: 0.35, a: 1 };
+  const A = 0.6; // the body alpha under test
+  // Outward-wound unit cube in USD space (verified by windingIsOutward).
+  const P = [-1,-1,-1, 1,-1,-1, 1,1,-1, -1,1,-1, -1,-1,1, 1,-1,1, 1,1,1, -1,1,1];
+  const OUT = [0,2,1, 0,3,2, 4,5,6, 4,6,7, 0,1,5, 0,5,4, 1,2,6, 1,6,5, 2,3,7, 2,7,6, 3,0,4, 3,4,7];
+
+  const L = [];
+  L.push('#usda 1.0');
+  L.push('(');
+  L.push('    defaultPrim = "Diag"');
+  L.push('    metersPerUnit = 1');
+  L.push('    upAxis = "Y"');
+  L.push(')');
+  L.push('');
+  L.push('def Xform "Diag"');
+  L.push('{');
+  L.push('    def Scope "Materials"');
+  L.push('    {');
+
+  const unlitTail = [
+    'float inputs:metallic = 0',
+    'float inputs:roughness = 1',
+    'int inputs:useSpecularWorkflow = 1',
+    'color3f inputs:specularColor = (0, 0, 0)',
+    'float inputs:ior = 1'
+  ];
+  const vec = (c, k) => `(${(c.r * k).toFixed(4)}, ${(c.g * k).toFixed(4)}, ${(c.b * k).toFixed(4)})`;
+  const mat = (name, lines, texture) => {
+    L.push(`        def Material "${name}"`);
+    L.push('        {');
+    L.push(`            token outputs:surface.connect = </Diag/Materials/${name}/S.outputs:surface>`);
+    if (texture) {
+      L.push('            def Shader "st"');
+      L.push('            {');
+      L.push('                uniform token info:id = "UsdPrimvarReader_float2"');
+      L.push('                token inputs:varname = "st"');
+      L.push('                float2 outputs:result');
+      L.push('            }');
+      L.push('            def Shader "tex"');
+      L.push('            {');
+      L.push('                uniform token info:id = "UsdUVTexture"');
+      L.push(`                asset inputs:file = @${texture}@`);
+      L.push(`                float2 inputs:st.connect = </Diag/Materials/${name}/st.outputs:result>`);
+      L.push('                token inputs:wrapS = "clamp"');
+      L.push('                token inputs:wrapT = "clamp"');
+      L.push('                float3 outputs:rgb');
+      L.push('            }');
+    }
+    L.push('            def Shader "S"');
+    L.push('            {');
+    L.push('                uniform token info:id = "UsdPreviewSurface"');
+    lines.forEach(l => L.push('                ' + l));
+    L.push('                token outputs:surface');
+    L.push('            }');
+    L.push('        }');
+  };
+
+  // A: opaque unlit control - the "solid looked GOOD" recipe.
+  mat('mA', ['color3f inputs:diffuseColor = (0, 0, 0)',
+    `color3f inputs:emissiveColor = ${vec(C, 1)}`,
+    'float inputs:opacity = 1'].concat(unlitTail));
+  // B: the CURRENT body recipe, flat: blended 0.6, emissive premultiplied.
+  mat('mB', ['color3f inputs:diffuseColor = (0, 0, 0)',
+    `color3f inputs:emissiveColor = ${vec(C, A)}`,
+    `float inputs:opacity = ${A}`].concat(unlitTail));
+  // C: current recipe but emissive CONNECTED to the ramp texture (exact).
+  mat('mC', ['color3f inputs:diffuseColor = (0, 0, 0)',
+    'color3f inputs:emissiveColor.connect = </Diag/Materials/mC/tex.outputs:rgb>',
+    `float inputs:opacity = ${A}`].concat(unlitTail), 'textures/ramp_diag.png');
+  // D: lit translucent - diffuse carries the colour, no emission.
+  mat('mD', [`color3f inputs:diffuseColor = ${vec(C, 1)}`,
+    'color3f inputs:emissiveColor = (0, 0, 0)',
+    `float inputs:opacity = ${A}`].concat(unlitTail));
+  // E: emissive WITHOUT premultiply - tests whether alpha scales emission.
+  mat('mE', ['color3f inputs:diffuseColor = (0, 0, 0)',
+    `color3f inputs:emissiveColor = ${vec(C, 1)}`,
+    `float inputs:opacity = ${A}`].concat(unlitTail));
+  // F: hybrid - lit diffuse plus a weak emissive floor.
+  mat('mF', [`color3f inputs:diffuseColor = ${vec(C, 1)}`,
+    `color3f inputs:emissiveColor = ${vec(C, 0.25)}`,
+    `float inputs:opacity = ${A}`].concat(unlitTail));
+  // slab/post: opaque lit grey.
+  mat('mSlab', ['color3f inputs:diffuseColor = (0.75, 0.74, 0.72)',
+    'color3f inputs:emissiveColor = (0, 0, 0)',
+    'float inputs:opacity = 1',
+    'float inputs:metallic = 0',
+    'float inputs:roughness = 0.6']);
+  L.push('    }');
+
+  // st runs bottom->top of each cube so the ramp shows as a gradient.
+  const stFor = (pos) => {
+    const st = [];
+    for (let i = 0; i < pos.length; i += 3) st.push((pos[i + 1] + 1) / 2, 0.5);
+    return st;
+  };
+  let meshId = 0;
+  const emit = (matName, pos, idx, cx, cy, cz, sx, sy, sz, withSt) => {
+    const pts = [], n = pos.length / 3;
+    const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < n; i++) {
+      const x = cx + pos[i * 3] * sx, y = cy + pos[i * 3 + 1] * sy, z = cz + pos[i * 3 + 2] * sz;
+      pts.push(`(${x.toFixed(4)}, ${y.toFixed(4)}, ${z.toFixed(4)})`);
+      [x, y, z].forEach((v, k) => { if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; });
+    }
+    const counts = [], fi = [];
+    for (let t = 0; t + 2 < idx.length; t += 3) { counts.push(3); fi.push(idx[t], idx[t + 1], idx[t + 2]); }
+    L.push(`    def Mesh "m${meshId++}" (`);
+    L.push('        prepend apiSchemas = ["MaterialBindingAPI"]');
+    L.push('    )');
+    L.push('    {');
+    L.push('        uniform token subdivisionScheme = "none"');
+    L.push('        uniform bool doubleSided = true');
+    L.push(`        float3[] extent = [(${mn.map(v => v.toFixed(4)).join(', ')}), (${mx.map(v => v.toFixed(4)).join(', ')})]`);
+    L.push(`        int[] faceVertexCounts = [${counts.join(', ')}]`);
+    L.push(`        int[] faceVertexIndices = [${fi.join(', ')}]`);
+    L.push(`        point3f[] points = [${pts.join(', ')}]`);
+    if (withSt) {
+      const st = stFor(pos), uv = [];
+      for (let k = 0; k < st.length; k += 2) uv.push(`(${st[k].toFixed(3)}, ${st[k + 1].toFixed(3)})`);
+      L.push(`        texCoord2f[] primvars:st = [${uv.join(', ')}] (`);
+      L.push('            interpolation = "vertex"');
+      L.push('        )');
+    }
+    L.push(`        rel material:binding = </Diag/Materials/${matName}>`);
+    L.push('    }');
+  };
+
+  // Geometry variants for the back row - same material as B.
+  // G: the open-shape pipeline's prism (polygonPrismGeometry + winding fix,
+  // the same two functions the real exporter applies).
+  const prism = polygonPrismGeometry([{ x: -1, y: -1 }, { x: 1, y: -1 }, { x: 1, y: 1 }, { x: -1, y: 1 }], 2);
+  if (windingIsOutward(prism.positions, prism.indices) === false) {
+    const fixed = [];
+    for (let t = 0; t + 2 < prism.indices.length; t += 3) {
+      fixed.push(prism.indices[t], prism.indices[t + 2], prism.indices[t + 1]);
+    }
+    prism.indices = fixed;
+  }
+  // H: the closed-shape DOUBLESIDE case - both windings in one mesh.
+  const doubled = OUT.slice();
+  for (let t = 0; t + 2 < OUT.length; t += 3) doubled.push(OUT[t], OUT[t + 2], OUT[t + 1]);
+  // I: the tessellation pass over the plain cube.
+  const tess = tessellateForGradient({ positions: P, indices: OUT });
+
+  const slabTop = 0.01;
+  emit('mSlab', P, OUT, 0, slabTop / 2, 0, 0.19, slabTop / 2, 0.19);   // slab
+  emit('mSlab', P, OUT, -0.17, 0.085, 0.17, 0.006, 0.075, 0.006);     // corner post, front-left
+  const rows = [
+    { z: 0.1, h: 0.03, cubes: [['mA', null], ['mB', null], ['mC', 'st']] },
+    { z: 0.0, h: 0.045, cubes: [['mD', null], ['mE', null], ['mF', null]] },
+    { z: -0.1, h: 0.06, cubes: [['mB', 'G'], ['mB', 'H'], ['mB', 'I']] }
+  ];
+  rows.forEach(row => {
+    row.cubes.forEach((cube, col) => {
+      const x = -0.1 + col * 0.1, y = slabTop + row.h;
+      if (cube[1] === 'G') emit(cube[0], prism.positions, prism.indices, x, y, row.z, 0.03, row.h, 0.03);
+      else if (cube[1] === 'H') emit(cube[0], P, doubled, x, y, row.z, 0.03, row.h, 0.03);
+      else if (cube[1] === 'I') emit(cube[0], tess.positions, tess.indices, x, y, row.z, 0.03, row.h, 0.03);
+      else emit(cube[0], P, OUT, x, y, row.z, 0.03, row.h, 0.03, cube[1] === 'st');
+    });
+  });
+  L.push('}');
+  L.push('');
+  return L.join('\n');
+}
+
+window.launchARDiagnostic = function () {
+  try {
+    const usda = buildDiagnosticUsda();
+    const files = [{ name: 'diag.usda', data: new TextEncoder().encode(usda) }];
+    try {
+      files.push({
+        name: 'textures/ramp_diag.png',
+        data: canvasToPngBytes(buildRampCanvas({ r: 0.15, g: 0.65, b: 0.35, a: 1 }, 0.6))
+      });
+    } catch (e) { console.warn('diag ramp failed', e); }
+    const blob = buildZip(files, 64, 'model/vnd.usdz+zip');
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.rel = 'ar';
+    a.href = url;
+    const img = document.createElement('img');
+    img.style.display = 'none';
+    a.appendChild(img);
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 15000);
+    if (typeof window.showArStatus === 'function') window.showArStatus('diagnostic grid · post marks front-left');
+    return true;
+  } catch (e) {
+    console.warn('AR diagnostic failed:', e);
+    return false;
+  }
+};
+
+// Is this an iOS device at all? Every browser on iPhone/iPad is WKWebView
+// underneath - Apple allows no other engine - so AR Quick Look is reachable
+// from all of them even though only Safari advertises it. iPadOS 13+ lies
+// and reports itself as "MacIntel", hence the touch-point check.
+function isIOSDevice() {
+  const ua = navigator.userAgent || '';
+  if (/iPad|iPhone|iPod/.test(ua)) return true;
+  return navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1;
+}
+
+// Can this browser open a .usdz into AR? Capability check FIRST - that's the
+// honest signal, and it's true in Safari on iOS. But Chrome/Edge/Firefox on
+// iPhone don't report rel="ar" support despite being able to use it, so the
+// capability check alone hides the button from every non-Safari browser on
+// the one platform this feature exists for. The platform fallback covers
+// them. Non-Safari iOS browsers hand off less reliably than Safari does;
+// that's a real caveat, not a reason to hide the button from them.
+window.isARQuickLookSupported = function () {
+  const a = document.createElement('a');
+  if (a.relList && a.relList.supports && a.relList.supports('ar')) return true;
+  return isIOSDevice();
+};
+
+// Distinguishes the reliable path from the best-effort one, so the UI can
+// say something useful if the handoff doesn't take.
+window.isARNativeSafari = function () {
+  const a = document.createElement('a');
+  return !!(a.relList && a.relList.supports && a.relList.supports('ar'));
+};
+
+// Hands the sculpture to iOS's system AR viewer.
+window.launchAR = function () {
+  const blob = window.buildSculptureUSDZ();
+  if (!blob) {
+    console.warn('AR: nothing to export - enter 3D mode first');
+    return false;
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.rel = 'ar';
+  a.href = url;
+  // Quick Look REQUIRES the anchor to contain an <img>; without a child
+  // image Safari navigates to the file instead of opening the AR viewer.
+  const img = document.createElement('img');
+  img.style.display = 'none';
+  a.appendChild(img);
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 15000); // Quick Look reads the blob asynchronously - revoking early kills it
+  return true;
+};
+
+// Returns a .usdz Blob of the current sculpture, or null if there's nothing
+// to export.
+window.buildSculptureUSDZ = function () {
+  if (!babylonScene) return null;
+  // Census before export: if something is missing in AR, this says whether
+  // it was dropped on the way out or is present-but-not-rendering. Grouped
+  // by name prefix, which is how every mesh in this file is categorised.
+  const census = {};
+  const bump = (bucket, key) => {
+    census[key] = census[key] || { exported: 0, skipped: 0 };
+    census[key][bucket]++;
+  };
+  babylonScene.meshes.forEach(m => {
+    if (m.name.startsWith('skyFace_')) return;
+    const key = (m.name.match(/^[a-zA-Z]+/) || ['other'])[0];
+    const dropped = !m.isEnabled() || m.getTotalVertices() === 0 ||
+      !!(m.metadata && m.metadata.skipExport);
+    bump(dropped ? 'skipped' : 'exported', key);
+  });
+  console.log('USDZ mesh census (exported / skipped):',
+    Object.entries(census).map(([k, v]) => `${k} ${v.exported}/${v.skipped}`).join('  '));
+
+  const built = buildUsda();
+  if (!built) return null;
+  // Version stamp: makes it unambiguous from the phone whether the page that
+  // built this model actually has the current fixes, rather than a cached one.
+  console.log('USDZ exporter build: ' + USDZ_EXPORTER_BUILD);
+  const data = new TextEncoder().encode(built.usda);
+  const texBytes = built.textures.reduce((n, t) => n + t.data.length, 0);
+  const mb = ((data.length + texBytes) / 1048576).toFixed(2);
+  console.log(`USDZ: ${(data.length / 1048576).toFixed(2)} MB of USDA + ` +
+    `${built.textures.length} textures (${(texBytes / 1048576).toFixed(2)} MB)`);
+  if (typeof window.showArStatus === 'function') {
+    window.showArStatus(`${USDZ_EXPORTER_BUILD} · ${mb} MB · ${built.textures.length} tex`);
+  }
+  // The .usda must be the FIRST entry - Quick Look opens the archive's first
+  // file as the stage.
+  return buildZip(
+    [{ name: 'sculpture.usda', data }].concat(built.textures),
+    64, 'model/vnd.usdz+zip'
+  );
+};
 // Builds a solid prism (top cap + bottom cap + side walls) from a flat 2D
 // polygon (local XY, closed loop not required) extruded +/- depth/2 along Z.
 // Used to give "open" shapes real volume in the OBJ export, matching how
@@ -5408,6 +6754,11 @@ function downloadZip(filename, files) {
 // axis Front view looks along). This remap has the same net handedness flip
 // as a straight left-handed -> right-handed conversion, so the same triangle
 // winding reversal below keeps faces/normals correct.
+// Colour bands per shape in the OBJ export - MTL's stand-in for the density
+// gradient. Set to 1 to turn banding off and go back to one flat colour per
+// shape, which some Rhino workflows prefer.
+const OBJ_GRADIENT_BANDS = 6;
+
 const EXPORT_OBJ_PASSWORD = '12345';
 
 window.exportSceneToOBJ = function () {
@@ -5422,10 +6773,7 @@ window.exportSceneToOBJ = function () {
     console.warn('No 3D scene to export yet - enter 3D mode first');
     return;
   }
-  const meshes = babylonScene.meshes.filter(m =>
-    !m.name.startsWith('skyFace_') && m.isEnabled() && m.getTotalVertices() > 0 &&
-    !(m.metadata && m.metadata.skipExport)
-  );
+  const meshes = collectExportMeshes();
   if (meshes.length === 0) {
     console.warn('Nothing to export - no artwork meshes found');
     return;
@@ -5437,10 +6785,10 @@ window.exportSceneToOBJ = function () {
   // file that no longer matches, so Rhino can't find it and every shape
   // falls back to flat grey. A timestamp keeps every pair self-consistent.
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const objFilename = `kandinsky-3d-${stamp}.obj`;
-  const mtlFilename = `kandinsky-3d-${stamp}.mtl`;
+  const objFilename = `genex-3d-${stamp}.obj`;
+  const mtlFilename = `genex-3d-${stamp}.mtl`;
 
-  const objLines = ['# Kandinsky 3D export', `mtllib ${mtlFilename}`, ''];
+  const objLines = ['# GenEx 3D export', `mtllib ${mtlFilename}`, ''];
   const mtlLines = [];
   let vertexOffset = 0;
   const seenColors = new Map(); // dedupe identical colors into one material
@@ -5454,15 +6802,7 @@ window.exportSceneToOBJ = function () {
     // texture-alpha silhouette, so use the real shape outline (extruded into
     // an actual solid prism, matching the real depth every other shape has)
     // instead of the full padded rectangle the plane mesh actually is
-    let positions, indices;
-    if (mesh.metadata && mesh.metadata.exportPolygon) {
-      const built = polygonPrismGeometry(mesh.metadata.exportPolygon, mesh.metadata.exportDepth || 0);
-      positions = built.positions;
-      indices = built.indices;
-    } else {
-      positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
-      indices = mesh.getIndices();
-    }
+    const { positions, indices } = exportGeometryFor(mesh);
     if (!positions || !indices || indices.length < 3) return;
 
     const { c, a } = meshExportColor(mesh);
@@ -5499,11 +6839,47 @@ window.exportSceneToOBJ = function () {
       objLines.push(`v ${p.x.toFixed(5)} ${p.z.toFixed(5)} ${p.y.toFixed(5)}`);
     }
 
+    // MTL has no per-vertex colour, so the density gradient is approximated by
+    // binning each TRIANGLE by the `t` of its centroid into a few bands and
+    // switching material between them. The seenColors map dedupes across the
+    // whole scene, so this costs ~OBJ_GRADIENT_BANDS materials per distinct
+    // colour, not per mesh - and Rhino's "split by material" import then
+    // gives real, separately selectable colour bands on a physical piece.
+    const bandField = (OBJ_GRADIENT_BANDS > 1 && mesh.metadata && mesh.metadata.volumeGradient
+      && indices.length / 3 >= 24) ? densityField(positions) : null;
+    const bandMat = (t) => {
+      const band = Math.min(OBJ_GRADIENT_BANDS - 1, Math.floor(t * OBJ_GRADIENT_BANDS));
+      const bc = densityColorAt({ r: c.r, g: c.g, b: c.b, a },
+        (band + 0.5) / OBJ_GRADIENT_BANDS);
+      const key = `${bc.r.toFixed(3)}_${bc.g.toFixed(3)}_${bc.b.toFixed(3)}_${a.toFixed(2)}`;
+      let nm = seenColors.get(key);
+      if (!nm) {
+        nm = `mat_${seenColors.size}`;
+        seenColors.set(key, nm);
+        mtlLines.push(
+          `newmtl ${nm}`,
+          `Kd ${bc.r.toFixed(4)} ${bc.g.toFixed(4)} ${bc.b.toFixed(4)}`,
+          `Ka 0 0 0`, `Ks 0 0 0`, `d ${a.toFixed(3)}`, `illum 1`, ''
+        );
+      }
+      return nm;
+    };
+
+    let currentMat = matName;
     for (let i = 0; i + 2 < indices.length; i += 3) {
       // Reverse winding to match the Z negation above (keeps faces/normals correct)
       const a1 = indices[i] + 1 + vertexOffset;
       const b1 = indices[i + 1] + 1 + vertexOffset;
       const c1 = indices[i + 2] + 1 + vertexOffset;
+      if (bandField) {
+        let t = 0;
+        for (let k = 0; k < 3; k++) {
+          const vi = indices[i + k] * 3;
+          t += densityAt(bandField, positions[vi], positions[vi + 1], positions[vi + 2]);
+        }
+        const want = bandMat(t / 3);
+        if (want !== currentMat) { objLines.push(`usemtl ${want}`); currentMat = want; }
+      }
       objLines.push(`f ${a1} ${c1} ${b1}`);
     }
 
@@ -5514,11 +6890,11 @@ window.exportSceneToOBJ = function () {
   // block a page's second auto-triggered download, which meant the .mtl
   // (all the color data) was never actually reaching disk before
   const encoder = new TextEncoder();
-  downloadZip(`kandinsky-3d-${stamp}.zip`, [
+  downloadZip(`genex-3d-${stamp}.zip`, [
     { name: objFilename, data: encoder.encode(objLines.join('\n') + '\n') },
     { name: mtlFilename, data: encoder.encode(mtlLines.join('\n') + '\n') }
   ]);
-  console.log(`Exported ${meshes.length} meshes to kandinsky-3d-${stamp}.zip (unzip, then import the .obj into Rhino)`);
+  console.log(`Exported ${meshes.length} meshes to genex-3d-${stamp}.zip (unzip, then import the .obj into Rhino)`);
 };
 
 console.log('✅ babylon3D.js loaded!');
