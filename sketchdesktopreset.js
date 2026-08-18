@@ -308,7 +308,7 @@ function isUiEvent(event) {
     // touch, where the desktop-only hamburger doesn't exist) fell through to
     // p5 and started a new shape behind the panel it opened.
     return !!(event && event.target && event.target.closest &&
-        event.target.closest('#controls, #instructions, #menu-dropdown, #setup-overlay, #palette-toast'));
+        event.target.closest('#controls, #instructions, #menu-dropdown, #setup-overlay, #welcome-overlay, #palette-toast'));
 }
 
 function mouseDragged(event) {

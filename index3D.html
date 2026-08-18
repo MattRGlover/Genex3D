@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Kandinsky Abstract Art - 3D Mode</title>
+  <title>GenEx — Generative, Interactive</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Forum&display=swap" rel="stylesheet">
@@ -61,14 +61,14 @@
       left: 50%;
       transform: translateX(-50%);
       z-index: 100;
-      background: rgba(255, 255, 255, 0.12);
-      border: 1px solid rgba(255, 255, 255, 0.3);
-      color: rgba(255, 255, 255, 0.7);
-      width: 44px;
-      height: 44px;
+      background: rgba(255, 255, 255, 0.24);
+      border: 1px solid rgba(255, 255, 255, 0.48);
+      color: rgba(255, 255, 255, 0.94);
+      width: 48px;
+      height: 48px;
       border-radius: 50%;
       cursor: pointer;
-      font-size: 13px;
+      font-size: 14px;
       font-family: 'Forum', serif;
       font-weight: bold;
       letter-spacing: 0.5px;
@@ -79,7 +79,7 @@
       animation: mode-btn-pulse 2.6s ease-in-out infinite;
     }
     #mode-toggle-btn:hover {
-      background: rgba(255, 255, 255, 0.35);
+      background: rgba(255, 255, 255, 0.46);
       color: rgba(255, 255, 255, 1);
     }
     #mode-toggle-btn:disabled {
@@ -88,7 +88,7 @@
       animation: none;
     }
     @keyframes mode-btn-pulse {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.35); }
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.45); }
       50% { box-shadow: 0 0 0 8px rgba(255, 255, 255, 0); }
     }
     /* The three satellite buttons flanking the 2D/3D toggle. Identical
@@ -96,60 +96,155 @@
        they share one rule - three near-identical copies had already started
        to drift. All are available on touch, unlike the desktop-only
        hamburger menu, which is the only route to any of this on desktop. */
-    #palette-btn, #material-btn, #refresh-btn {
+    #palette-btn, #material-btn, #refresh-btn, #ar-btn, #scramble-btn {
       position: absolute;
-      bottom: 19px;
+      bottom: 18px;   /* centres a 42px button on the 48px toggle's axis (y=39) */
       left: 50%;
       z-index: 100;
-      background: rgba(255, 255, 255, 0.12);
-      border: 1px solid rgba(255, 255, 255, 0.3);
-      color: rgba(255, 255, 255, 0.7);
-      width: 36px;
-      height: 36px;
+      background: rgba(255, 255, 255, 0.22);
+      border: 1px solid rgba(255, 255, 255, 0.45);
+      color: rgba(255, 255, 255, 0.92);
+      width: 42px;
+      height: 42px;
       border-radius: 50%;
       cursor: pointer;
-      font-size: 12px;
+      font-size: 14px;
       display: flex;
       justify-content: center;
       align-items: center;
       transition: background-color 0.3s, color 0.3s, opacity 0.3s;
     }
-    #palette-btn:hover, #material-btn:hover, #refresh-btn:hover {
-      background: rgba(255, 255, 255, 0.35);
+    #palette-btn:hover, #material-btn:hover, #refresh-btn:hover, #ar-btn:hover, #scramble-btn:hover {
+      background: rgba(255, 255, 255, 0.45);
       color: rgba(255, 255, 255, 1);
     }
     /* 2D pair: refresh left, palette right - both act on the 2D
        composition, so both stand down in 3D. That leaves the bar reading
        [refresh] [3D] [palette]: symmetric, 8px either side of the toggle. */
-    #refresh-btn { transform: translateX(-66px); }
-    #palette-btn { transform: translateX(30px); }
+    #refresh-btn { transform: translateX(-74px); }
+    #palette-btn { transform: translateX(32px); }
     /* Materials takes the LEFT slot refresh vacates on entering 3D - the
        pedestal and struts only exist there, and the palette has nothing to
        change there, so the two swap in and out as exact counterparts. */
-    #material-btn { transform: translateX(-66px); display: none; }
+    #material-btn { transform: translateX(-74px); display: none; }
+    /* AR takes the RIGHT slot in 3D - the one the palette button vacates -
+       so 3D reads [materials] [2D] [AR], mirroring 2D's own three. Only ever
+       shown where AR Quick Look actually exists (iOS Safari): body.ar-capable
+       is set by feature detection, never by sniffing the user agent. */
+    #ar-btn { transform: translateX(32px); display: none; }
+    /* Scramble - 3D only: tips every shape 1-10 degrees on X and Y and
+       rebuilds the struts for the new orientations; tap again to revert. */
+    #scramble-btn { transform: translateX(-124px); display: none; }
+    #scramble-btn.active {
+      background: rgba(255, 255, 255, 0.45);
+      color: rgba(255, 255, 255, 1);
+    }
     body.in-3d #palette-btn,
     body.in-3d #refresh-btn,
     body.in-3d #palette-toast { display: none; }
     body.in-3d #material-btn { display: flex; }
+    body.in-3d #scramble-btn { display: flex; }
+    body.in-3d.ar-capable #ar-btn { display: flex; }
+    #ar-btn.busy { opacity: 0.5; pointer-events: none; }
+
+    /* Build stamp, shown on screen when an AR model is generated. Exists
+       because a phone has no console: without it there is no way to tell a
+       failed fix from cached JavaScript, and several rounds of "no change"
+       could have been either. */
+    #ar-status {
+      position: absolute;
+      bottom: 76px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 101;
+      background: rgba(18, 18, 22, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      color: rgba(255, 255, 255, 0.9);
+      font-family: 'Forum', serif;
+      font-size: 11.5px;
+      letter-spacing: 0.3px;
+      padding: 6px 13px;
+      border-radius: 14px;
+      white-space: nowrap;
+      max-width: 92vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s;
+    }
+    #ar-status.show { opacity: 1; }
 
     /* One-time, self-dismissing hint. Deliberately small and low-contrast:
        a suggestion, not an interruption. */
+    /* Hover labels. Native title= is slow to appear, can't be styled, and
+       would double up with this - so every button carries data-tip instead.
+       The buttons are position:absolute, which makes each its own containing
+       block, so the pseudo-element anchors to the button itself. */
+    #controls button[data-tip]::after {
+      content: attr(data-tip);
+      position: absolute;
+      bottom: calc(100% + 9px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(24, 24, 28, 0.94);
+      border: 1px solid rgba(255, 255, 255, 0.26);
+      color: rgba(255, 255, 255, 0.95);
+      font-family: 'Forum', serif;
+      font-size: 12px;
+      font-weight: normal;
+      letter-spacing: 0.3px;
+      padding: 5px 11px;
+      border-radius: 7px;
+      white-space: nowrap;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.16s;
+      z-index: 200;
+    }
+    #controls button[data-tip]:hover::after { opacity: 1; }
+    #controls button[data-tip]:disabled:hover::after { opacity: 0; }
+    /* The two top-corner buttons have no room above them - drop their labels
+       below instead, and right-align the fullscreen one so it can't run off
+       the edge of the window. */
+    #menu-btn[data-tip]::after,
+    #fullscreen-btn[data-tip]::after {
+      bottom: auto;
+      top: calc(100% + 9px);
+    }
+    #fullscreen-btn[data-tip]::after {
+      left: auto;
+      right: 0;
+      transform: none;
+    }
+    /* :hover sticks after a tap on touch, leaving a label stranded on screen
+       - and a finger covers the button anyway. */
+    @media (pointer: coarse) {
+      #controls button[data-tip]::after { display: none; }
+    }
+
+    /* Points AT the palette button rather than floating over the centre.
+       The toast stays centred (so it can't run off a narrow screen) and the
+       arrow is offset instead: the palette button's centre is 53px right of
+       the viewport centre (32px offset + half of 42px), and the toast's own
+       centre coincides with the viewport's, so calc(50% + 53px) inside the
+       toast lands exactly on it. Update both together if either moves. */
     #palette-toast {
       position: absolute;
-      bottom: 68px;
+      bottom: 72px;
       left: 50%;
       transform: translateX(-50%) translateY(6px);
       z-index: 99;
       display: flex;
       align-items: center;
-      gap: 8px;
-      background: rgba(20, 20, 22, 0.62);
-      border: 1px solid rgba(255, 255, 255, 0.16);
-      color: rgba(255, 255, 255, 0.82);
+      gap: 9px;
+      background: rgba(24, 24, 28, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.34);
+      color: rgba(255, 255, 255, 0.95);
       font-family: 'Forum', serif;
-      font-size: 12px;
+      font-size: 13px;
       letter-spacing: 0.2px;
-      padding: 7px 14px;
+      padding: 9px 17px;
       border-radius: 20px;
       backdrop-filter: blur(6px);
       cursor: pointer;
@@ -159,12 +254,36 @@
       white-space: nowrap;
       max-width: 90vw;
     }
+    /* The pointer: a diamond rotated 45deg, half-hidden behind the pill so
+       only the protruding corner shows - keeps the border continuous, which
+       a bordered CSS triangle can't do. */
+    #palette-toast::after {
+      content: '';
+      position: absolute;
+      top: 100%;
+      left: calc(50% + 53px);
+      width: 11px;
+      height: 11px;
+      margin: -6px 0 0 -5.5px;
+      background: rgba(24, 24, 28, 0.9);
+      border-right: 1px solid rgba(255, 255, 255, 0.34);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.34);
+      transform: rotate(45deg);
+    }
     #palette-toast.show {
       opacity: 1;
       transform: translateX(-50%) translateY(0);
       pointer-events: auto;
+      /* Soft halo pulse - draws the eye without moving, since motion this
+         close to the artwork reads as part of it. Runs on the box-shadow
+         only, so it can't fight the transform the transition owns. */
+      animation: toast-attn 2.4s ease-in-out 0.6s infinite;
     }
-    #palette-toast .fa-palette { opacity: 0.8; }
+    @keyframes toast-attn {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); }
+      50% { box-shadow: 0 0 0 7px rgba(255, 255, 255, 0.09); }
+    }
+    #palette-toast .fa-palette { opacity: 0.9; }
 
     #instructions {
       position: absolute;
@@ -386,7 +505,7 @@
       width: 20px; height: 20px; border-radius: 4px;
       border: 1px solid rgba(0,0,0,0.25);
     }
-    #strip-cycle {
+    #strip-prev, #strip-cycle {
       background: transparent;
       border: 1px solid rgba(255, 255, 255, 0.22);
       color: rgba(255, 255, 255, 0.7);
@@ -397,7 +516,7 @@
       cursor: pointer;
       flex: none;
     }
-    #strip-cycle:hover { background: rgba(255, 255, 255, 0.12); }
+    #strip-prev:hover, #strip-cycle:hover { background: rgba(255, 255, 255, 0.12); }
     /* palette names on the palette step */
     .palette-name {
       font-size: 12px;
@@ -408,6 +527,97 @@
       letter-spacing: 0.2px;
     }
 
+    /* Welcome: the front door. Deliberately its OWN overlay rather than a
+       step of the wizard - it's a fork in the road, not a stage of one
+       journey, and keeping it separate leaves the wizard's step machinery
+       (bounds, dots, back/next labels) completely untouched. */
+    #welcome-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 320;            /* above #setup-overlay's 300 */
+      background: rgba(12, 12, 14, 0.86);
+      backdrop-filter: blur(10px);
+      display: flex;
+      align-items: flex-start; /* see #setup-overlay's note - same overflow trap */
+      justify-content: center;
+      font-family: 'Forum', serif;
+      color: rgba(255, 255, 255, 0.9);
+      overflow-y: auto;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    #welcome-overlay.hidden { display: none; }
+    #welcome-panel {
+      margin: auto;
+      width: min(480px, 100%);
+      background: rgba(28, 28, 32, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 14px;
+      padding: 30px 28px 24px;
+      box-sizing: border-box;
+      text-align: center;
+    }
+    #welcome-panel h1 {
+      margin: 0 0 16px 0;
+      font-size: 27px;   /* a full sentence now, not a wordmark - must not wrap on a phone */
+      font-weight: normal;
+      letter-spacing: 1px;
+    }
+    #welcome-panel .sub {
+      margin: 0 0 12px 0;
+      font-size: 13.5px;
+      line-height: 1.6;
+      color: rgba(255, 255, 255, 0.62);
+    }
+    #welcome-panel .sub:last-of-type { margin-bottom: 24px; }
+    #welcome-actions { display: flex; flex-direction: column; gap: 10px; }
+    #welcome-actions button {
+      font-family: 'Forum', serif;
+      border-radius: 9px;
+      cursor: pointer;
+      letter-spacing: 0.5px;
+      padding: 13px 20px;
+      font-size: 15px;
+      transition: background-color 0.2s, border-color 0.2s;
+    }
+    #welcome-start {
+      background: rgba(255, 255, 255, 0.92);
+      border: none;
+      color: rgba(18, 18, 20, 0.95);
+    }
+    #welcome-start:hover { background: #fff; }
+    #welcome-advanced {
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      color: rgba(255, 255, 255, 0.78);
+    }
+    #welcome-advanced:hover { background: rgba(255, 255, 255, 0.1); }
+    #welcome-actions .hint {
+      font-size: 11.5px;
+      color: rgba(255, 255, 255, 0.4);
+      margin: -4px 0 4px;
+    }
+    /* Modifies "Get Started" only - Advanced Mode is the user choosing every
+       one of these by hand, so randomising them there would be contradictory.
+       Placed directly beneath that button so its scope reads from position. */
+    #welcome-random {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      margin: -2px 0 10px;
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.55);
+      cursor: pointer;
+      text-align: left;
+    }
+    #welcome-random input {
+      width: 16px;
+      height: 16px;
+      flex: none;
+      accent-color: rgba(255, 255, 255, 0.85);
+      cursor: pointer;
+    }
     #setup-overlay {
       position: fixed;
       inset: 0;
@@ -541,6 +751,8 @@
 @media (max-width: 520px) {
       #setup-panel { padding: 16px; }
       #setup-panel h2 { font-size: 19px; }
+      #welcome-panel { padding: 24px 18px 20px; }
+      #welcome-panel h1 { font-size: 23px; }
       /* Four strut options across a phone leaves ~56px of label room, and
          "Clear resin" needs ~63px - with nowrap labels they overlapped each
          other. Two-up keeps every label on one line. The 3 base options and
@@ -556,35 +768,45 @@
        something quite different (leaving 3D). Offsets shift to keep the same
        8px gap either side of the 44px-wide mode toggle. */
     @media (pointer: coarse) {
-      #palette-btn, #material-btn, #refresh-btn { width: 44px; height: 44px; bottom: 15px; }
-      #palette-btn { transform: translateX(30px); }
-      #material-btn, #refresh-btn { transform: translateX(-74px); }
+      #palette-btn, #material-btn, #refresh-btn, #ar-btn, #scramble-btn { width: 46px; height: 46px; bottom: 16px; }
+      #scramble-btn { transform: translateX(-132px); }
+      #palette-toast::after { left: calc(50% + 55px); }
+      #palette-btn, #ar-btn { transform: translateX(32px); }
+      #material-btn, #refresh-btn { transform: translateX(-78px); }
     }
   </style>
 </head>
 <body>
   <div id="controls">
-    <button id="menu-btn" class="desktop-only" title="Menu">
+    <button id="menu-btn" class="desktop-only" data-tip="Menu">
       <i class="fas fa-bars"></i>
     </button>
-    <button id="fullscreen-btn">
+    <button id="fullscreen-btn" data-tip="Fullscreen">
       <i id="fullscreen-icon" class="fas fa-expand"></i>
     </button>
-    <button id="mode-toggle-btn" disabled title="Toggle 3D mode">3D</button>
-    <button id="palette-btn" title="Change palette">
+    <button id="mode-toggle-btn" disabled data-tip="Explore in 3D">3D</button>
+    <button id="palette-btn" data-tip="Change palette">
       <i class="fas fa-palette"></i>
     </button>
-    <button id="material-btn" title="Base &amp; strut materials">
+    <button id="material-btn" data-tip="Materials &amp; light">
       <i class="fas fa-swatchbook"></i>
     </button>
-    <button id="refresh-btn" title="Start a new composition">
+    <button id="refresh-btn" data-tip="New composition">
       <i class="fas fa-arrows-rotate"></i>
+    </button>
+    <button id="ar-btn" data-tip="Place it in your room">
+      <i class="fas fa-cube"></i>
+    </button>
+    <button id="scramble-btn" data-tip="Scramble the angles">
+      <i class="fas fa-dice"></i>
     </button>
   </div>
 
+  <div id="ar-status"></div>
+
   <div id="palette-toast">
     <i class="fas fa-palette"></i>
-    <span>You can change the palette any time — the piece keeps what it has</span>
+    <span>Change the palette any time</span>
   </div>
 
   <div id="menu-dropdown" class="desktop-only">
@@ -596,8 +818,31 @@
     <button id="menu-reset">Reset Composition</button>
   </div>
 
+  <!-- Front door: quick start vs. fine tuning. Shown before the wizard. -->
+  <div id="welcome-overlay">
+    <div id="welcome-panel">
+      <h1>Welcome to GeneX 3D</h1>
+      <!-- The user's own copy - use it as written. A call to action and the
+           promise of a live, unrepeatable result; the internals (what
+           triggers an element, what it grows from) stay unsaid. -->
+      <p class="sub">Draw on the canvas and collaborate on generative and unique compositions, as they emerge. Every action taken shapes the work as you go, and no two pieces are ever quite the same.</p>
+      <p class="sub">Once it's complete, engage 3D and explore your creation as if it were standing right in front of you.</p>
+      <div id="welcome-actions">
+        <button id="welcome-start" type="button">Get Started</button>
+        <!-- Checkbox sits directly under the button it modifies, so its
+             scope is clear from position instead of a wordier label. -->
+        <label id="welcome-random">
+          <input type="checkbox" id="welcome-random-cb">
+          <span>Surprise me — randomise the shapes, materials and lighting</span>
+        </label>
+        <button id="welcome-advanced" type="button">Advanced Mode</button>
+        <p class="hint">Choose the palette, shapes and materials yourself</p>
+      </div>
+    </div>
+  </div>
+
   <!-- USER MODE: stepped setup - palette, then shapes, then preview -->
-  <div id="setup-overlay">
+  <div id="setup-overlay" class="hidden">
     <div id="setup-panel">
       <div id="setup-steps">
         <div class="dot active"></div><div class="dot"></div><div class="dot"></div>
@@ -619,7 +864,8 @@
           <span class="lbl">Palette</span>
           <span id="strip-name"></span>
           <span id="strip-swatches"></span>
-          <button id="strip-cycle" type="button">Next palette</button>
+          <button id="strip-prev" type="button">‹ Prev</button>
+          <button id="strip-cycle" type="button">Next ›</button>
         </div>
         <div id="shape-quick">
           <button id="shape-all" type="button">Feature all</button>
@@ -751,7 +997,7 @@
       if (setupBtn) {
         setupBtn.addEventListener('click', () => {
           menuDropdown.classList.remove('show');
-          if (typeof window.openUserSetup === 'function') window.openUserSetup();
+          if (typeof window.openWelcome === 'function') window.openWelcome();
         });
       }
       const paletteBtn = document.getElementById('menu-palette');
@@ -1471,13 +1717,19 @@
       });
       document.getElementById('setup-shuffle').addEventListener('click', () => renderPalettes(false, false));
       // Live palette switching from the shapes step - no need to go back
-      document.getElementById('strip-cycle').addEventListener('click', () => {
+      // Step through the palettes without going back a step. Both
+      // directions, because cycling PAST the one you liked and having no way
+      // back is the whole reason this needed a partner button - the ring is
+      // ordered (candidates -> surprise me -> artist's palette), so stepping
+      // -1 lands exactly where you just were.
+      const stepPalette = (delta) => {
         if (!candidates.length) return;
-        // cycle: candidates -> surprise me -> artist's palette -> back
         const order = candidates.map((_, i) => i).concat([null, 'artist']);
         const at = order.findIndex(v => v === selectedPalette);
-        selectPalette(order[(at + 1) % order.length]);
-      });
+        selectPalette(order[(at + delta + order.length) % order.length]);
+      };
+      document.getElementById('strip-prev').addEventListener('click', () => stepPalette(-1));
+      document.getElementById('strip-cycle').addEventListener('click', () => stepPalette(1));
       document.getElementById('shape-all').addEventListener('click', () => {
         SHAPE_TYPES.forEach(s => chosen.add(s.value));
         renderShapes(); updateStatus();
@@ -1530,6 +1782,61 @@
       // (`if (resetCycleTimestamp > 0) return`), so an impatient double-tap
       // can't stack two cycles, and the fade to black IS the feedback - no
       // spinner needed for something that visibly takes over the screen.
+      // AR (iOS only). Feature-detected, never sniffed: body.ar-capable is
+      // what reveals the button, so every other device simply never sees it.
+      // Surfaces the exporter build stamp + model size on the phone itself.
+      const arStatus = document.getElementById('ar-status');
+      let arStatusTimer = null;
+      window.showArStatus = function (text) {
+        if (!arStatus) return;
+        arStatus.textContent = text;
+        arStatus.classList.add('show');
+        clearTimeout(arStatusTimer);
+        arStatusTimer = setTimeout(() => arStatus.classList.remove('show'), 6000);
+      };
+
+      const arFab = document.getElementById('ar-btn');
+      if (arFab && typeof window.isARQuickLookSupported === 'function'
+          && window.isARQuickLookSupported()) {
+        document.body.classList.add('ar-capable');
+        arFab.addEventListener('click', () => {
+          // Building the USDA is synchronous and can take a moment on a big
+          // composition - flag the button so a second tap can't stack it.
+          arFab.classList.add('busy');
+          setTimeout(() => {
+            try {
+              if (!window.launchAR()) {
+                alert('Enter 3D mode first to build the model.');
+              } else if (typeof window.isARNativeSafari === 'function' && !window.isARNativeSafari()) {
+                // Non-Safari browsers on iOS can usually hand a .usdz to
+                // Quick Look, but not always - and when they can't, the tap
+                // just silently downloads a file. Say so rather than leaving
+                // the user staring at nothing.
+                setTimeout(() => {
+                  console.log('AR: non-Safari iOS browser - Quick Look handoff is best-effort here');
+                }, 0);
+              }
+            } catch (e) {
+              console.warn('AR export failed:', e);
+              alert("Couldn't build the AR model for this composition.");
+            }
+            arFab.classList.remove('busy');
+          }, 30); // let the browser paint the busy state before we block on it
+        });
+      }
+
+      // Scramble: tips every shape 1-10 degrees on X and Y, rebuilds the
+      // scene so the struts support the new orientations; tap again to
+      // revert to the true composition.
+      const scrambleFab = document.getElementById('scramble-btn');
+      if (scrambleFab) scrambleFab.addEventListener('click', () => {
+        if (typeof window.setScrambleMode !== 'function') return;
+        const on = !window.getScrambleMode();
+        window.setScrambleMode(on);
+        scrambleFab.classList.toggle('active', on);
+        scrambleFab.dataset.tip = on ? 'Back to true' : 'Scramble the angles';
+      });
+
       const refreshFab = document.getElementById('refresh-btn');
       if (refreshFab) refreshFab.addEventListener('click', () => {
         hideToast();
@@ -1551,7 +1858,7 @@
         if (!toast) return;
         toast.classList.add('show');
         clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => toast.classList.remove('show'), 7000);
+        toastTimer = setTimeout(() => toast.classList.remove('show'), 11000);
       }
       function hideToast() {
         if (!toast) return;
@@ -1580,6 +1887,68 @@
           showToast();
         }
       }, 1200);
+
+      // ——— welcome: quick start vs. fine tuning ———
+      const welcomeOverlay = document.getElementById('welcome-overlay');
+      const randomCb = document.getElementById('welcome-random-cb');
+      const pickRandom = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+      // A random 3-6 of the shape types get FEATURED - not excluded, which is
+      // what `shapeTypes` means here (see applyUserSettings). Fewer than 3
+      // reads as repetitive, more than 6 is barely a preference at all.
+      function randomFeaturedShapes() {
+        const pool = SHAPE_TYPES.map(t => t.value);
+        for (let i = pool.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [pool[i], pool[j]] = [pool[j], pool[i]];
+        }
+        return pool.slice(0, 3 + Math.floor(Math.random() * 4));
+      }
+
+      // "Get Started": commit a config and get out of the way. The palette is
+      // left unlocked (paletteIndex null = a fresh one per composition), which
+      // IS the curated default - it's the untouched classic behaviour, and
+      // locking a stranger to one palette on their first visit is the worse
+      // failure. The checkbox extends the randomness to everything else.
+      function startCurated(randomise) {
+        if (randomise) {
+          if (typeof window.getMaterialOptions === 'function') {
+            const opts = window.getMaterialOptions();
+            window.setSculptureMaterials({
+              base: pickRandom(opts.base).id,
+              strut: pickRandom(opts.strut).id
+            });
+          }
+          if (typeof window.setSpotlightMode === 'function') {
+            window.setSpotlightMode(Math.random() < 0.5);
+          }
+        }
+        if (typeof window.applyUserSettings === 'function') {
+          window.applyUserSettings({
+            artist: false,
+            paletteIndex: null,
+            shapeTypes: randomise ? randomFeaturedShapes() : null
+          });
+        }
+        welcomeOverlay.classList.add('hidden');
+        overlay.classList.add('hidden');
+      }
+
+      document.getElementById('welcome-start')
+        .addEventListener('click', () => startCurated(randomCb && randomCb.checked));
+      document.getElementById('welcome-advanced').addEventListener('click', () => {
+        welcomeOverlay.classList.add('hidden');
+        window.openUserSetup();
+      });
+
+      // The front door, reusable: the menu's "New Composition…" comes back
+      // through here rather than dropping a returning user straight into the
+      // three-step wizard.
+      window.openWelcome = function () {
+        if (typeof window.beginUserSetup === 'function') window.beginUserSetup();
+        overlay.classList.add('hidden');
+        welcomeOverlay.classList.remove('hidden');
+      };
 
       renderPalettes(false, false);
       goTo(0);
