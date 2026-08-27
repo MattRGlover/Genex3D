@@ -439,6 +439,10 @@
     body.in-3d #structure-toggle-btn { display: flex; }
     body.in-3d.ar-capable #ar-btn { display: flex; }
     #ar-btn.busy { opacity: 0.5; pointer-events: none; }
+    /* Defensive, same as #go3d-toast's own mirror-image rule: the timer that
+       shows this lives in 3D-mode-entry code, but if 2D is somehow reached
+       again before that fires, the button it points at is already gone. */
+    body:not(.in-3d) #ar-toast { display: none; }
     /* "Start New" wipes the composition for good (see the confirm dialog
        it opens) - a bit of breathing room ahead of it in the dock reads as
        "this one's different," separating it from the routine controls
@@ -1664,6 +1668,14 @@
 
   <div id="go3d-toast" class="hint-toast">
     <span>3D View</span>
+  </div>
+
+  <!-- Nudges iPhone users toward AR once they've had a moment to look
+       around in 3D - see window.showArToast, scheduled from
+       activate3DMode in babylon3D.js. Only ever shown on ar-capable
+       devices (the button itself doesn't exist on anything else). -->
+  <div id="ar-toast" class="hint-toast">
+    <span>View Now in AR</span>
   </div>
 
   <!-- "only show the message when the button is clicked" - #mode-toggle-btn
@@ -3093,6 +3105,9 @@
           && window.isARQuickLookSupported()) {
         document.body.classList.add('ar-capable');
         arFab.addEventListener('click', () => {
+          // They found the button - the hint has done its job, whether it
+          // was ever shown or not.
+          if (typeof window.markArHintSeen === 'function') window.markArHintSeen();
           // Building the USDA is synchronous and can take a moment on a big
           // composition - flag the button so a second tap can't stack it.
           arFab.classList.add('busy');
@@ -3477,6 +3492,36 @@
       // Exposed for #help-btn (window.replayHelp, in babylon3D.js) to replay
       // this hint on demand in 2D.
       window.showGo3DToast = showGo3DToast;
+
+      // ——— "View Now in AR" hint: nudges iPhone users toward the AR button
+      // once they've had a moment to look around in 3D. Scheduling (the
+      // 15s delay, cancel-on-leaving-3D, show-once-ever) lives in
+      // activate3DMode/deactivate3DMode (babylon3D.js) - this file only
+      // owns showing/hiding the toast itself, same division as every other
+      // toast here. ———
+      const arToast = document.getElementById('ar-toast');
+      let arToastTimer = null;
+      function showArToast() {
+        if (!arToast) return;
+        const arFabEl = document.getElementById('ar-btn');
+        if (arFabEl && typeof window.__centerOverButton === 'function') window.__centerOverButton(arToast, arFabEl);
+        arToast.classList.add('show');
+        if (arFabEl && typeof window.__pulseButtonOnce === 'function') window.__pulseButtonOnce(arFabEl);
+        clearTimeout(arToastTimer);
+        arToastTimer = setTimeout(hideArToast, 11000);
+      }
+      function hideArToast() {
+        if (!arToast) return;
+        clearTimeout(arToastTimer);
+        arToast.classList.remove('show');
+      }
+      if (arToast) arToast.addEventListener('click', () => {
+        hideArToast();
+        const arFabEl = document.getElementById('ar-btn');
+        if (arFabEl && !arFabEl.classList.contains('busy')) arFabEl.click();
+      });
+      window.showArToast = showArToast;
+      window.hideArToast = hideArToast;
 
       // "only show the message when the button is clicked" - a NATIVE
       // disabled button never fires 'click' (or mousedown/mouseup) at all,

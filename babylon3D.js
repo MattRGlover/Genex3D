@@ -8,6 +8,13 @@ let babylonScene = null;
 let camera3D = null;
 let is3DMode = false;
 let firstEntry3DHintsShown = false;
+// "View Now in AR" hint (see activate3DMode/deactivate3DMode below): shown
+// once ever, not once per 3D-mode visit - like firstEntry3DHintsShown, once
+// someone has found the button (or been shown the hint) it doesn't need to
+// nudge again for the rest of the session.
+let arHintShown = false;
+let arHintTimer = null;
+const AR_HINT_DELAY_MS = 15000;
 // How many 2D elements existed at the last successful convertShapesTo3D()
 // build (from any source - activate3DMode, setScrambleMode, or a future
 // caller) - null until that first build. activate3DMode compares this
@@ -570,11 +577,38 @@ function activate3DMode() {
     strutGrowthDone.then(() => play3DIntroSequence());
   }
 
+  // "View Now in AR" - nudges iPhone users toward the AR button once
+  // they've had a moment to actually look around in 3D. ar-capable is set
+  // once, at page load (see index3D.html's arFab wiring), so it's already
+  // correct here regardless of which visit this is. Timer, not tied to
+  // strutGrowthDone/the intro sequence - AR is a separate, always-available
+  // feature, not part of the onboarding walkthrough, so it shouldn't wait
+  // on (or race) that sequence.
+  if (!arHintShown && document.body.classList.contains('ar-capable')) {
+    clearTimeout(arHintTimer);
+    arHintTimer = setTimeout(() => {
+      if (!is3DMode || arHintShown) return; // left 3D, or already dismissed via the AR button itself
+      arHintShown = true;
+      if (typeof window.showArToast === 'function') window.showArToast();
+    }, AR_HINT_DELAY_MS);
+  }
+
   console.log('3D mode activated!');
 }
 
+// Exposed so #ar-btn's own click handler (index3D.html) can mark the hint
+// "seen" the moment someone actually finds and uses the button - whether or
+// not the timer above ever got to show it.
+window.markArHintSeen = function () {
+  arHintShown = true;
+  clearTimeout(arHintTimer);
+  if (typeof window.hideArToast === 'function') window.hideArToast();
+};
+
 function deactivate3DMode() {
   console.log('Deactivating 3D mode...');
+  clearTimeout(arHintTimer);
+  if (typeof window.hideArToast === 'function') window.hideArToast();
 
   // Same reasoning as activate3DMode's own call - the 3D sweep might still
   // be mid-flight if the user backs out quickly.
@@ -4382,6 +4416,18 @@ function createBaseMesh3D(node) {
   // with no alpha cutout, so none of the padded-rectangle failure modes that
   // forced open shapes back to flat colour apply here.
   [sides, topCap, botCap].forEach(m => { m.metadata = { usdTexture: true }; });
+  // `sides` is a DOUBLESIDE ribbon - both windings are already baked into its
+  // geometry, same as extrudePrism bodies. topCap/botCap are plain CreateGround
+  // planes (single winding, front face up), so on a TRANSLUCENT base (the
+  // clear acrylic option) they hit the exact same RealityKit transparent-pass
+  // bug as any other single-winding body: only one side of the mesh draws,
+  // and it isn't reliably the one facing the camera. That's why the acrylic
+  // base's underside disappeared when viewed from below in AR while the
+  // (already-doubled) sides stayed visible. See the `usdForceDoubleWinding`
+  // check in buildUsda for the actual fix - shipping a reversed twin of every
+  // triangle, exactly like volumeGradient bodies already do.
+  topCap.metadata.usdForceDoubleWinding = true;
+  botCap.metadata.usdForceDoubleWinding = true;
   baseSurfaceMeshes.push(sides, topCap, botCap);
 
   // Black outline on EVERY real edge, not just the outermost ones - each
@@ -7550,9 +7596,26 @@ function collectUsdParts() {
     // than fight which side that is, give every triangle a reversed twin:
     // whichever side the pass culls, each face keeps a drawable copy from
     // every viewpoint. Meshes where windingIsOutward returns null are
-    // either flat or ALREADY doubled - skipped, no re-doubling.
+    // either flat or ALREADY doubled - skipped, no re-doubling, UNLESS
+    // `usdForceDoubleWinding` says otherwise (see below).
+    //
+    // Flat single-sided planes (the base's topCap/botCap - see
+    // createBaseMesh3D) are a separate case windingIsOutward can't speak to
+    // at all: a flat quad has zero signed volume regardless of which way it
+    // winds, so `outward` is always null for them, same as a genuinely
+    // pre-doubled closed body - but a flat plane isn't pre-doubled, it only
+    // ever has ONE real face. Confirmed by direct AR test to go invisible
+    // from the wrong side on an OPAQUE base too (wood), not just a
+    // translucent one - the "opaque single-winding meshes render correctly
+    // from every angle" evidence above came from closed TUBES, where the
+    // far wall visually substitutes for a culled near face; a flat plane has
+    // no such far wall to fall back on, so it just disappears. Doubling a
+    // flat plane's winding is always safe and nearly free (same point array,
+    // a few extra index entries), so `usdForceDoubleWinding`-tagged meshes
+    // double unconditionally, regardless of opacity.
+    const forceDouble = !!(mesh.metadata && mesh.metadata.usdForceDoubleWinding);
     let outIdx = indices;
-    if (surf.a < 0.999 && outward !== null && mesh.metadata && mesh.metadata.volumeGradient) {
+    if (forceDouble || (surf.a < 0.999 && outward !== null && mesh.metadata && mesh.metadata.volumeGradient)) {
       outIdx = Array.from(indices);
       for (let t = 0; t + 2 < indices.length; t += 3) {
         outIdx.push(indices[t], indices[t + 2], indices[t + 1]);
