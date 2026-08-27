@@ -40,6 +40,27 @@ let lineCounter = 0;
 
 let lastDragTime = 0;
 let isLooping = true;
+// —— Lock / undo / redo (2D only) ——
+// Locked blocks new elements from spawning (handleDrag's gate) - it does
+// not freeze undo/redo, which stay available regardless.
+let isLocked = false;
+// Every element this composition has ever created, in creation order -
+// elementHistory[0..historyPointer) is what's ACTUALLY on screen right now.
+// Undo/redo just move historyPointer and replay from scratch (see
+// rebuildFromHistory) rather than trying to reverse live/animating state in
+// place - lines/beziers/arcs/spirals bake themselves onto a flat pixel
+// layer once their draw-in animation finishes, so there's no vector data
+// left to erase after the fact; a full, deterministic replay is the only
+// way undo and (especially) redo stay exact no matter how long ago an
+// element finished animating. A NEW element created after undoing some
+// steps discards whatever redo history was ahead of it - same as any
+// standard undo/redo stack.
+let elementHistory = [];
+let historyPointer = 0;
+// Set by create*Element right before it returns success, consumed by
+// handleDrag() into a real history entry - keeps the history-recording
+// concern out of each creator function's own control flow.
+let __pendingHistoryEntry = null;
 let sceneReport;
 let bigBgLayer; // WORLD background strip (4 square skybox side faces, tileable)
 let isShapeTurn;
@@ -55,7 +76,8 @@ let finalCompositionImage;
 let fadeAlpha = 255; // Start with black screen
 let completionTimestamp = 0;
 let projectStartTime = 0; // Track when project starts
-const FADE_DURATION_MS = 2000; // 2 seconds
+const FADE_DURATION_MS = 2000; // 2 seconds - the reset cycle's fade out/in
+const INITIAL_FADE_DURATION_MS = 4000; // slower first-impression reveal than a reset gets
 const BLACKOUT_DELAY_MS = 5000; // 5 seconds
 
 let palette;
@@ -103,14 +125,19 @@ function setup() {
   randomSeedValue = int(random(1000000));
   randomSeed(randomSeedValue);
   
-  reset();
-
-  // Initialize project start time for initial fade-in
-  projectStartTime = millis();
-
   // Purely local mode: no Firebase initialization
-  generateWorldBackground();
-  
+  // projectStartTime (starts the fade-in countdown) is set only once the
+  // REAL background has actually landed, not right away - starting it
+  // early meant the fade could finish counting down against a background
+  // that hadn't rendered yet, popping in mid-fade or right after instead of
+  // genuinely fading in from the moment there was something to see. Passed
+  // straight into reset()'s own background generation rather than calling
+  // generateWorldBackground() a second time afterward - that second call
+  // used to roll and show an entirely different background moments after
+  // this one had already landed and started fading in behind the welcome
+  // modal.
+  reset(true, () => { projectStartTime = millis(); });
+
   // Expose arrays and background layer globally for 3D mode integration
   window.skeletons = skeletons;
   window.ornaments = ornaments;
@@ -192,12 +219,15 @@ function draw() {
   checkCompletion();
 
   // --- INITIAL FADE-IN LOGIC ---
-  // Handle the initial fade-in from black when project first loads
+  // Handle the initial fade-in from black when project first loads.
+  // projectStartTime is only set once the real background has actually
+  // landed (see setup()'s generateWorldBackground callback) - so this never
+  // starts counting down against a background that isn't ready yet.
   if (projectStartTime > 0 && resetCycleTimestamp === 0) {
     let elapsed = millis() - projectStartTime;
-    if (elapsed < FADE_DURATION_MS) {
+    if (elapsed < INITIAL_FADE_DURATION_MS) {
       // Initial fade-in from black to transparent
-      fadeAlpha = map(elapsed, 0, FADE_DURATION_MS, 255, 0);
+      fadeAlpha = map(elapsed, 0, INITIAL_FADE_DURATION_MS, 255, 0);
     } else {
       // Initial fade-in complete
       fadeAlpha = 0;
@@ -244,29 +274,19 @@ function draw() {
       console.log(`[DEBUG] Cycle reset complete - ready for new composition`);
     }
 
-    // Draw the fade effect onto its dedicated layer
+  }
+
+  // Draw the fade effect onto its dedicated layer and composite it on top -
+  // covers BOTH the initial fade-in from black (fadeAlpha computed above)
+  // and an active reset cycle. Previously this only ran inside the
+  // resetCycleTimestamp block, so the initial-load fadeAlpha was computed
+  // but never actually painted - the piece appeared at full brightness
+  // immediately instead of fading in.
+  if (fadeAlpha > 0) {
     fadeLayer.clear();
     fadeLayer.background(0, fadeAlpha);
-  }
-
-  // --- DEBUG INFO ---
-  // Display element count for debugging
-  push();
-  fill(0, 0, 15, 0.7);
-  noStroke();
-  textSize(14);
-  textAlign(LEFT, TOP);
-  textFont('monospace');
-  text(`Elements: ${totalElementsCreated}/${MAX_ELEMENTS}`, 10, 10);
-  pop();
-
-  // Render the fade layer on top of everything
-  if (resetCycleTimestamp > 0) {
     image(fadeLayer, 0, 0);
   }
-
-  // Draw debug info on top of everything
-  drawDebugInfo();
 }
 
 // —————————————————————————————————————
@@ -308,7 +328,7 @@ function isUiEvent(event) {
     // touch, where the desktop-only hamburger doesn't exist) fell through to
     // p5 and started a new shape behind the panel it opened.
     return !!(event && event.target && event.target.closest &&
-        event.target.closest('#controls, #instructions, #menu-dropdown, #setup-overlay, #welcome-overlay, #palette-toast'));
+        event.target.closest('#controls, #instructions, #menu-dropdown, #setup-overlay, #welcome-overlay, #confirm-overlay, #palette-toast'));
 }
 
 function mouseDragged(event) {
@@ -481,6 +501,7 @@ function handleDrag() {
   // isUiEvent, so a swipe on a phone would otherwise start drawing behind
   // the setup overlay. This is the one choke point every entry path shares.
   if (userSetupPending) return false;
+  if (isLocked) return false;
   if (totalElementsCreated >= MAX_ELEMENTS) return false;
 
   let now = millis();
@@ -523,6 +544,20 @@ function handleDrag() {
 
   if (elementCreated) {
     totalElementsCreated++; // Increment ONLY on success.
+    // Commit whichever create*Element call just succeeded into the undo
+    // history. A new element always starts a fresh timeline branch: any
+    // undone-but-not-yet-overwritten redo future is discarded here, same as
+    // any standard undo/redo stack.
+    if (__pendingHistoryEntry) {
+      if (historyPointer < elementHistory.length) elementHistory.length = historyPointer;
+      elementHistory.push(__pendingHistoryEntry);
+      historyPointer = elementHistory.length;
+      __pendingHistoryEntry = null;
+      if (typeof window.updateUndoRedoButtons === 'function') {
+        window.updateUndoRedoButtons(historyPointer > 0, historyPointer < elementHistory.length);
+      }
+    }
+    if (typeof window.updateElementCount === 'function') window.updateElementCount(totalElementsCreated, MAX_ELEMENTS);
     console.log(`🎯 ELEMENT COUNT UPDATE: ${totalElementsCreated}/${MAX_ELEMENTS} total elements`);
     console.log(`📊 Current arrays: skeletons=${skeletons.length}, ornaments=${ornaments.length}, lineAnims=${lineAnims.length}, latticeAnims=${latticeAnims.length}`);
     
@@ -566,7 +601,9 @@ function createLatticeElement(anchor) {
   console.log(`  Lattice created with ${lattice.cells.length} cells at (${anchor.x}, ${anchor.y})`);
   latticeAnims.push(lattice);
   console.log(`  Total latticeAnims: ${latticeAnims.length}`);
-  sceneReport.lattices.push(captureLatticeReport(lattice, anchor.id));
+  const latticeReport = captureLatticeReport(lattice, anchor.id);
+  sceneReport.lattices.push(latticeReport);
+  __pendingHistoryEntry = { kind: 'lattice', obj: lattice, sceneReportKey: 'lattices', sceneReportEntry: latticeReport };
   return true;
 }
 
@@ -647,12 +684,14 @@ function createShapeElement(anchor) {
     sceneReport.skeletons.push(shapeReport);
     console.log(`📊 Added to skeletons. Total skeletons: ${skeletons.length}, Scene report skeletons: ${sceneReport.skeletons.length}`);
     console.log(`📋 Shape report:`, shapeReport);
+    __pendingHistoryEntry = { kind: 'shape', target: 'skeletons', obj: shape, varietyType: shapeType, sceneReportKey: 'skeletons', sceneReportEntry: shapeReport };
   } else {
     ornaments.push(shape);
     const shapeReport = captureShapeReport(shape);
     sceneReport.ornaments.push(shapeReport);
     console.log(`📊 Added to ornaments. Total ornaments: ${ornaments.length}, Scene report ornaments: ${sceneReport.ornaments.length}`);
     console.log(`📋 Shape report:`, shapeReport);
+    __pendingHistoryEntry = { kind: 'shape', target: 'ornaments', obj: shape, varietyType: shapeType, sceneReportKey: 'ornaments', sceneReportEntry: shapeReport };
   }
 
   console.log(`🔍 Current scene report summary:`);
@@ -699,13 +738,17 @@ function createLineElement(anchor) {
   createdLineTypes.add(lineType);
 
   let line;
+  let lineReport = null;
+  let sceneReportKey = null;
   switch (lineType) {
     case 'line':
       console.log('  Creating: Line');
       let B = random(anchors.filter(a => a !== anchor));
       let lineSteps = min(dist(anchor.x, anchor.y, B.x, B.y) * 0.5, 600);
       line = new LineAnim(anchor.x, anchor.y, B.x, B.y, lineSteps, { isThick });
-      sceneReport.lines.push(captureLineReport(line, anchor.id));
+      lineReport = captureLineReport(line, anchor.id);
+      sceneReport.lines.push(lineReport);
+      sceneReportKey = 'lines';
       elementCreated = true;
       break;
     case 'bezier':
@@ -714,7 +757,7 @@ function createLineElement(anchor) {
       const lineVec = p5.Vector.sub(B2, anchor);
       const lineLength = lineVec.mag();
       const perpVec = lineVec.copy().rotate(HALF_PI).setMag(random(-lineLength * 0.3, lineLength * 0.3));
-      
+
       const cp1Vec = p5.Vector.add(anchor, p5.Vector.mult(lineVec, 1/3)).add(perpVec);
       const cp2Vec = p5.Vector.add(anchor, p5.Vector.mult(lineVec, 2/3)).add(perpVec);
       const cp1 = { x: cp1Vec.x, y: cp1Vec.y };
@@ -722,7 +765,9 @@ function createLineElement(anchor) {
       const approxLength = dist(anchor.x, anchor.y, cp1.x, cp1.y) + dist(cp1.x, cp1.y, cp2.x, cp2.y) + dist(cp2.x, cp2.y, B2.x, B2.y);
       let bezierSteps = min(approxLength * 0.5, 600);
       line = new BezierAnim(anchor, cp1, cp2, B2, bezierSteps, { isThick });
-      sceneReport.beziers.push(captureLineReport(line, anchor.id));
+      lineReport = captureLineReport(line, anchor.id);
+      sceneReport.beziers.push(lineReport);
+      sceneReportKey = 'beziers';
       elementCreated = true;
       break;
     case 'arc':
@@ -732,7 +777,9 @@ function createLineElement(anchor) {
        let sweep = random(PI * 0.25, PI * 1.5);
        let steps = min(r * sweep * 0.5, 600);
        line = new ArcAnim(anchor.x, anchor.y, r, startAngle, sweep, steps);
-       sceneReport.arcs.push(captureLineReport(line, anchor.id));
+       lineReport = captureLineReport(line, anchor.id);
+       sceneReport.arcs.push(lineReport);
+       sceneReportKey = 'arcs';
        elementCreated = true;
        break;
     case 'spiral':
@@ -740,12 +787,15 @@ function createLineElement(anchor) {
       let maxRadius = random(40, 150);
       let coils = random(2, 6);
       line = new SpiralAnim(anchor.x, anchor.y, {radius: maxRadius, revolutions: coils, steps: 600});
-      sceneReport.spirals.push(captureLineReport(line, anchor.id));
+      lineReport = captureLineReport(line, anchor.id);
+      sceneReport.spirals.push(lineReport);
+      sceneReportKey = 'spirals';
       elementCreated = true;
       break;
   }
 
   if (line) {
+    __pendingHistoryEntry = { kind: 'line', obj: line, varietyType: lineType, sceneReportKey, sceneReportEntry: lineReport };
     // Assign to a layer probabilistically
     line.layer = random() < 0.5 ? 'foreground' : 'background';
     lineAnims.push(line);
@@ -1412,7 +1462,16 @@ function resetComposition() {
 }
 window.resetComposition = resetComposition;
 
-function reset() {
+// regenerateBackground: false reuses whatever's already in finalBgLayer
+// instead of rolling a new watercolor background - used when applying the
+// user's initial settings (see applyUserSettings) right after setup() has
+// already generated and shown one behind the welcome modal, so committing
+// those settings doesn't visibly swap it out for a different one. Every
+// other caller (initial load, resize, the fade-cycle's own reset) wants a
+// genuinely new background and leaves this at its default.
+// onBackgroundReady: forwarded to generateWorldBackground when regenerating
+// - see its own onReady param.
+function reset(regenerateBackground = true, onBackgroundReady) {
   // Clear graphics layers
   if (lineLayer) lineLayer.clear();
   if (foregroundLayer) foregroundLayer.clear();
@@ -1455,10 +1514,21 @@ function reset() {
   shapeCounter = 0;
   lineCounter = 0;
   totalElementsCreated = 0;
+  if (typeof window.updateElementCount === 'function') window.updateElementCount(totalElementsCreated, MAX_ELEMENTS);
   isShapeTurn = true; // Start with a shape turn
   createdShapeTypes.clear(); // Reset shape type tracking
   createdLineTypes.clear(); // Reset line type tracking
   firstTwoShapeColors = []; // Reset first two shape colors
+
+  // A fresh composition starts with a clean slate: no undo history to step
+  // back into (there's nothing before element 1 of a brand new piece), and
+  // never starts locked.
+  elementHistory = [];
+  historyPointer = 0;
+  __pendingHistoryEntry = null;
+  isLocked = false;
+  if (typeof window.updateUndoRedoButtons === 'function') window.updateUndoRedoButtons(false, false);
+  if (typeof window.setLockButtonState === 'function') window.setLockButtonState(false);
 
   // Determine number of lattices (1, 2, or 3) and assign their slots.
   // USER MODE: lattices aren't a KandinskyShape type - they're scheduled
@@ -1519,7 +1589,7 @@ function reset() {
 
   // Generate a fresh watercolor background for each new composition
   // Random seed already set above, so this will use the new seed
-  generateWorldBackground();
+  if (regenerateBackground) generateWorldBackground(onBackgroundReady);
   
   // Capture complete state for pixel-perfect reproduction
   sceneReport.thickLineSlots = [...thickLineSlots];
@@ -1533,36 +1603,132 @@ function reset() {
   console.log("🎨 Background ready for Firebase Storage upload");
 }
 
-function easeOutCubic(t) {
-    return 1 - pow(1 - t, 3);
+// —————————————————————————————————————
+// UNDO / REDO (2D only)
+// —————————————————————————————————————
+// Drives an already-constructed LineAnim/BezierAnim/ArcAnim/SpiralAnim/
+// LatticeAnim through its OWN step() to full completion synchronously,
+// instead of over several real frames - same deterministic pixels (same
+// stored points/color/weight), just drawn all at once. Used to replay
+// history instantly on undo/redo rather than re-triggering a multi-frame
+// draw-in animation every time.
+function fastForwardAnim(anim, targetLayer) {
+  let guard = 0;
+  if (anim instanceof LatticeAnim) {
+    anim.cIdx = 0;
+    while (guard++ < 20000) {
+      anim.lastF = -Infinity; // defeat step()'s frame-delay gate every call
+      if (!anim.step(targetLayer)) break;
+    }
+  } else if (anim instanceof SpiralAnim) {
+    anim.progress = 0;
+    while (anim.step(targetLayer) && guard++ < 20000) {}
+  } else {
+    // LineAnim, BezierAnim, ArcAnim all drive off `i`
+    anim.i = 0;
+    while (anim.step(targetLayer) && guard++ < 20000) {}
+  }
 }
 
-function drawDebugInfo() {
-  if (!compositionFinished && resetCycleTimestamp === 0) return;
+// The one place undo and redo both land: rebuilds the ENTIRE composition
+// from elementHistory[0..historyPointer) - not just splicing the most
+// recent item in/out. Lines/beziers/arcs/spirals/lattices bake themselves
+// onto lineLayer/foregroundLayer (flat pixel buffers) once their draw-in
+// animation finishes, so there's no vector data left to erase after the
+// fact - a full replay onto freshly-cleared layers is the only way undo
+// stays correct no matter how long ago an element finished animating, and
+// the only way redo reproduces it EXACTLY rather than re-rolling anything.
+// Every replayed element reuses its ORIGINAL object (elementHistory keeps
+// real references, not just parameters), so nothing is regenerated with
+// new randomness - undo/redo only ever change which already-created
+// elements are currently shown.
+function rebuildFromHistory() {
+  if (lineLayer) lineLayer.clear();
+  if (foregroundLayer) foregroundLayer.clear();
 
-  push();
-  fill(255, 0, 0);
-  textSize(16);
-  textAlign(LEFT, BOTTOM);
-  textFont('monospace');
-  let msg = '';
+  skeletons = [];
+  ornaments = [];
+  lineAnims = [];
+  latticeAnims = [];
+  window.skeletons = skeletons;
+  window.ornaments = ornaments;
+  window.lineAnims = lineAnims;
+  window.latticeAnims = latticeAnims;
 
-  if (compositionFinished && resetCycleTimestamp === 0) {
-    msg = 'COMPLETE - use menu to reset';
-  } else if (resetCycleTimestamp > 0) {
-    const elapsed = millis() - resetCycleTimestamp;
-    if (elapsed < FADE_DURATION_MS) {
-      msg = 'STATE: FADING OUT';
-    } else if (elapsed < FADE_DURATION_MS + BLACKOUT_DELAY_MS) {
-      const countdown = 5 - ((elapsed - FADE_DURATION_MS) / 1000);
-      msg = `STATE: BLACKOUT (${max(0, countdown).toFixed(1)}s)`;
-    } else if (elapsed < FADE_DURATION_MS + BLACKOUT_DELAY_MS + FADE_DURATION_MS) {
-      msg = 'STATE: FADING IN';
+  sceneReport.skeletons = [];
+  sceneReport.ornaments = [];
+  sceneReport.lines = [];
+  sceneReport.beziers = [];
+  sceneReport.arcs = [];
+  sceneReport.spirals = [];
+  sceneReport.lattices = [];
+
+  createdShapeTypes.clear();
+  createdLineTypes.clear();
+  shapeCounter = 0;
+  lineCounter = 0;
+  latticesCompleted = 0;
+
+  for (let idx = 0; idx < historyPointer; idx++) {
+    const entry = elementHistory[idx];
+    if (entry.kind === 'shape') {
+      shapeCounter++;
+      createdShapeTypes.add(entry.varietyType);
+      (entry.target === 'skeletons' ? skeletons : ornaments).push(entry.obj);
+      sceneReport[entry.sceneReportKey].push(entry.sceneReportEntry);
+    } else if (entry.kind === 'lattice') {
+      fastForwardAnim(entry.obj, foregroundLayer);
+      latticesCompleted++;
+      sceneReport[entry.sceneReportKey].push(entry.sceneReportEntry);
+    } else if (entry.kind === 'line') {
+      lineCounter++;
+      createdLineTypes.add(entry.varietyType);
+      const targetLayer = entry.obj.layer === 'foreground' ? foregroundLayer : lineLayer;
+      fastForwardAnim(entry.obj, targetLayer);
+      sceneReport[entry.sceneReportKey].push(entry.sceneReportEntry);
     }
   }
 
-  text(msg, 10, height - 10);
-  pop();
+  // Mirrors what KandinskyShape's own constructor does for the first two
+  // (skeleton) shapes - rebuilt here since those objects aren't being
+  // re-constructed, just re-shown.
+  firstTwoShapeColors = skeletons.slice(0, 2).map(s => s.c);
+
+  totalElementsCreated = historyPointer;
+  maxElementsReached = totalElementsCreated >= MAX_ELEMENTS;
+  // Not force-set true even at MAX_ELEMENTS - every replayed element is
+  // already fully drawn (no lineAnims/latticeAnims left running), so
+  // checkCompletion() naturally flips this back on its own next frame if
+  // still warranted, exactly like the live-drawing path does.
+  compositionFinished = false;
+  completionTimestamp = 0;
+
+  if (typeof window.updateElementCount === 'function') window.updateElementCount(totalElementsCreated, MAX_ELEMENTS);
+  if (typeof window.updateUndoRedoButtons === 'function') {
+    window.updateUndoRedoButtons(historyPointer > 0, historyPointer < elementHistory.length);
+  }
+}
+
+window.undo2D = function () {
+  if (historyPointer <= 0) return;
+  historyPointer--;
+  rebuildFromHistory();
+};
+
+window.redo2D = function () {
+  if (historyPointer >= elementHistory.length) return;
+  historyPointer++;
+  rebuildFromHistory();
+};
+
+// Blocks handleDrag from spawning new elements while true - undo/redo stay
+// available regardless of lock state.
+window.setLocked2D = function (locked) {
+  isLocked = !!locked;
+};
+
+function easeOutCubic(t) {
+    return 1 - pow(1 - t, 3);
 }
 
 function updateAnchorPositions() {
@@ -1772,7 +1938,12 @@ window.applyUserSettings = function (opts) {
   fadeAlpha = 0;
   resetHasOccurred = false;
   if (typeof fadeLayer !== 'undefined' && fadeLayer) fadeLayer.clear();
-  reset(); // start clean so the very first element already uses these settings
+  // regenerateBackground: false - setup() already generated and showed a
+  // background behind the welcome/setup screen before the user ever
+  // reached this point; committing their settings here should just keep
+  // using it, not roll and swap in a completely different one the instant
+  // they click through.
+  reset(false); // start clean so the very first element already uses these settings
 };
 
 // ——— MID-COMPOSITION PALETTE CHANGE ———
@@ -1986,7 +2157,12 @@ function getPalette() {
 // slices of the same strip; the strip tiles horizontally for the wrap seam).
 const BG_FACE_SCALE = 2; // cube face texture side = 2x the SMALLER canvas dim
 let bgCapTop, bgCapBottom;
-function generateWorldBackground() {
+// onReady (optional): called once the REAL background has actually landed -
+// not the synchronous placeholder crop drawn immediately below, but the
+// async skybox screenshot renderSphereBackgroundTo2D captures once its
+// shaders/textures are genuinely ready. Falls back to calling it right away
+// if that capture never even starts (no BABYLON, no skybox, threw).
+function generateWorldBackground(onReady) {
   // Base the face size on min(w,h): on portrait screens (phones) sizing from
   // height would explode the texture area and generation time
   const faceSize = Math.round(Math.min(width, height) * BG_FACE_SCALE);
@@ -2022,9 +2198,9 @@ function generateWorldBackground() {
   // draw a flat crop of the front-face window immediately as a placeholder.
   finalBgLayer.clear();
   finalBgLayer.image(bigBgLayer, -(worldW * 0.375 - width / 2), -(worldH * 0.5 - height / 2));
-  if (typeof window.renderSphereBackgroundTo2D === 'function') {
-    window.renderSphereBackgroundTo2D(finalBgLayer, bigBgLayer.canvas, width, height);
-  }
+  const capturing = typeof window.renderSphereBackgroundTo2D === 'function'
+    && window.renderSphereBackgroundTo2D(finalBgLayer, bigBgLayer.canvas, width, height, onReady);
+  if (!capturing && typeof onReady === 'function') onReady();
 }
 
 // opts:

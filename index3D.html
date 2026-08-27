@@ -15,6 +15,16 @@
       overflow: hidden;
       background: #000;
     }
+    /* Long-pressing anywhere - a button or the canvas itself - shouldn't
+       trigger the browser's own text-selection/callout magnifier. It
+       visibly fought with the custom long-press-for-tooltip behaviour on
+       buttons, and was never wanted while drawing either. */
+    * {
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
     canvas {
       display: block;
       touch-action: none;
@@ -32,34 +42,46 @@
       z-index: 0;
       display: none;
     }
+    /* Every real control (the bottom bar, help, fullscreen) starts fully
+       invisible and non-interactive - without this they render sharp and
+       clickable from frame 1, popping in plainly underneath the welcome
+       modal's own 0.6s fade-in/blur instead of staying hidden until there's
+       actually a composition for them to act on. Revealed by JS
+       (.show added to #controls) the moment the welcome/setup flow is
+       actually dismissed and the first real composition exists - see
+       startCurated() and the advanced setup wizard's final step. */
+    #controls {
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.5s;
+    }
+    #controls.show {
+      opacity: 1;
+      pointer-events: auto;
+    }
     /* Subtle, barely-there UI: translucent glass buttons */
-    #fullscreen-btn {
+    /* Bottom icon bar - one glass pill housing every mode-dependent control,
+       Instagram-dock style, so the buttons are laid out by flexbox instead
+       of by hand-tuned pixel offsets. Vertical centring of mismatched button
+       heights (42/46/48px) comes free from align-items, so nothing here
+       needs to "match the toggle's axis" the way the old absolute rules did. */
+    #bottom-bar {
       position: absolute;
-      top: 12px;
-      right: 12px;
-      z-index: 100;
-      background-color: rgba(255, 255, 255, 0.12);
-      border: 1px solid rgba(255, 255, 255, 0.25);
-      color: rgba(255, 255, 255, 0.55);
-      width: 36px;
-      height: 36px;
-      border-radius: 50%;
-      cursor: pointer;
-      font-size: 13px;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      transition: background-color 0.3s, color 0.3s;
-    }
-    #fullscreen-btn:hover {
-      background-color: rgba(255, 255, 255, 0.3);
-      color: rgba(255, 255, 255, 0.9);
-    }
-    #mode-toggle-btn {
-      position: absolute;
-      bottom: 15px;
+      bottom: 14px;
       left: 50%;
       transform: translateX(-50%);
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 999px;
+      padding: 6px 8px;
+      backdrop-filter: blur(10px);
+    }
+    #mode-toggle-btn {
+      position: relative;
       z-index: 100;
       background: rgba(255, 255, 255, 0.24);
       border: 1px solid rgba(255, 255, 255, 0.48);
@@ -75,6 +97,7 @@
       display: flex;
       justify-content: center;
       align-items: center;
+      flex: none;
       transition: background-color 0.3s, color 0.3s, opacity 0.3s;
       animation: mode-btn-pulse 2.6s ease-in-out infinite;
     }
@@ -91,15 +114,143 @@
       0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.45); }
       50% { box-shadow: 0 0 0 8px rgba(255, 255, 255, 0); }
     }
-    /* The three satellite buttons flanking the 2D/3D toggle. Identical
-       except for which side they sit on and which mode they belong to, so
-       they share one rule - three near-identical copies had already started
-       to drift. All are available on touch, unlike the desktop-only
-       hamburger menu, which is the only route to any of this on desktop. */
-    #palette-btn, #material-btn, #refresh-btn, #ar-btn, #scramble-btn {
+    /* Once tapped, the button no longer needs to draw the eye - added by JS
+       on first click and never removed, so it stays quiet from then on. */
+    #mode-toggle-btn.pulse-done { animation: none; }
+    /* "After 7 shapes, feature the palette button" - the SAME ring pulse
+       as #mode-toggle-btn's own idle animation above, reused rather than
+       a new effect invented from scratch: it's a pure box-shadow ripple
+       that never touches background-color, so removing the class (see
+       window.stopPaletteAttract) always lands the button back on its
+       exact normal rgba(255,255,255,0.22) unpressed look - never a
+       leftover "brighter gray" some other transition/hover state might
+       otherwise strand it at. */
+    #palette-btn.pulse-attract { animation: mode-btn-pulse 2.6s ease-in-out infinite; }
+    /* One ripple, not a loop - fired by window.__pulseButtonOnce (below,
+       alongside #btn-preview) on whatever button a message is currently
+       highlighting: #palette-btn/#mode-toggle-btn when their toast shows,
+       or whichever button #btn-preview is currently pointing at. Applied as
+       an inline style rather than a class specifically so it can outrank
+       #mode-toggle-btn's own ID-level idle animation/.pulse-done rule
+       without a specificity fight, then clear itself on animationend so
+       whichever of those the button already had resumes underneath. */
+    @keyframes btn-highlight-pulse {
+      0% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.55); }
+      60% { box-shadow: 0 0 0 10px rgba(255, 255, 255, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); }
+    }
+    /* #scramble-btn shows a real PAIR of dice (the two-dice image the
+       button is going for), not one face - two small square dice, each
+       its own 7-pip grid (standard die layout: 4 corners + 2 mid-edges +
+       centre), free to move/rotate independently so they can visibly
+       tumble around inside the button on a roll (see .die-1/.die-2's
+       @keyframes below) rather than FontAwesome's single fixed glyph.
+       Sits centred and fills the button; each .die is positioned
+       relative to ITS OWN centre via translate, so rotating never
+       swings it off away from where it's supposed to sit. */
+    .dice-pair {
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+    /* Clips the tumble to the button's own circle (it's already round via
+       border-radius:50% below) - lets the mid-roll keyframes swing further
+       out for a livelier tumble without either die ever visibly poking
+       out past the button's edge; reads as bouncing off the inside of a
+       cup rather than flying off the button. */
+    #scramble-btn { overflow: hidden; }
+    .die {
+      /* Self-centering lives in top/left (plain box positioning, never
+         touched again), NOT in the animated transform below - an
+         animation's keyframes fully REPLACE the element's transform for
+         their duration rather than layering on top of it, so baking
+         "-50%" self-centering into every single keyframe step (on top of
+         each step's own tumble offset) would mean re-deriving it
+         everywhere. Keeping it here instead means transform is free to be
+         used purely for the resting offset/rotation and the tumble
+         animation, nothing else. */
       position: absolute;
-      bottom: 18px;   /* centres a 42px button on the 48px toggle's axis (y=39) */
-      left: 50%;
+      top: calc(50% - 6px);
+      left: calc(50% - 6px);
+      width: 12px;
+      height: 12px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: repeat(3, 1fr);
+      background: rgba(0, 0, 0, 0.22);
+      border-radius: 3px;
+      /* Resting pose: two dice landed slightly apart and slightly
+         askew, not stacked concentrically or perfectly square - reads
+         as "just settled" rather than a single die redrawn twice. Kept
+         within the button's own ~21px radius (minus the die's own
+         half-diagonal) so they still sit fully inside it even without
+         the overflow clip above doing any work at rest. */
+    }
+    #die-1 { transform: translate(-6px, -5px) rotate(-10deg); }
+    #die-2 { transform: translate(5px, 5px) rotate(12deg); }
+    .die .pip {
+      width: 2.6px;
+      height: 2.6px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.92);
+      opacity: 0;
+      transform: scale(0.4);
+      transition: opacity 0.1s, transform 0.1s, background-color 0.1s;
+      justify-self: center;
+      align-self: center;
+    }
+    .die .pip.show { opacity: 1; transform: scale(1); }
+    /* "red dot for 1" - the classic single-pip face's dot is coloured,
+       every other face's pips stay the button's normal white. */
+    .die .pip.show.pip-one { background: #ff4d4d; }
+    .pip[data-pos="tl"] { grid-column: 1; grid-row: 1; }
+    .pip[data-pos="tr"] { grid-column: 3; grid-row: 1; }
+    .pip[data-pos="ml"] { grid-column: 1; grid-row: 2; }
+    .pip[data-pos="c"]  { grid-column: 2; grid-row: 2; }
+    .pip[data-pos="mr"] { grid-column: 3; grid-row: 2; }
+    .pip[data-pos="bl"] { grid-column: 1; grid-row: 3; }
+    .pip[data-pos="br"] { grid-column: 3; grid-row: 3; }
+    /* Each die tumbles its OWN path (different offsets, different spin
+       direction/amount) so the two visibly move independently rather
+       than in lockstep, then lands exactly on its resting transform
+       above - the translate() base position has to be repeated in each
+       keyframe's final step since an animation fully overrides the
+       element's own inline/rule transform for its duration, not layer on
+       top of it. Free to swing further than the resting radius mid-roll
+       (the button's own overflow:hidden above clips anything that would
+       otherwise poke out). Runs once per tap (JS removes the class on
+       animationend), timed to roughly match rollDice()'s own face-swap
+       cadence. */
+    @keyframes die-tumble-1 {
+      0%   { transform: translate(-6px, -5px) rotate(-10deg); }
+      15%  { transform: translate(7px, -9px) rotate(150deg) scale(1.05); }
+      30%  { transform: translate(10px, 4px) rotate(300deg) scale(0.92); }
+      45%  { transform: translate(-4px, 9px) rotate(430deg) scale(1.08); }
+      60%  { transform: translate(-10px, -2px) rotate(560deg) scale(0.95); }
+      75%  { transform: translate(3px, -7px) rotate(680deg) scale(1.04); }
+      90%  { transform: translate(-7px, -6px) rotate(770deg) scale(0.98); }
+      100% { transform: translate(-6px, -5px) rotate(710deg); } /* 2 full spins, lands back at -10deg's orientation (710 mod 360 = 350 = -10deg) */
+    }
+    @keyframes die-tumble-2 {
+      0%   { transform: translate(5px, 5px) rotate(12deg); }
+      15%  { transform: translate(-7px, 8px) rotate(-140deg) scale(1.06); }
+      30%  { transform: translate(-9px, -4px) rotate(-280deg) scale(0.9); }
+      45%  { transform: translate(3px, -9px) rotate(-410deg) scale(1.1); }
+      60%  { transform: translate(9px, 3px) rotate(-540deg) scale(0.93); }
+      75%  { transform: translate(2px, 8px) rotate(-660deg) scale(1.05); }
+      90%  { transform: translate(7px, 6px) rotate(-750deg) scale(0.97); }
+      100% { transform: translate(5px, 5px) rotate(-708deg); } /* 2 full spins the other way, lands back at 12deg's orientation (-708 mod 360 = 12deg) */
+    }
+    #scramble-btn.rolling #die-1 { animation: die-tumble-1 0.55s ease-out; }
+    #scramble-btn.rolling #die-2 { animation: die-tumble-2 0.55s ease-out 0.03s; }
+    /* Every button in the bar - the satellites flanking the toggle, plus
+       export/fullscreen at the outer ends - plus #help-btn off on its own,
+       shares one rule so they all read as one family instead of drifting
+       into near-identical copies. position:relative keeps each its own
+       containing block, so the data-tip::after label still anchors to the
+       button itself rather than to #bottom-bar. */
+    #help-btn, #export-btn, #fullscreen-btn, #palette-btn, #material-btn, #refresh-btn, #ar-btn, #scramble-btn, #undo-btn, #redo-btn, #lock-btn, #spotlight-btn, #lighting-btn, #structure-toggle-btn {
+      position: relative;
       z-index: 100;
       background: rgba(255, 255, 255, 0.22);
       border: 1px solid rgba(255, 255, 255, 0.45);
@@ -108,44 +259,194 @@
       height: 42px;
       border-radius: 50%;
       cursor: pointer;
-      font-size: 14px;
+      font-size: 17px;
       display: flex;
       justify-content: center;
       align-items: center;
+      flex: none;
       transition: background-color 0.3s, color 0.3s, opacity 0.3s;
     }
-    #palette-btn:hover, #material-btn:hover, #refresh-btn:hover, #ar-btn:hover, #scramble-btn:hover {
+    #help-btn:hover, #export-btn:hover, #fullscreen-btn:hover, #palette-btn:hover, #material-btn:hover, #refresh-btn:hover, #ar-btn:hover, #scramble-btn:hover, #undo-btn:hover, #redo-btn:hover, #lock-btn:hover, #spotlight-btn:hover, #lighting-btn:hover, #structure-toggle-btn:hover {
       background: rgba(255, 255, 255, 0.45);
       color: rgba(255, 255, 255, 1);
     }
-    /* 2D pair: refresh left, palette right - both act on the 2D
-       composition, so both stand down in 3D. That leaves the bar reading
-       [refresh] [3D] [palette]: symmetric, 8px either side of the toggle. */
-    #refresh-btn { transform: translateX(-74px); }
-    #palette-btn { transform: translateX(32px); }
-    /* Materials takes the LEFT slot refresh vacates on entering 3D - the
-       pedestal and struts only exist there, and the palette has nothing to
-       change there, so the two swap in and out as exact counterparts. */
-    #material-btn { transform: translateX(-74px); display: none; }
-    /* AR takes the RIGHT slot in 3D - the one the palette button vacates -
-       so 3D reads [materials] [2D] [AR], mirroring 2D's own three. Only ever
-       shown where AR Quick Look actually exists (iOS Safari): body.ar-capable
-       is set by feature detection, never by sniffing the user agent. */
-    #ar-btn { transform: translateX(32px); display: none; }
-    /* Scramble - 3D only: tips every shape 1-10 degrees on X and Y and
-       rebuilds the struts for the new orientations; tap again to revert. */
-    #scramble-btn { transform: translateX(-124px); display: none; }
-    #scramble-btn.active {
+    #export-btn:disabled, #undo-btn:disabled, #redo-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    /* Warm coral/red, not the shared white .active look most of the bar
+       uses - "locked" is a restriction, and red/warm is the conventional
+       colour language for that (same reasoning as #spotlight-btn's own
+       gold override: a toggled button should read as ON by its own
+       colour, not just a brighter circle indistinguishable from the rest
+       of the bar). */
+    #lock-btn.active {
+      background: rgba(255, 107, 107, 0.9);
+      color: rgba(56, 12, 12, 0.95);
+      box-shadow: 0 0 12px 2px rgba(255, 107, 107, 0.5);
+    }
+    #lock-btn.active:hover {
+      background: rgba(255, 122, 122, 1);
+    }
+    /* 2D-only controls - undo/redo history and locking don't mean anything
+       once the piece is already built in 3D. */
+    body.in-3d #undo-btn, body.in-3d #redo-btn, body.in-3d #lock-btn { display: none; }
+    /* Being reworked - hidden for now rather than removed, so the button
+       and its wiring are still there to bring back later. */
+    #export-btn { display: none; }
+    /* #help-btn sits apart from #bottom-bar, anchored to its own corner -
+       it replays messages, it isn't one of the composition's own controls,
+       so it doesn't belong in that dock. Overrides the position:relative
+       above with its own fixed corner spot. */
+    #help-btn {
+      position: absolute;
+      bottom: 18px;
+      right: 18px;
+    }
+    /* On a narrow phone #bottom-bar (up to 6 buttons in 2D now: palette,
+       undo, redo, lock, mode-toggle, refresh) runs close to the full
+       viewport width even at its tightened touch gap below - #help-btn's
+       fixed bottom-right spot sat right in its path. Moved to the opposite
+       (top-left) corner here instead of trying to squeeze it back out of
+       the way, since that stays correct regardless of how wide the bar
+       ends up - no pixel-budget math to keep re-checking as buttons are
+       added or removed. */
+    @media (max-width: 520px) {
+      #help-btn {
+        bottom: auto;
+        right: auto;
+        top: 18px;
+        left: 18px;
+      }
+    }
+    /* Also its own corner, not part of the bar - upper-right, the
+       conventional spot for a fullscreen toggle. */
+    #fullscreen-btn {
+      position: absolute;
+      top: 18px;
+      right: 18px;
+    }
+    /* Materials shares refresh's DOM slot (only one of the pair is ever
+       display:flex), so the bar never opens a gap for whichever one is
+       hidden. Same for AR and palette. Scramble has no 2D counterpart, so
+       it's simply absent - display:none - until 3D turns it on. */
+    #material-btn, #ar-btn, #scramble-btn, #spotlight-btn, #lighting-btn, #structure-toggle-btn { display: none; }
+    /* Not tied to body.in-3d like its siblings above - only shown while
+       spotlight mode is actually on (see syncSpotlightButton, which drives
+       this directly since it depends on two states, not one class). */
+    /* .active here means "struts/base are HIDDEN" (the toggled-on state of
+       the button itself), not "structure visible" - same lit-background
+       language as scramble/spotlight/lighting's own .active. */
+    #scramble-btn.active, #spotlight-btn.active, #lighting-btn.active, #structure-toggle-btn.active {
       background: rgba(255, 255, 255, 0.45);
       color: rgba(255, 255, 255, 1);
     }
+    /* Warm gold, not the shared white .active look above - a lit bulb reads
+       as ON by its own colour, not just a brighter circle indistinguishable
+       from every other toggled button in the bar. Overrides the shared rule
+       above by coming after it (same specificity, source order decides). */
+    #spotlight-btn.active {
+      background: rgba(255, 196, 64, 0.92);
+      color: rgba(48, 32, 4, 0.95);
+      box-shadow: 0 0 12px 2px rgba(255, 196, 64, 0.55);
+    }
+    #spotlight-btn.active:hover {
+      background: rgba(255, 206, 84, 1);
+    }
+    /* Cool blue, not the shared white .active look above - same reasoning
+       as #spotlight-btn's own gold override, just this button's own
+       theme (a "view/visibility" toggle - see its eye/eye-slash icon).
+       .active here means struts/base are HIDDEN, the button's own
+       toggled-on state. */
+    #structure-toggle-btn.active {
+      background: rgba(74, 168, 255, 0.9);
+      color: rgba(10, 30, 56, 0.95);
+      box-shadow: 0 0 12px 2px rgba(74, 168, 255, 0.5);
+    }
+    #structure-toggle-btn.active:hover {
+      background: rgba(94, 178, 255, 1);
+    }
+    /* #lighting-panel, #materials-panel and #palette-panel (z-index 150
+       each) physically overlap the WHOLE bar while open, their own trigger
+       button included, to "cover the other buttons" - each button needs to
+       rise above that overlap so the same click that opened its panel can
+       still reach it to close it again, instead of the panel's own body
+       swallowing the click first. Scoped to .active (only true while THAT
+       button's own panel is actually open), not a blanket z-index:200 on
+       the bare button - all three buttons live in the same #bottom-bar
+       stacking context, so an unconditional 200 on any one of them also
+       poked it out through the OTHER panels even when its own was closed,
+       showing through a panel that's supposed to cover every other button.
+       Falls back to the shared z-index:100 every other bar button gets
+       otherwise. */
+    #lighting-btn.active { z-index: 200; }
+    #material-btn.active { z-index: 200; }
+    #palette-btn.active { z-index: 200; }
+    #material-btn.active, #palette-btn.active {
+      background: rgba(255, 255, 255, 0.45);
+      color: rgba(255, 255, 255, 1);
+    }
+    /* The same rainbow gradient as the "Artist's Palette" swatch elsewhere
+       in this panel - a lit-up palette button reads as ON by its own
+       colour, not just a brighter circle indistinguishable from every
+       other toggled button in the bar (same reasoning as #spotlight-btn's
+       own warm-gold override, just recoloured for this button's own
+       theme). Overrides the shared white rule above by coming after it
+       (same specificity, source order decides). */
+    #palette-btn.active {
+      background: linear-gradient(135deg, #e34a4a, #e3a34a, #e3e34a, #5fc45f, #4aa8e3, #7a5fd0, #c94ab5);
+      color: rgba(255, 255, 255, 0.98);
+      box-shadow: 0 0 12px 2px rgba(200, 120, 200, 0.5);
+    }
+    #palette-btn.active:hover {
+      box-shadow: 0 0 14px 3px rgba(200, 120, 200, 0.65);
+    }
+    /* Black, not the shared white .active look above - the metallic colour
+       now lives on the icon's own swatch windows (bronze/silver/gold,
+       see .swatchbook-icon below), so the button itself goes dark to set
+       them off instead of competing with them. */
+    #material-btn.active {
+      background: rgba(20, 18, 16, 0.94);
+      color: rgba(255, 255, 255, 0.95);
+      box-shadow: 0 0 12px 2px rgba(0, 0, 0, 0.55);
+    }
+    #material-btn.active:hover {
+      background: rgba(32, 29, 26, 1);
+    }
+    /* The ACTUAL fa-swatchbook glyph (its real path data, traced from
+       Font Awesome's own SVG - not a from-scratch redraw), its 3 fanned
+       card shapes plain/monochrome (currentColor, same as every other
+       bar icon at rest) UNTIL the button is actually engaged - only then
+       do they take on their own material colour: the tall left card
+       (gold), the pointed diamond card (silver), the bottom-right card
+       (wood brown), a real materials swatch fan instead of a flat glyph.
+       The 3 tiny "window" shapes on the left card are a fill-rule hole
+       in the original icon, empty/see-through there - kept as a subtle
+       dark tint in both states instead, so they read as punched-out
+       windows rather than disappearing into the card. */
+    .swatchbook-icon { width: 15px; height: 15px; }
+    .swatchbook-icon .mat-card,
+    .swatchbook-icon .mat-diamond,
+    .swatchbook-icon .mat-rect { fill: currentColor; }
+    .swatchbook-icon .mat-window { fill: rgba(0, 0, 0, 0.28); }
+    #material-btn.active .swatchbook-icon .mat-card    { fill: #e0b13c; }
+    #material-btn.active .swatchbook-icon .mat-diamond { fill: #c9cdd3; }
+    #material-btn.active .swatchbook-icon .mat-rect    { fill: #9c6b3a; }
     body.in-3d #palette-btn,
     body.in-3d #refresh-btn,
-    body.in-3d #palette-toast { display: none; }
+    body.in-3d #palette-toast,
+    body.in-3d #go3d-toast { display: none; }
     body.in-3d #material-btn { display: flex; }
+    body.in-3d #spotlight-btn { display: flex; }
     body.in-3d #scramble-btn { display: flex; }
+    body.in-3d #structure-toggle-btn { display: flex; }
     body.in-3d.ar-capable #ar-btn { display: flex; }
     #ar-btn.busy { opacity: 0.5; pointer-events: none; }
+    /* "Start New" wipes the composition for good (see the confirm dialog
+       it opens) - a bit of breathing room ahead of it in the dock reads as
+       "this one's different," separating it from the routine controls
+       beside it rather than sitting flush like just another button. */
+    #refresh-btn { margin-left: 14px; }
+    @media (pointer: coarse) {
+      #refresh-btn { margin-left: 10px; }
+    }
 
     /* Build stamp, shown on screen when an AR model is generated. Exists
        because a phone has no console: without it there is no way to tell a
@@ -153,7 +454,7 @@
        could have been either. */
     #ar-status {
       position: absolute;
-      bottom: 76px;
+      bottom: 92px;
       left: 50%;
       transform: translateX(-50%);
       z-index: 101;
@@ -175,208 +476,152 @@
     }
     #ar-status.show { opacity: 1; }
 
-    /* One-time, self-dismissing hint. Deliberately small and low-contrast:
-       a suggestion, not an interruption. */
-    /* Hover labels. Native title= is slow to appear, can't be styled, and
-       would double up with this - so every button carries data-tip instead.
-       The buttons are position:absolute, which makes each its own containing
-       block, so the pseudo-element anchors to the button itself. */
-    #controls button[data-tip]::after {
-      content: attr(data-tip);
+    /* Composition progress, top-center - replaces the old dark/near-invisible
+       debug label p5 drew in the canvas corner. 2D only: in 3D the piece is
+       already built, the count no longer changes. */
+    #element-count {
       position: absolute;
-      bottom: calc(100% + 9px);
+      top: 16px;
       left: 50%;
       transform: translateX(-50%);
-      background: rgba(24, 24, 28, 0.94);
-      border: 1px solid rgba(255, 255, 255, 0.26);
-      color: rgba(255, 255, 255, 0.95);
+      z-index: 60;
       font-family: 'Forum', serif;
-      font-size: 12px;
-      font-weight: normal;
-      letter-spacing: 0.3px;
-      padding: 5px 11px;
-      border-radius: 7px;
-      white-space: nowrap;
-      opacity: 0;
+      font-size: 19px;
+      letter-spacing: 0.5px;
+      color: rgba(255, 255, 255, 0.92);
+      text-shadow: 0 1px 5px rgba(0, 0, 0, 0.55);
       pointer-events: none;
-      transition: opacity 0.16s;
-      z-index: 200;
+      user-select: none;
     }
-    #controls button[data-tip]:hover::after { opacity: 1; }
-    #controls button[data-tip]:disabled:hover::after { opacity: 0; }
-    /* The two top-corner buttons have no room above them - drop their labels
-       below instead, and right-align the fullscreen one so it can't run off
-       the edge of the window. */
-    #menu-btn[data-tip]::after,
-    #fullscreen-btn[data-tip]::after {
-      bottom: auto;
-      top: calc(100% + 9px);
-    }
-    #fullscreen-btn[data-tip]::after {
-      left: auto;
-      right: 0;
-      transform: none;
-    }
-    /* :hover sticks after a tap on touch, leaving a label stranded on screen
-       - and a finger covers the button anyway. */
-    @media (pointer: coarse) {
-      #controls button[data-tip]::after { display: none; }
-    }
+    body.in-3d #element-count { display: none; }
 
-    /* Points AT the palette button rather than floating over the centre.
-       The toast stays centred (so it can't run off a narrow screen) and the
-       arrow is offset instead: the palette button's centre is 53px right of
-       the viewport centre (32px offset + half of 42px), and the toast's own
-       centre coincides with the viewport's, so calc(50% + 53px) inside the
-       toast lands exactly on it. Update both together if either moves. */
-    #palette-toast {
+    /* One-time, self-dismissing hint. Plain white serif text above the bar,
+       no bubble/box and no leader - just a drop shadow for legibility
+       against the artwork, slid by JS (window.__centerOverButton) to sit
+       centred directly above whichever button it's about, so its own
+       position is what says which button that is. #btn-preview is the
+       shared one every bar button's label crossfades through (:hover,
+       long-press and the flash sweep all go through window.showBtnPreview/
+       hideBtnPreview below); #go3d-toast/#palette-toast are their own
+       one-time hints. */
+    .hint-toast {
       position: absolute;
-      bottom: 72px;
+      bottom: 80px;
       left: 50%;
-      transform: translateX(-50%) translateY(6px);
+      transform: translateX(-50%);
       z-index: 99;
-      display: flex;
-      align-items: center;
-      gap: 9px;
-      background: rgba(24, 24, 28, 0.9);
-      border: 1px solid rgba(255, 255, 255, 0.34);
-      color: rgba(255, 255, 255, 0.95);
-      font-family: 'Forum', serif;
-      font-size: 13px;
+      color: #fff;
+      font-family: 'Times New Roman', Times, serif;
+      font-size: 16px;
       letter-spacing: 0.2px;
-      padding: 9px 17px;
-      border-radius: 20px;
-      backdrop-filter: blur(6px);
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.85), 0 1px 10px rgba(0, 0, 0, 0.6);
       cursor: pointer;
       opacity: 0;
       pointer-events: none;
-      transition: opacity 0.5s, transform 0.5s;
+      transition: opacity 0.5s;
       white-space: nowrap;
       max-width: 90vw;
+      text-align: center;
     }
-    /* The pointer: a diamond rotated 45deg, half-hidden behind the pill so
-       only the protruding corner shows - keeps the border continuous, which
-       a bordered CSS triangle can't do. */
-    #palette-toast::after {
-      content: '';
-      position: absolute;
-      top: 100%;
-      left: calc(50% + 53px);
-      width: 11px;
-      height: 11px;
-      margin: -6px 0 0 -5.5px;
-      background: rgba(24, 24, 28, 0.9);
-      border-right: 1px solid rgba(255, 255, 255, 0.34);
-      border-bottom: 1px solid rgba(255, 255, 255, 0.34);
-      transform: rotate(45deg);
-    }
-    #palette-toast.show {
+    .hint-toast.show {
       opacity: 1;
-      transform: translateX(-50%) translateY(0);
       pointer-events: auto;
-      /* Soft halo pulse - draws the eye without moving, since motion this
-         close to the artwork reads as part of it. Runs on the box-shadow
-         only, so it can't fight the transform the transition owns. */
-      animation: toast-attn 2.4s ease-in-out 0.6s infinite;
     }
-    @keyframes toast-attn {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); }
-      50% { box-shadow: 0 0 0 7px rgba(255, 255, 255, 0.09); }
+    /* A message long enough to need real line breaks, not the shared
+       bubble's single-line nowrap - narrow enough to wrap into 2 short,
+       centred lines instead of one long cramped one, with room to breathe
+       between them. */
+    .hint-toast.wrap {
+      white-space: normal;
+      max-width: 190px;
+      line-height: 1.45;
     }
-    #palette-toast .fa-palette { opacity: 0.9; }
-
-    #instructions {
-      position: absolute;
-      top: 60px;
-      left: 15px;
-      z-index: 100;
-      background: rgba(0, 0, 0, 0.25);
-      color: rgba(255, 255, 255, 0.85);
-      padding: 8px 12px;
-      border-radius: 8px;
-      font-family: 'Forum', serif;
-      font-size: 12px;
-      max-width: 240px;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.6s;
+    /* #help-btn sits at its own fixed corner spot, closer to the bottom
+       edge than the bar-adjacent toasts above, so this one needs its own
+       slightly lower resting height. */
+    #btn-preview-help {
+      bottom: 76px;
     }
-    #instructions.show {
+    #btn-preview-text {
       opacity: 1;
+      transition: opacity 0.13s;
     }
-    #instructions h4 {
-      margin: 0 0 6px 0;
-      color: rgba(255, 255, 255, 0.9);
-      font-size: 12px;
+    #btn-preview-text.fade { opacity: 0; }
+
+    /* No panel, no box - two fingerprints float directly over the actual
+       3D view, driven frame-by-frame from real camera3D values (see
+       playGestureDemo in babylon3D.js), so their motion IS the camera's
+       motion instead of a separate illustration of it. The layer sits
+       above the Babylon canvas (z-index 10 while active) but below the
+       bar/toasts, and never intercepts input itself. */
+    #gesture-hint {
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      pointer-events: none;
     }
-    #instructions p {
-      margin: 3px 0;
-      color: rgba(255, 255, 255, 0.8);
-    }
-    /* Hamburger menu: desktop only */
-    #menu-btn {
+    /* Never lingers into 2D - it's demonstrating a 3D-only gesture. */
+    body:not(.in-3d) #gesture-hint { display: none; }
+    /* Same recipe as the bar buttons (#help-btn etc. above) - same size,
+       background, border, so a fingertip reads as part of the same design
+       language instead of a different kind of object. */
+    .gesture-finger {
       position: absolute;
-      top: 12px;
-      left: 12px;
-      z-index: 100;
-      background-color: rgba(255, 255, 255, 0.12);
-      border: 1px solid rgba(255, 255, 255, 0.25);
-      color: rgba(255, 255, 255, 0.55);
-      width: 36px;
-      height: 36px;
+      top: 45%;
+      left: 50%;
+      /* playGestureDemo (babylon3D.js) overwrites both transform and
+         opacity every frame - materialize/breathe/dematerialize live
+         entirely in JS, so no CSS transition here fights it mid-flight.
+         The base values only matter before that first frame lands. */
+      transform: translate(-50%, -50%);
+      width: 42px;
+      height: 42px;
       border-radius: 50%;
-      cursor: pointer;
-      font-size: 13px;
+      background: rgba(255, 255, 255, 0.22);
+      border: 1px solid rgba(255, 255, 255, 0.45);
+      backdrop-filter: blur(3px);
       display: flex;
-      justify-content: center;
       align-items: center;
-      transition: background-color 0.3s, color 0.3s;
+      justify-content: center;
+      font-size: 17px;
+      color: rgba(255, 255, 255, 0.92);
+      opacity: 0;
     }
-    #menu-btn:hover {
-      background-color: rgba(255, 255, 255, 0.3);
-      color: rgba(255, 255, 255, 0.9);
-    }
-    #menu-dropdown {
-      position: absolute;
-      top: 54px;
-      left: 12px;
-      z-index: 100;
-      background: rgba(20, 20, 20, 0.75);
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      border-radius: 10px;
-      padding: 6px;
-      min-width: 190px;
+
+    /* Same idea as #gesture-hint, for 2D: a fingertip and a trail floating
+       directly over the canvas, no panel. Sits above the p5 canvas
+       (z-index 1) but below the bar/toasts, and never intercepts input. */
+    #draw-hint {
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      pointer-events: none;
       display: none;
-      flex-direction: column;
-      backdrop-filter: blur(6px);
     }
-    #menu-dropdown.show {
-      display: flex;
-    }
-    #menu-dropdown button {
-      background: transparent;
-      border: none;
-      color: rgba(255, 255, 255, 0.85);
-      font-family: 'Forum', serif;
-      font-size: 13px;
-      text-align: left;
-      padding: 8px 10px;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: background-color 0.2s;
-    }
-    #menu-dropdown button:hover {
-      background-color: rgba(255, 255, 255, 0.15);
-    }
-    #menu-dropdown button:disabled {
-      opacity: 0.35;
-      cursor: not-allowed;
-    }
-    #menu-dropdown hr {
-      border: none;
-      border-top: 1px solid rgba(255, 255, 255, 0.15);
-      margin: 4px 2px;
+    body.in-3d #draw-hint { display: none; } /* 2D-only gesture */
+    #draw-hint-svg {
+      position: absolute;
+      inset: 0;
       width: 100%;
+      height: 100%;
+    }
+    /* The stroke itself, revealed progressively via stroke-dashoffset
+       (window.playDrawHintDemo, below) in step with the fingertip moving
+       along it - the same "motion IS the thing it's demonstrating" idea as
+       the 3D gesture demo, just drawing a line instead of moving a camera. */
+    #draw-hint-path {
+      fill: none;
+      stroke: rgba(255, 255, 255, 0.8);
+      stroke-width: 2.5px;
+      stroke-linecap: round;
+    }
+    /* Positioned in raw viewport pixels (computed alongside the path itself
+       in window.playDrawHintDemo), unlike .gesture-finger's percentage
+       anchor + delta convention - simpler when the thing it's tracking is
+       already in pixel coordinates. */
+    #draw-hint-finger {
+      top: 0;
+      left: 0;
     }
 
     /* ——— USER MODE: stepped pre-draw setup ——— */
@@ -384,7 +629,7 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      margin-bottom: 16px;
+      margin-bottom: clamp(8px, 2vh, 16px);
     }
     #setup-steps .dot {
       height: 3px;
@@ -400,7 +645,7 @@
       display: flex;
       align-items: center;
       gap: 10px;
-      margin-top: 20px;
+      margin-top: clamp(8px, 2vh, 20px);
     }
     #setup-status {
       flex: 1;
@@ -431,8 +676,29 @@
     }
     #setup-next:hover { background: #fff; }
     #setup-next:disabled { opacity: 0.35; cursor: not-allowed; }
-    /* shape picker */
+    /* shape picker - 13 types rarely fit within #shape-rows' own max-height
+       at once (5 rows deep on a narrow phone), so it scrolls internally
+       rather than growing the whole panel. Left alone, that read as
+       "cut off/broken" rather than "scroll for more": the last visible
+       row just stopped mid-cell with no hint anything followed it (see
+       #shape-rows-wrap.has-more below - JS toggles it based on whether
+       there's genuinely more to scroll to, on render and on scroll, so
+       the fade disappears once the list is scrolled all the way down or
+       never needed scrolling at all). */
     #shape-rows { max-height: 44vh; overflow-y: auto; padding: 2px; }
+    #shape-rows-wrap { position: relative; }
+    #shape-rows-wrap::after {
+      content: '';
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 28px;
+      background: linear-gradient(rgba(28, 28, 32, 0), rgba(28, 28, 32, 0.95));
+      border-radius: 0 0 8px 8px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+    #shape-rows-wrap.has-more::after { opacity: 1; }
     .shape-row {
       display: flex;
       gap: 8px;
@@ -441,6 +707,13 @@
     }
     .shape-cell {
       width: 88px;
+      /* renderShapes' own column-count math (JS) assumes this 88px IS the
+         cell's full rendered width - without border-box, the border (2px)
+         and horizontal padding (8px) added 10px on top of that per cell,
+         so 5 cells fit by the JS's math but not in reality, overflowing
+         the row's real container by exactly that accumulated gap ("cards
+         getting cut off on the first line"). */
+      box-sizing: border-box;
       flex: none;
       border: 1px solid rgba(255, 255, 255, 0.14);
       border-radius: 10px;
@@ -545,7 +818,13 @@
       overflow-y: auto;
       padding: 20px;
       box-sizing: border-box;
+      /* Starts transparent so the canvas/sky is visible for a beat before
+         this scrim settles over it, rather than snapping straight in - JS
+         adds .show a frame after load. */
+      opacity: 0;
+      transition: opacity 0.6s;
     }
+    #welcome-overlay.show { opacity: 1; }
     #welcome-overlay.hidden { display: none; }
     #welcome-panel {
       margin: auto;
@@ -568,8 +847,28 @@
       font-size: 13.5px;
       line-height: 1.6;
       color: rgba(255, 255, 255, 0.62);
+      text-align: center;
     }
     #welcome-panel .sub:last-of-type { margin-bottom: 24px; }
+    /* Word-by-word fade-in (h1/.sub, split into these at runtime - see
+       splitIntoWordSpans) - inline-block so translateY actually has
+       something to move; a plain inline span ignores transform. */
+    #welcome-panel .word {
+      display: inline-block;
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 0.4s ease, transform 0.4s ease;
+    }
+    #welcome-panel .word.show { opacity: 1; transform: none; }
+    /* Button-by-button fade-in for the action column below the text -
+       each control (both buttons, the checkbox row, the hint line) is
+       its own step, revealed in sequence after the text finishes. */
+    #welcome-actions .fade-item {
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 0.4s ease, transform 0.4s ease;
+    }
+    #welcome-actions .fade-item.show { opacity: 1; transform: none; }
     #welcome-actions { display: flex; flex-direction: column; gap: 10px; }
     #welcome-actions button {
       font-family: 'Forum', serif;
@@ -597,7 +896,7 @@
       color: rgba(255, 255, 255, 0.4);
       margin: -4px 0 4px;
     }
-    /* Modifies "Get Started" only - Advanced Mode is the user choosing every
+    /* Modifies "Start Now" only - Advanced Mode is the user choosing every
        one of these by hand, so randomising them there would be contradictory.
        Placed directly beneath that button so its scope reads from position. */
     #welcome-random {
@@ -609,7 +908,7 @@
       font-size: 12px;
       color: rgba(255, 255, 255, 0.55);
       cursor: pointer;
-      text-align: left;
+      text-align: center;
     }
     #welcome-random input {
       width: 16px;
@@ -618,6 +917,367 @@
       accent-color: rgba(255, 255, 255, 0.85);
       cursor: pointer;
     }
+    /* "Start New" confirmation - small on purpose, unlike the welcome/setup
+       overlays it's answering one question, not starting a flow. Same dark
+       glass language as the rest of the app's overlays. */
+    #confirm-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 340; /* above #controls (100) and every other in-app overlay */
+      background: rgba(12, 12, 14, 0.78);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Forum', serif;
+      color: rgba(255, 255, 255, 0.9);
+      padding: 20px;
+      box-sizing: border-box;
+      opacity: 0;
+      transition: opacity 0.25s;
+    }
+    #confirm-overlay.show { opacity: 1; }
+    #confirm-overlay.hidden { display: none; }
+    #confirm-panel {
+      width: min(320px, 100%);
+      background: rgba(28, 28, 32, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 14px;
+      padding: 24px 22px 20px;
+      box-sizing: border-box;
+      text-align: center;
+    }
+    #confirm-message {
+      margin: 0 0 6px;
+      font-size: 17px;
+      letter-spacing: 0.3px;
+    }
+    #confirm-sub {
+      margin: 0 0 20px;
+      font-size: 12.5px;
+      color: rgba(255, 255, 255, 0.55);
+    }
+    #confirm-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    #confirm-actions button {
+      font-family: 'Forum', serif;
+      border-radius: 9px;
+      cursor: pointer;
+      letter-spacing: 0.5px;
+      padding: 12px 20px;
+      font-size: 14.5px;
+      transition: background-color 0.2s, border-color 0.2s;
+    }
+    #confirm-ok {
+      background: rgba(255, 255, 255, 0.92);
+      border: none;
+      color: rgba(18, 18, 20, 0.95);
+    }
+    #confirm-ok:hover { background: #fff; }
+    #confirm-cancel {
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      color: rgba(255, 255, 255, 0.78);
+    }
+    #confirm-cancel:hover { background: rgba(255, 255, 255, 0.1); }
+    /* Grows straight up out of the bar rather than a full-screen modal -
+       deliberately NO backdrop-filter/dark scrim over the canvas: these are
+       LIVE sliders, so the sculpture behind has to stay clearly visible and
+       unblurred while dragging one. z-index 150 sits above every OTHER
+       button in #bottom-bar (they're all z-index 100) so opening it
+       visually covers them instead of sitting beside them, but below
+       #lighting-btn itself (z-index 200 - see that rule) so the very button
+       that opened it stays reachable to close it again. A `position:fixed`
+       CHILD of #bottom-bar (see the HTML comment there for why it lives
+       there at all): #bottom-bar's own `transform` makes IT this panel's
+       fixed containing block instead of the viewport, so bottom:0 here
+       (not 14px) lands at the bar's own bottom edge, which already sits at
+       the intended viewport offset - and left:50%+translateX(-50%) still
+       centers correctly since the bar itself is already viewport-centered
+       the same way. animating max-height (not height/scale) is what makes
+       overflow:hidden clip its own content during the transition without
+       knowing the panel's exact pixel height up front. */
+    #lighting-panel {
+      position: fixed;
+      bottom: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 150;
+      width: min(320px, calc(100vw - 40px));
+      max-height: 0;
+      overflow: hidden;
+      opacity: 0;
+      background: rgba(28, 28, 32, 0.95);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 18px;
+      box-sizing: border-box;
+      font-family: 'Forum', serif;
+      color: rgba(255, 255, 255, 0.9);
+      transition: max-height 0.32s ease, opacity 0.28s ease;
+      pointer-events: none;
+    }
+    #lighting-panel.show {
+      max-height: 320px;
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #lighting-panel-inner {
+      /* Extra right clearance: #lighting-btn (see the JS that right-aligns
+         the panel to it) sits right at this panel's own top-right corner
+         while open, floating above everything in it (z-index 200) - without
+         this, its circle lands directly on top of the Reset button's label
+         or a slider's thumb, both still visually there underneath it. */
+      padding: 18px 56px 16px 20px;
+    }
+    #lighting-panel h2 {
+      margin: 0 0 14px;
+      font-size: 17px;
+      font-weight: normal;
+      letter-spacing: 0.5px;
+      text-align: center;
+    }
+    .light-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 12px;
+    }
+    .light-row label {
+      width: 82px;
+      flex: none;
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.75);
+    }
+    .light-row input[type="range"] {
+      flex: 1;
+      accent-color: rgba(255, 255, 255, 0.85);
+    }
+    #lighting-reset {
+      width: 100%;
+      font-family: 'Forum', serif;
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      color: rgba(255, 255, 255, 0.78);
+      border-radius: 9px;
+      cursor: pointer;
+      letter-spacing: 0.5px;
+      padding: 10px 14px;
+      font-size: 13.5px;
+      margin-top: 4px;
+      transition: background-color 0.2s, border-color 0.2s;
+    }
+    #lighting-reset:hover { background: rgba(255, 255, 255, 0.1); }
+    /* Same expand-from-button mechanics as #lighting-panel (position:fixed
+       CHILD of #bottom-bar, max-height animation, no scrim - see that
+       panel's own long comment for the full reasoning, identical here).
+       #material-btn sits toward the LEFT of the bar rather than the right,
+       so the dynamic clearance below pads the LEFT side of the content
+       instead of the right. */
+    #materials-panel {
+      position: fixed;
+      bottom: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 150;
+      width: min(380px, calc(100vw - 32px));
+      max-height: 0;
+      overflow: hidden;
+      opacity: 0;
+      background: rgba(28, 28, 32, 0.95);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 18px;
+      box-sizing: border-box;
+      font-family: 'Forum', serif;
+      color: rgba(255, 255, 255, 0.9);
+      transition: max-height 0.32s ease, opacity 0.28s ease;
+      pointer-events: none;
+    }
+    #materials-panel.show {
+      max-height: 460px;
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #materials-panel-inner {
+      padding: 18px 20px;
+      /* #material-btn floats above wherever it happens to sit along the
+         panel's own bottom edge - its x position varies too much (as few
+         as 3-4 neighbours up to a full bar - see the button's own HTML
+         comment) to reliably clear with left/right padding alone. Bottom
+         padding instead: since the button is ALWAYS anchored at the same
+         bottom:0 as the panel itself, reserving room below the last row
+         clears it regardless of which column or how far across it lands. */
+      padding-bottom: 64px;
+    }
+    #materials-panel h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+      font-weight: normal;
+      letter-spacing: 0.5px;
+      text-align: center;
+    }
+    #materials-columns {
+      display: flex;
+      gap: 18px;
+    }
+    .mat-col {
+      flex: 1;
+      min-width: 0;
+    }
+    .mat-col h3 {
+      margin: 0 0 10px;
+      font-size: 12px;
+      font-weight: normal;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.5);
+      text-align: center;
+    }
+    .mat-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    /* Side-by-side swatch+label rows - not the wizard's own stacked
+       .mat-cell/.mat-chip (still used there, unchanged) - this panel is a
+       quick, glanceable picker, not a step in a guided flow. */
+    .mat-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 7px 8px;
+      border-radius: 8px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: border-color 0.15s, background-color 0.15s;
+    }
+    .mat-item:hover { background: rgba(255, 255, 255, 0.08); }
+    .mat-item.selected {
+      border-color: rgba(255, 255, 255, 0.7);
+      background: rgba(255, 255, 255, 0.1);
+    }
+    .mat-item .swatch {
+      width: 42px;
+      height: 26px;
+      border-radius: 5px;
+      flex: none;
+      border: 1px solid rgba(0, 0, 0, 0.4);
+      overflow: hidden; /* clips the palette variant's per-colour segments to the rounded corners */
+    }
+    .mat-item .lbl {
+      font-size: 13px;
+      letter-spacing: 0.2px;
+      color: rgba(255, 255, 255, 0.75);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex: 1;
+    }
+    .mat-item.selected .lbl { color: rgba(255, 255, 255, 0.95); }
+    /* Palette swatches are N distinct colour blocks, not one flat fill -
+       same .swatch box, filled with equal-width <span> segments instead. */
+    .swatch.palette-swatch { display: flex; }
+    .swatch.palette-swatch span { flex: 1; }
+    /* Same expand-from-button mechanics as #materials-panel/#lighting-panel
+       (see #lighting-panel's own comment for the full reasoning) -
+       #palette-btn is 2D-only and, like #material-btn, sits early enough in
+       the bar that its distance from a centred panel's edge varies, so the
+       same bottom-padding reserve (not left/right) is what actually clears
+       it reliably. */
+    #palette-panel {
+      position: fixed;
+      bottom: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 150;
+      width: min(320px, calc(100vw - 32px));
+      max-height: 0;
+      overflow: hidden;
+      opacity: 0;
+      background: rgba(28, 28, 32, 0.95);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 18px;
+      box-sizing: border-box;
+      font-family: 'Forum', serif;
+      color: rgba(255, 255, 255, 0.9);
+      transition: max-height 0.32s ease, opacity 0.28s ease;
+      pointer-events: none;
+    }
+    #palette-panel.show {
+      /* Taller than materials/lighting's own fixed caps - stacked rows (see
+         the .mat-item override below: label above its swatch, not beside
+         it) roughly double each row's height, and there are up to 7 of
+         them here. min() with a vh fallback so a short viewport still
+         clamps sanely instead of this fixed height overflowing it. */
+      max-height: min(760px, 88vh);
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #palette-panel-inner {
+      padding: 18px 20px;
+      /* Bigger reserve than #materials-panel-inner's 64px: the palette FAB
+         also has a hover/tap name-label floating just above its icon (see
+         #btn-preview), and this panel's taller stacked rows push the
+         shuffle button low enough to reach that label's zone, not just the
+         icon itself - 64px cleared the icon but not the label above it. */
+      padding-bottom: 108px;
+      /* On a short viewport (e.g. an SE-sized phone) 7 stacked rows plus
+         that reserve genuinely don't fit under #palette-panel's own vh
+         clamp - the FAB anchors #palette-panel's bottom edge at a fixed
+         pixel offset from the viewport bottom regardless of how tall the
+         panel is allowed to grow, so a tighter clamp there can't buy back
+         clearance the way it does when there's room to spare. Capping
+         and scrolling HERE (not relying solely on the padding reserve)
+         keeps the last row reachable instead of it overlapping the FAB's
+         label. On any normal phone this cap exceeds the natural content
+         height, so it never actually engages.
+         Keep this identical to #palette-panel.show's max-height. */
+      max-height: min(760px, 88vh);
+      overflow-y: auto;
+      box-sizing: border-box;
+    }
+    #palette-panel h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+      font-weight: normal;
+      letter-spacing: 0.5px;
+      text-align: center;
+    }
+    /* Stacked, not side-by-side like materials' own .mat-item (a DIFFERENT
+       panel/container, untouched) - centred label on top, its colour
+       swatch as a full-width strip underneath, so the swatch sits visually
+       "between" one description line and the next rather than beside it. */
+    #palette-panel .mat-item {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 4px;
+      padding: 7px 10px;
+    }
+    #palette-panel .mat-item .lbl {
+      text-align: center;
+      white-space: normal;
+    }
+    #palette-panel .mat-item .swatch {
+      width: 100%;
+      height: 20px;
+    }
+    #palettep-shuffle {
+      width: 100%;
+      font-family: 'Forum', serif;
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      color: rgba(255, 255, 255, 0.78);
+      border-radius: 9px;
+      cursor: pointer;
+      letter-spacing: 0.5px;
+      padding: 10px 14px;
+      font-size: 13.5px;
+      margin-top: 10px;
+      transition: background-color 0.2s, border-color 0.2s;
+    }
+    #palettep-shuffle:hover { background: rgba(255, 255, 255, 0.1); }
     #setup-overlay {
       position: fixed;
       inset: 0;
@@ -646,7 +1306,7 @@
       background: rgba(28, 28, 32, 0.9);
       border: 1px solid rgba(255, 255, 255, 0.18);
       border-radius: 14px;
-      padding: 22px 24px 20px;
+      padding: clamp(14px, 3vh, 22px) 24px clamp(12px, 2.5vh, 20px);
       box-sizing: border-box;
     }
     #setup-panel h2 {
@@ -656,12 +1316,12 @@
       letter-spacing: 0.5px;
     }
     #setup-panel .sub {
-      margin: 0 0 18px 0;
+      margin: 0 0 clamp(8px, 2vh, 18px) 0;
       font-size: 12.5px;
       color: rgba(255, 255, 255, 0.55);
     }
     #setup-panel h3 {
-      margin: 16px 0 8px 0;
+      margin: clamp(8px, 2vh, 16px) 0 clamp(4px, 1vh, 8px) 0;
       font-size: 13px;
       font-weight: normal;
       letter-spacing: 1.2px;
@@ -728,18 +1388,19 @@
       background: rgba(255, 255, 255, 0.1);
     }
     .mat-chip {
-      height: 42px;
+      /* Base and struts both stack in the materials step - scaling with
+         viewport height, not just width, is what keeps that step fitting
+         on a short/landscape screen without scrolling (see #setup-
+         overlay's align-items note above). Same full-width treatment for
+         both rows now, deliberately - base and struts are equally
+         important choices, and a wide slab next to a 15px rod read as one
+         mattering more than the other. */
+      height: clamp(26px, 6vh, 42px);
       border-radius: 7px;
       /* a hairline dark edge so a pale slab still reads as an object
          against the panel rather than bleeding into it */
       border: 1px solid rgba(0, 0, 0, 0.4);
-      margin-bottom: 7px;
-    }
-    /* struts are rods, not slabs - show them as one */
-    .mat-row.struts .mat-chip {
-      width: 15px;
-      margin: 0 auto 7px;
-      border-radius: 8px;
+      margin-bottom: clamp(4px, 1vh, 7px);
     }
     .mat-cell .lbl {
       font-size: 11.5px;
@@ -748,95 +1409,325 @@
       white-space: nowrap;
     }
     .mat-cell.selected .lbl { color: rgba(255, 255, 255, 0.95); }
+    /* Materials step only - compact and centred, no description paragraph
+       (the base/strut chips are self-explanatory), closer to the lighting
+       panel's tight rows than the wordier palette/shape steps elsewhere in
+       this same wizard. */
+    .mat-step h2 { text-align: center; }
+    .mat-step .mat-section + .mat-section { margin-top: clamp(10px, 2.2vh, 18px); }
+    .mat-step h3 {
+      justify-content: center;
+      text-align: center;
+    }
 @media (max-width: 520px) {
       #setup-panel { padding: 16px; }
       #setup-panel h2 { font-size: 19px; }
       #welcome-panel { padding: 24px 18px 20px; }
       #welcome-panel h1 { font-size: 23px; }
-      /* Four strut options across a phone leaves ~56px of label room, and
-         "Clear resin" needs ~63px - with nowrap labels they overlapped each
-         other. Two-up keeps every label on one line. The 3 base options and
-         2 lighting options still fit across. */
-      .mat-row.struts { flex-wrap: wrap; }
-      .mat-row.struts .mat-cell { flex: 1 1 calc(50% - 4px); }
+      /* Four options across a phone leaves ~56px of label room, and "Clear
+         acrylic" needs ~63px - with nowrap labels they overlapped each
+         other. Two-up keeps every label on one line. Base and struts both
+         have 4 options now, so both rows wrap the same way. */
+      .mat-row { flex-wrap: wrap; }
+      .mat-row .mat-cell { flex: 1 1 calc(50% - 4px); }
       /* The toast's single line is ~330px; 90vw on a small phone is less
          than that, and nowrap made it hang off both edges rather than clip. */
-      #palette-toast { white-space: normal; text-align: center; }
+      .hint-toast { white-space: normal; text-align: center; }
+      /* #palette-strip's own row (label + name + swatches + Prev/Next) is
+         fine on desktop, but a long palette name (e.g. two combined
+         palette names joined by "&") has only a narrow sliver of a phone
+         screen left for #strip-name once the 5 fixed swatches and both
+         buttons take their share - it wraps to 2-3 lines while Prev/Next
+         stay centred against that new height, reading as a cramped,
+         lopsided row. Pushed onto its own full-width line below instead
+         (order, not DOM position, so nothing else has to change) - the
+         label/swatches/buttons stay one compact row above it. */
+      #palette-strip { flex-wrap: wrap; row-gap: 6px; }
+      #strip-name { order: 4; flex: 1 1 100%; }
+    }
+    /* Short/landscape phones: the clamp()s throughout the materials step
+       already shrink toward their floors as height drops, but on the
+       shortest real devices (iPhone SE landscape et al) even those floors
+       add up to more than the viewport - this trims the same properties
+       further so the step fits without #setup-overlay's scroll fallback
+       ever having to kick in. */
+    @media (max-height: 420px) {
+      #setup-overlay { padding: 8px; }
+      #setup-panel { padding: 10px 20px; }
+      #setup-panel h2 { font-size: 16px; }
+      #setup-panel .sub { margin-bottom: 4px; font-size: 11px; }
+      #setup-panel h3 { margin: 4px 0 2px 0; font-size: 11px; }
+      #setup-steps { margin-bottom: 4px; }
+      #setup-nav { margin-top: 4px; }
+      .mat-cell { padding: 3px 5px 4px; }
+      .mat-chip { height: 20px; margin-bottom: 2px; }
+      .mat-cell .lbl { font-size: 10px; }
     }
     /* Touch devices: the 36px side buttons were under the 44px minimum
-       comfortable tap target, and they sit right beside a button that does
-       something quite different (leaving 3D). Offsets shift to keep the same
-       8px gap either side of the 44px-wide mode toggle. */
+       comfortable tap target. #bottom-bar's flexbox centring means bumping
+       their size is all that's needed - no offsets to keep in sync. */
     @media (pointer: coarse) {
-      #palette-btn, #material-btn, #refresh-btn, #ar-btn, #scramble-btn { width: 46px; height: 46px; bottom: 16px; }
-      #scramble-btn { transform: translateX(-132px); }
-      #palette-toast::after { left: calc(50% + 55px); }
-      #palette-btn, #ar-btn { transform: translateX(32px); }
-      #material-btn, #refresh-btn { transform: translateX(-78px); }
+      #help-btn, #export-btn, #fullscreen-btn, #palette-btn, #material-btn, #refresh-btn, #ar-btn, #scramble-btn, #undo-btn, #redo-btn, #lock-btn, #spotlight-btn, #lighting-btn, #structure-toggle-btn { width: 46px; height: 46px; }
+      /* 2D now puts up to 6 buttons in the bar at once (palette, undo,
+         redo, lock, mode-toggle, refresh) - the 12px desktop gap/padding
+         made it run edge-to-edge and read as buttons crowding each other
+         on a phone-width screen. Tighter spacing, same button size. */
+      #bottom-bar { gap: 6px; padding: 6px 7px; }
     }
   </style>
 </head>
 <body>
   <div id="controls">
-    <button id="menu-btn" class="desktop-only" data-tip="Menu">
-      <i class="fas fa-bars"></i>
+    <!-- One dock, laid out left-to-right: scramble (3D only), the
+         refresh/materials slot, the mode toggle, the palette/AR slot,
+         export (desktop only), and fullscreen. Every function that used to
+         live in the hamburger menu now has its own button here - Change
+         Palette, Materials and Reset already had one; export is the one
+         exception that had no bar equivalent, so it joined the bar instead
+         of disappearing with the menu. ("Start over", which reopened the
+         setup wizard, was dropped rather than added - too close to what
+         refresh already does to earn its own button.) -->
+    <div id="bottom-bar">
+      <button id="mode-toggle-btn" disabled data-tip="3D View">3D</button>
+      <!-- A real pair of 7-pip dice (not FontAwesome's single-colour
+           fa-dice glyph) so they can visibly tumble around inside the
+           button and land on their own independent random faces each
+           roll - see .dice-pair's CSS above and window rollDice() (JS). -->
+      <button id="scramble-btn" data-tip="Scramble the angles">
+        <div class="dice-pair" id="dice-pair">
+          <div class="die" id="die-1">
+            <span class="pip" data-pos="tl"></span>
+            <span class="pip" data-pos="tr"></span>
+            <span class="pip" data-pos="ml"></span>
+            <span class="pip" data-pos="c"></span>
+            <span class="pip" data-pos="mr"></span>
+            <span class="pip" data-pos="bl"></span>
+            <span class="pip" data-pos="br"></span>
+          </div>
+          <div class="die" id="die-2">
+            <span class="pip" data-pos="tl"></span>
+            <span class="pip" data-pos="tr"></span>
+            <span class="pip" data-pos="ml"></span>
+            <span class="pip" data-pos="c"></span>
+            <span class="pip" data-pos="mr"></span>
+            <span class="pip" data-pos="bl"></span>
+            <span class="pip" data-pos="br"></span>
+          </div>
+        </div>
+      </button>
+      <!-- The real fa-swatchbook glyph (see .swatchbook-icon above for
+           where this path data came from), its 3 fanned cards split into
+           separate paths so each can carry its own material colour -
+           silver/gold/wood - instead of sharing the icon's one flat
+           colour. The 3 tiny "windows" on the left card are a fill-rule
+           hole in the original single-colour icon, empty/see-through
+           there - darkened here instead so they still read against the
+           now-silver card. -->
+      <button id="material-btn" data-tip="Materials">
+        <svg class="swatchbook-icon" viewBox="0 0 512 512" aria-hidden="true">
+          <path class="mat-card" d="M0 32C0 14.3 14.3 0 32 0H160c17.7 0 32 14.3 32 32V416c0 53-43 96-96 96s-96-43-96-96V32z"/>
+          <path class="mat-diamond" d="M223.6 425.9c.3-3.3 .4-6.6 .4-9.9V154l75.4-75.4c12.5-12.5 32.8-12.5 45.3 0l90.5 90.5c12.5 12.5 12.5 32.8 0 45.3L223.6 425.9z"/>
+          <path class="mat-rect" d="M182.8 512l192-192H480c17.7 0 32 14.3 32 32V480c0 17.7-14.3 32-32 32H182.8z"/>
+          <rect class="mat-window" x="64" y="64" width="64" height="64"/>
+          <rect class="mat-window" x="64" y="192" width="64" height="64"/>
+          <circle class="mat-window" cx="96" cy="416" r="24"/>
+        </svg>
+      </button>
+      <!-- Same expand-from-button mechanics as #lighting-panel (see the
+           comment on that one further down for the full reasoning) - a
+           CHILD of #bottom-bar so #material-btn's z-index can out-rank it
+           within the same stacking context and stay clickable/closeable
+           once open. Base and struts side by side (not stacked rows) so
+           the whole thing fits in one short panel with no scrolling. -->
+      <div id="materials-panel">
+        <div id="materials-panel-inner">
+          <h2>Materials</h2>
+          <div id="materials-columns">
+            <div class="mat-col">
+              <h3>Base</h3>
+              <div class="mat-list" id="matp-base"></div>
+            </div>
+            <div class="mat-col">
+              <h3>Struts</h3>
+              <div class="mat-list" id="matp-strut"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <button id="palette-btn" data-tip="Palette">
+        <i class="fas fa-palette"></i>
+      </button>
+      <!-- Same expand-from-button mechanics as #materials-panel/
+           #lighting-panel (see #lighting-panel's own comment for the full
+           reasoning) - a CHILD of #bottom-bar so #palette-btn's z-index can
+           out-rank it within the same stacking context. -->
+      <div id="palette-panel">
+        <div id="palette-panel-inner">
+          <h2>Palette</h2>
+          <div class="mat-list" id="palettep-list"></div>
+          <button id="palettep-shuffle" type="button">Shuffle palettes</button>
+        </div>
+      </div>
+      <button id="undo-btn" data-tip="Undo" disabled>
+        <i class="fas fa-rotate-left"></i>
+      </button>
+      <button id="redo-btn" data-tip="Redo" disabled>
+        <i class="fas fa-rotate-right"></i>
+      </button>
+      <button id="lock-btn" data-tip="Lock composition">
+        <i class="fas fa-lock-open"></i>
+      </button>
+      <button id="refresh-btn" data-tip="Start New">
+        <i class="fas fa-arrows-rotate"></i>
+      </button>
+      <button id="ar-btn" data-tip="View in AR">
+        <i class="fas fa-cube"></i>
+      </button>
+      <!-- Kept as far right as possible (past refresh/AR, right before the
+           hidden export slot) - #lighting-panel right-aligns itself to
+           #lighting-btn's own position (see showLightingPanel), so the
+           closer that button sits to the bar's own right edge, the more
+           room the panel has to grow leftward without going off a narrow
+           phone screen's left edge. -->
+      <!-- "turn off the struts and base so they can just look at the
+           composition if they desire" - a plain visibility toggle, 3D-only
+           like #spotlight-btn beside it. No panel, just flips
+           window.setStructureVisible on click. -->
+      <button id="structure-toggle-btn" data-tip="Hide base &amp; struts">
+        <i class="fas fa-eye"></i>
+      </button>
+      <button id="spotlight-btn" data-tip="Spotlight">
+        <i class="fas fa-lightbulb"></i>
+      </button>
+      <button id="lighting-btn" data-tip="Lighting">
+        <i class="fas fa-sliders"></i>
+      </button>
+      <!-- Export is being reworked (format TBD) and is desktop-only for
+           now - exporting a file isn't a mobile-friendly action anyway. -->
+      <button id="export-btn" class="desktop-only" disabled data-tip="Export 3D model">
+        <i class="fas fa-download"></i>
+      </button>
+
+      <!-- Spotlight-only tuning - only reachable via #lighting-btn, which
+           only appears once spotlight mode is on (see syncSpotlightButton).
+           Normal mode's rig is never touched by this panel. Opens/closes
+           off the same button click - no separate close button, and
+           deliberately no full-screen scrim (see the CSS note on
+           #lighting-panel) so the sculpture stays visible and unblurred
+           while dragging a slider. A CHILD of #bottom-bar (not a page-level
+           sibling) on purpose: #bottom-bar's own z-index makes it a
+           stacking context, and #lighting-btn needs to out-rank this panel
+           WITHIN that same context to stay clickable once the panel is
+           open and physically overlapping it - a child's z-index can't
+           escape its parent's stacking context to beat a sibling of that
+           parent, only a true sibling within it. -->
+      <div id="lighting-panel">
+        <div id="lighting-panel-inner">
+          <h2>Lighting</h2>
+          <div class="light-row">
+            <label for="light-skydim">Background</label>
+            <input type="range" id="light-skydim" min="0.15" max="1.3" step="0.01">
+          </div>
+          <div class="light-row">
+            <label for="light-count">Lights</label>
+            <input type="range" id="light-count" min="1" max="4" step="1">
+          </div>
+          <div class="light-row">
+            <label for="light-intensity">Intensity</label>
+            <input type="range" id="light-intensity" min="0.3" max="4" step="0.01">
+          </div>
+          <div class="light-row">
+            <label for="light-warmth">Warmth</label>
+            <input type="range" id="light-warmth" min="-1" max="1" step="0.01">
+          </div>
+          <button id="lighting-reset" type="button">Reset</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Off to the side rather than in the dock itself - it's a "show me
+         again" for messages that already played once on their own, not a
+         function of the composition like everything in #bottom-bar. -->
+    <button id="help-btn" data-tip="Help">
+      <i class="fas fa-question"></i>
     </button>
+
+    <!-- Also off on its own, upper-right corner - not part of the bar's
+         left-to-right composition controls. -->
     <button id="fullscreen-btn" data-tip="Fullscreen">
       <i id="fullscreen-icon" class="fas fa-expand"></i>
-    </button>
-    <button id="mode-toggle-btn" disabled data-tip="Explore in 3D">3D</button>
-    <button id="palette-btn" data-tip="Change palette">
-      <i class="fas fa-palette"></i>
-    </button>
-    <button id="material-btn" data-tip="Materials &amp; light">
-      <i class="fas fa-swatchbook"></i>
-    </button>
-    <button id="refresh-btn" data-tip="New composition">
-      <i class="fas fa-arrows-rotate"></i>
-    </button>
-    <button id="ar-btn" data-tip="Place it in your room">
-      <i class="fas fa-cube"></i>
-    </button>
-    <button id="scramble-btn" data-tip="Scramble the angles">
-      <i class="fas fa-dice"></i>
     </button>
   </div>
 
   <div id="ar-status"></div>
+  <div id="element-count"></div>
 
-  <div id="palette-toast">
-    <i class="fas fa-palette"></i>
-    <span>Change the palette any time</span>
+  <div id="go3d-toast" class="hint-toast">
+    <span>3D View</span>
   </div>
 
-  <div id="menu-dropdown" class="desktop-only">
-    <button id="menu-export-obj" disabled>Export 3D Model (.OBJ)</button>
-    <hr>
-    <button id="menu-setup">New Composition…</button>
-    <button id="menu-palette">Change Palette…</button>
-    <button id="menu-materials">Materials…</button>
-    <button id="menu-reset">Reset Composition</button>
+  <!-- "only show the message when the button is clicked" - #mode-toggle-btn
+       is disabled with nothing drawn yet, so its own click never fires
+       (see the pointerdown listener below, which works around that). A
+       dedicated toast rather than reusing #btn-preview: that shared line is
+       tuned for short single-word labels (white-space: nowrap) - this
+       message is long enough to need real wrapping and breathing room
+       instead of stretching into one cramped edge-to-edge line. -->
+  <div id="mode-toggle-empty-toast" class="hint-toast wrap">
+    <span>Draw at least 1 element to enter 3D mode</span>
+  </div>
+
+  <div id="palette-toast" class="hint-toast">
+    <span>Palette</span>
+  </div>
+
+  <!-- One shared line of text for every button's label, sliding to sit
+       above whichever button is current, instead of each button growing its
+       own - see window.showBtnPreview/hideBtnPreview. -->
+  <div id="btn-preview" class="hint-toast">
+    <span id="btn-preview-text"></span>
+  </div>
+
+  <!-- #help-btn sits off in its own corner, well away from #bottom-bar - so
+       it gets its own dedicated line (always "Help", positioned right above
+       it) instead of the shared centred one. See showBtnPreview/
+       hideBtnPreview's helpBtn branch. -->
+  <div id="btn-preview-help" class="hint-toast">
+    <span>Help</span>
   </div>
 
   <!-- Front door: quick start vs. fine tuning. Shown before the wizard. -->
   <div id="welcome-overlay">
     <div id="welcome-panel">
       <h1>Welcome to GeneX 3D</h1>
-      <!-- The user's own copy - use it as written. A call to action and the
-           promise of a live, unrepeatable result; the internals (what
-           triggers an element, what it grows from) stay unsaid. -->
-      <p class="sub">Draw on the canvas and collaborate on generative and unique compositions, as they emerge. Every action taken shapes the work as you go, and no two pieces are ever quite the same.</p>
-      <p class="sub">Once it's complete, engage 3D and explore your creation as if it were standing right in front of you.</p>
+      <p class="sub">Draw in 2D, explore in 3D.</p>
       <div id="welcome-actions">
-        <button id="welcome-start" type="button">Get Started</button>
+        <button id="welcome-start" type="button" class="fade-item">Start Now</button>
         <!-- Checkbox sits directly under the button it modifies, so its
-             scope is clear from position instead of a wordier label. -->
-        <label id="welcome-random">
-          <input type="checkbox" id="welcome-random-cb">
-          <span>Surprise me — randomise the shapes, materials and lighting</span>
+             scope is clear from position instead of a wordier label.
+             Checked by default - "surprise me" is the intended default for
+             Start Now, not an opt-in extra. -->
+        <label id="welcome-random" class="fade-item">
+          <input type="checkbox" id="welcome-random-cb" checked>
+          <span>Surprise me — randomise the shapes and materials</span>
         </label>
-        <button id="welcome-advanced" type="button">Advanced Mode</button>
-        <p class="hint">Choose the palette, shapes and materials yourself</p>
+        <button id="welcome-advanced" type="button" class="fade-item">Advanced Mode</button>
+        <p class="hint fade-item">Choose the palette, shapes and materials yourself</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- "Start New" is destructive (wipes the current composition and its
+       undo history) - this confirms before resetComposition() actually
+       runs. Only ever shown once #controls itself is visible, so it never
+       needs to out-rank #welcome-overlay/#setup-overlay's z-index. -->
+  <div id="confirm-overlay" class="hidden">
+    <div id="confirm-panel">
+      <p id="confirm-message">Start a new composition?</p>
+      <p id="confirm-sub">This can't be undone.</p>
+      <div id="confirm-actions">
+        <button id="confirm-cancel" type="button">Cancel</button>
+        <button id="confirm-ok" type="button">Start New</button>
       </div>
     </div>
   </div>
@@ -871,18 +1762,21 @@
           <button id="shape-all" type="button">Feature all</button>
           <button id="shape-none" type="button">No preference</button>
         </div>
-        <div id="shape-rows"></div>
+        <div id="shape-rows-wrap">
+          <div id="shape-rows"></div>
+        </div>
       </div>
 
-      <div class="setup-step" data-step="2" hidden>
-        <h2>Materials &amp; light</h2>
-        <p class="sub">The pedestal, its support struts, and how the piece is lit — the parts of the sculpture your palette doesn’t decide. All of it appears when you enter 3D.</p>
-        <h3>Base</h3>
-        <div class="mat-row" id="mat-base"></div>
-        <h3>Struts</h3>
-        <div class="mat-row struts" id="mat-strut"></div>
-        <h3>Lighting</h3>
-        <div class="mat-row" id="mat-light"></div>
+      <div class="setup-step mat-step" data-step="2" hidden>
+        <h2>Materials</h2>
+        <div class="mat-section">
+          <h3>Base</h3>
+          <div class="mat-row" id="mat-base"></div>
+        </div>
+        <div class="mat-section">
+          <h3>Struts</h3>
+          <div class="mat-row struts" id="mat-strut"></div>
+        </div>
       </div>
 
       <div id="setup-nav">
@@ -893,13 +1787,25 @@
     </div>
   </div>
 
-  <div id="instructions">
-    <h4>🎮 3D Controls</h4>
-    <p class="desktop-ctrl"><strong>Drag</strong> - Orbit around the sculpture</p>
-    <p class="desktop-ctrl"><strong>Scroll</strong> - Zoom in/out</p>
-    <p class="desktop-ctrl"><strong>ESC</strong> - Return to 2D</p>
-    <p class="touch-ctrl"><strong>Swipe</strong> - Orbit around the sculpture</p>
-    <p class="touch-ctrl"><strong>Pinch</strong> - Zoom in/out</p>
+  <!-- Wordless first-3D-entry demo: two touch points, driven frame-by-frame
+       by playGestureDemo (babylon3D.js) in step with the real camera - no
+       panel, they float directly over the scene. fa-hand-pointer rather
+       than a fingerprint - a fingerprint has no real "up", so rotating it
+       to face its direction of travel (playGestureDemo again) wouldn't
+       actually read as pointing anywhere. -->
+  <div id="gesture-hint">
+    <i class="fas fa-hand-pointer gesture-finger" id="gesture-finger-1"></i>
+    <i class="fas fa-hand-pointer gesture-finger" id="gesture-finger-2"></i>
+  </div>
+
+  <!-- Wordless "how to draw" demo: a fingertip drags a curved stroke across
+       the 2D canvas, the same motion that actually starts any shape here -
+       shown once when the canvas first appears, replayed by #help-btn.
+       window.playDrawHintDemo (below) drives it; no real shape is created,
+       it's illustration only. -->
+  <div id="draw-hint">
+    <svg id="draw-hint-svg"><path id="draw-hint-path"></path></svg>
+    <i class="fas fa-hand-pointer gesture-finger" id="draw-hint-finger"></i>
   </div>
 
   <!-- Babylon.js -->
@@ -927,11 +1833,230 @@
     // Show only the controls relevant to this device
     document.addEventListener('DOMContentLoaded', () => {
       const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-      document.querySelectorAll(isTouch ? '.desktop-ctrl' : '.touch-ctrl')
-        .forEach(el => el.style.display = 'none');
       if (isTouch) {
         document.querySelectorAll('.desktop-only').forEach(el => el.style.display = 'none');
       }
+    });
+  </script>
+
+  <script>
+    // One shared line of text (#btn-preview) for every button's label,
+    // rather than each button growing its own. Both the text and the
+    // line's own horizontal position (window.__centerOverButton) track
+    // whichever button is current, crossfading together so a run of
+    // several buttons in a row reads as one steady line updating, not a
+    // flicker of separate popups. Hover, long-press, the flash sweep and
+    // #help-btn's replay all go through showBtnPreview/hideBtnPreview below.
+    document.addEventListener('DOMContentLoaded', () => {
+      const isCoarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+      const preview = document.getElementById('btn-preview');
+      const previewText = document.getElementById('btn-preview-text');
+      const helpBtn = document.getElementById('help-btn');
+      const helpPreview = document.getElementById('btn-preview-help');
+      const CROSSFADE_MS = 130; // matches the CSS transition on .fade below
+
+      let currentBtn = null;
+      let bubbleShown = false;
+      let hideTimer = null;
+      let crossfadeGen = 0; // invalidates a crossfade's second half if superseded before it lands
+
+      // Slides a piece of plain text to sit horizontally centred directly
+      // above whatever button it's currently about (clamped so it can't run
+      // off either edge) - no bubble, no leader, the text's own position is
+      // what says which button it's for. Shared by #btn-preview,
+      // #btn-preview-help, #palette-toast and #go3d-toast.
+      window.__centerOverButton = function (el, btn) {
+        if (!el || !btn) return;
+        const btnRect = btn.getBoundingClientRect();
+        const targetCenterX = btnRect.left + btnRect.width / 2;
+        const half = el.getBoundingClientRect().width / 2;
+        const margin = 10;
+        const clampedX = Math.min(Math.max(targetCenterX, half + margin), window.innerWidth - half - margin);
+        el.style.left = clampedX + 'px';
+      };
+      function positionHelpPreview() {
+        window.__centerOverButton(helpPreview, helpBtn);
+      }
+
+      // One ripple on whatever button a message is currently highlighting -
+      // see the CSS above (@keyframes btn-highlight-pulse) for why this is
+      // an inline style rather than a class.
+      window.__pulseButtonOnce = function (btn) {
+        if (!btn) return;
+        btn.style.animation = 'none';
+        void btn.offsetWidth; // force reflow so a re-highlight restarts cleanly even mid-pulse
+        btn.style.animation = 'btn-highlight-pulse 0.8s ease-out 1';
+        const clear = () => { btn.style.animation = ''; btn.removeEventListener('animationend', clear); };
+        btn.addEventListener('animationend', clear);
+      };
+
+      // holdMs: if given, auto-hides after that long (used by the flash
+      // sweep/replay walkthrough). Omitted for hover/long-press, which stay
+      // up for as long as the trigger itself lasts.
+      window.showBtnPreview = function (btn, holdMs) {
+        if (!btn) return;
+        const tip = btn.getAttribute('data-tip');
+        if (!tip) return;
+        clearTimeout(hideTimer);
+
+        if (btn === helpBtn) {
+          // Dedicated line, not the shared one - see positionHelpPreview.
+          if (bubbleShown) {
+            preview.classList.remove('show');
+            bubbleShown = false;
+          }
+          currentBtn = btn;
+          if (helpPreview) {
+            positionHelpPreview();
+            helpPreview.classList.add('show');
+          }
+          window.__pulseButtonOnce(btn);
+          if (holdMs) hideTimer = setTimeout(() => window.hideBtnPreview(btn), holdMs);
+          return;
+        }
+        if (currentBtn === helpBtn && helpPreview) helpPreview.classList.remove('show');
+
+        if (!preview || !previewText) return;
+        const isSameBtn = currentBtn === btn;
+        currentBtn = btn;
+        const myGen = ++crossfadeGen;
+
+        if (!bubbleShown) {
+          // First appearance of a run: fade the whole line in fresh -
+          // nothing was showing a moment ago for the text to crossfade FROM.
+          bubbleShown = true;
+          previewText.textContent = tip;
+          previewText.classList.remove('fade');
+          window.__centerOverButton(preview, btn);
+          preview.classList.add('show');
+          window.__pulseButtonOnce(btn);
+        } else if (!isSameBtn) {
+          // Text crossfades to the new button, and the line slides to sit
+          // above it - both happen together at the crossfade's midpoint,
+          // once the old text has faded out.
+          previewText.classList.add('fade');
+          setTimeout(() => {
+            if (myGen !== crossfadeGen) return; // superseded mid-fade
+            previewText.textContent = tip;
+            window.__centerOverButton(preview, btn);
+            previewText.classList.remove('fade');
+            window.__pulseButtonOnce(btn);
+          }, CROSSFADE_MS);
+        } else if (previewText.textContent !== tip) {
+          // Same button, but its own data-tip changed since the text last
+          // updated (e.g. #scramble-btn's label flips on click, while the
+          // pointer never left the button to re-trigger mouseenter) - swap
+          // it immediately rather than leaving it stale until the next
+          // hover-off/hover-on cycle.
+          previewText.textContent = tip;
+        }
+        // else: re-entering the same button mid-hover with an unchanged
+        // label - nothing to do.
+
+        if (holdMs) hideTimer = setTimeout(() => window.hideBtnPreview(btn), holdMs);
+      };
+      window.hideBtnPreview = function (btn) {
+        // A hover leaving one button shouldn't hide a preview a DIFFERENT
+        // trigger (a tap landing right after) just put up for another one.
+        if (btn && btn !== currentBtn) return;
+        clearTimeout(hideTimer);
+        if (currentBtn === helpBtn) {
+          if (helpPreview) helpPreview.classList.remove('show');
+          currentBtn = null;
+          return;
+        }
+        if (!preview) return;
+        crossfadeGen++;
+        preview.classList.remove('show');
+        bubbleShown = false;
+        currentBtn = null;
+      };
+
+      const previewButtons = document.querySelectorAll('#controls button[data-tip]');
+
+      // Desktop: hover, continuously - the direct equivalent of the old
+      // :hover::after rule, just routed through the shared bubble instead.
+      if (!isCoarse) {
+        previewButtons.forEach((btn) => {
+          btn.addEventListener('mouseenter', () => { if (!btn.disabled) window.showBtnPreview(btn); });
+          btn.addEventListener('mouseleave', () => window.hideBtnPreview(btn));
+        });
+      }
+
+      // Touch has no :hover, so a button's data-tip label needs another way
+      // to surface on mobile: long-press. A completed long-press is treated
+      // as "reading the label", not "pressing the button" - it swallows the
+      // click that would otherwise follow.
+      const LONG_PRESS_MS = 500;
+      previewButtons.forEach((btn) => {
+        let timer = null, longPressed = false, startX = 0, startY = 0;
+        btn.addEventListener('touchstart', (e) => {
+          longPressed = false;
+          const t = e.touches[0];
+          startX = t.clientX;
+          startY = t.clientY;
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            longPressed = true;
+            window.showBtnPreview(btn);
+          }, LONG_PRESS_MS);
+        }, { passive: true });
+        btn.addEventListener('touchmove', (e) => {
+          const t = e.touches[0];
+          if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) clearTimeout(timer);
+        }, { passive: true });
+        btn.addEventListener('touchend', (e) => {
+          clearTimeout(timer);
+          if (longPressed) {
+            e.preventDefault(); // was for reading the label, not pressing the button
+            // Long enough to actually read the label after lifting the
+            // finger, not just register that one flashed past.
+            setTimeout(() => window.hideBtnPreview(btn), 1000);
+          }
+        });
+        btn.addEventListener('touchcancel', () => window.hideBtnPreview(btn));
+      });
+
+      // Walks the bubble through every visible button's label, one second
+      // each, crossfading in place. Two entry points:
+      // - window.flashBarTooltips: the one-time intro, mobile only (desktop
+      //   already has hover for continuous discovery) - fires on the first
+      //   2D appearance and, in 3D, from play3DIntroSequence.
+      // - window.replayBarPreviews: #help-btn's "show them again", on ANY
+      //   device - unlike the intro sweep, someone who explicitly asked to
+      //   see the walkthrough again should get it even with a mouse.
+      // Included regardless of :disabled - the mode-toggle button can still
+      // be mid its own enable delay when the intro sweep runs, and skipping
+      // it there meant the single most important button never got a turn.
+      let flashSweepTimers = [];
+      window.cancelBarFlash = function () {
+        flashSweepTimers.forEach(clearTimeout);
+        flashSweepTimers = [];
+        window.hideBtnPreview();
+      };
+
+      function walkBarPreviews() {
+        window.cancelBarFlash();
+        const btns = Array.from(document.querySelectorAll('#bottom-bar button[data-tip]'))
+          .filter(b => getComputedStyle(b).display !== 'none');
+        if (!btns.length) return;
+        const STEP_MS = 1000;
+        btns.forEach((b, i) => {
+          flashSweepTimers.push(setTimeout(() => {
+            // Only the last step schedules its own hide - every earlier one
+            // gets superseded by the next showBtnPreview call before a hide
+            // would matter, and giving both a timer risks a race where the
+            // hide and the next show land on the same tick.
+            const holdMs = i === btns.length - 1 ? STEP_MS : undefined;
+            window.showBtnPreview(b, holdMs);
+          }, i * STEP_MS));
+        });
+      }
+      window.flashBarTooltips = function () {
+        if (!isCoarse) return;
+        walkBarPreviews();
+      };
+      window.replayBarPreviews = walkBarPreviews;
     });
   </script>
 
@@ -958,60 +2083,21 @@
   </script>
 
   <script>
-    // Hamburger menu: export 3D model / reset composition
+    // Export the 3D model. Everything else the old hamburger menu held -
+    // Change Palette, Materials, Reset - already has its own button in
+    // #bottom-bar.
     document.addEventListener('DOMContentLoaded', () => {
-      const menuBtn = document.getElementById('menu-btn');
-      const menuDropdown = document.getElementById('menu-dropdown');
-      const exportBtn = document.getElementById('menu-export-obj');
-      const resetBtn = document.getElementById('menu-reset');
-      if (!menuBtn) return;
-
-      menuBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        menuDropdown.classList.toggle('show');
-        if (typeof window.isBabylonSceneReady === 'function') {
-          exportBtn.disabled = !window.isBabylonSceneReady();
-        }
-      });
-      document.addEventListener('click', (e) => {
-        if (menuDropdown.classList.contains('show') && !menuDropdown.contains(e.target)) {
-          menuDropdown.classList.remove('show');
-        }
-      });
-
-      exportBtn.addEventListener('click', () => {
-        if (typeof window.exportSceneToOBJ === 'function') {
-          window.exportSceneToOBJ();
-        }
-        menuDropdown.classList.remove('show');
-      });
-
-      resetBtn.addEventListener('click', () => {
-        if (typeof window.resetComposition === 'function') {
-          window.resetComposition();
-        }
-        menuDropdown.classList.remove('show');
-      });
-
-      const setupBtn = document.getElementById('menu-setup');
-      if (setupBtn) {
-        setupBtn.addEventListener('click', () => {
-          menuDropdown.classList.remove('show');
-          if (typeof window.openWelcome === 'function') window.openWelcome();
+      const exportBtn = document.getElementById('export-btn');
+      if (exportBtn) {
+        exportBtn.addEventListener('click', () => {
+          if (typeof window.exportSceneToOBJ === 'function') window.exportSceneToOBJ();
         });
       }
-      const paletteBtn = document.getElementById('menu-palette');
-      if (paletteBtn) {
-        paletteBtn.addEventListener('click', () => {
-          menuDropdown.classList.remove('show');
-          if (typeof window.openPaletteChange === 'function') window.openPaletteChange();
-        });
-      }
-      const materialsBtn = document.getElementById('menu-materials');
-      if (materialsBtn) {
-        materialsBtn.addEventListener('click', () => {
-          menuDropdown.classList.remove('show');
-          if (typeof window.openMaterialChange === 'function') window.openMaterialChange();
+
+      const helpBtn = document.getElementById('help-btn');
+      if (helpBtn) {
+        helpBtn.addEventListener('click', () => {
+          if (typeof window.replayHelp === 'function') window.replayHelp();
         });
       }
     });
@@ -1026,9 +2112,29 @@
     // (window.getPaletteCandidates), so the colours previewed here are
     // exactly the ones the composition will use.
     document.addEventListener('DOMContentLoaded', () => {
+      // Own copy - this script block is a separate closure from the one
+      // that already declares this same check (see showBtnPreview's block
+      // above), so it isn't in scope here to reuse.
+      const isCoarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
       const overlay = document.getElementById('setup-overlay');
       const listEl = document.getElementById('palette-list');
+      // #palette-panel's own compact list (the quick picker off
+      // #palette-btn) - see buildCompactPaletteRow/renderPalettes, which
+      // keep this and listEl in sync from one call.
+      const listElCompact = document.getElementById('palettep-list');
       const rowsEl = document.getElementById('shape-rows');
+      const rowsWrapEl = document.getElementById('shape-rows-wrap');
+      // Fade hint at the bottom of the shape grid (see #shape-rows-wrap's
+      // own CSS) - only shown while there's genuinely more to scroll to,
+      // not just because the list happens to be tall enough to scroll at
+      // all. Re-checked after every render (item count / column count can
+      // change what fits) and on every scroll of the list itself.
+      function updateShapeScrollHint() {
+        if (!rowsEl || !rowsWrapEl) return;
+        const hasMore = rowsEl.scrollHeight - rowsEl.scrollTop - rowsEl.clientHeight > 2;
+        rowsWrapEl.classList.toggle('has-more', hasMore);
+      }
+      if (rowsEl) rowsEl.addEventListener('scroll', updateShapeScrollHint);
       const dots = document.querySelectorAll('#setup-steps .dot');
       const steps = document.querySelectorAll('.setup-step');
       const backBtn = document.getElementById('setup-back');
@@ -1413,6 +2519,41 @@
       }
 
       // ——— step 1: palettes ———
+      // Compact swatch+label row for #palette-panel (the quick picker off
+      // #palette-btn) - same shared .mat-item/.swatch/.lbl language
+      // #materials-panel already uses, just fed palette data instead.
+      // hexes: either an array of colour strings (rendered as N discrete
+      // segments via .palette-swatch) or a single CSS background string
+      // (the artist's-palette gradient).
+      function buildCompactPaletteRow(hexes, label, onClick) {
+        if (!listElCompact) return;
+        const item = document.createElement('div');
+        item.className = 'mat-item';
+        const swatch = document.createElement('div');
+        if (Array.isArray(hexes)) {
+          swatch.className = 'swatch palette-swatch';
+          hexes.forEach(h => {
+            const s = document.createElement('span');
+            s.style.backgroundColor = h;
+            swatch.appendChild(s);
+          });
+        } else {
+          swatch.className = 'swatch';
+          swatch.style.background = hexes;
+        }
+        const lbl = document.createElement('div');
+        lbl.className = 'lbl';
+        lbl.textContent = label;
+        // Label ABOVE the swatch (not beside it, unlike materials' own
+        // .mat-item) - see #palette-panel .mat-item's CSS: this row stacks
+        // vertically, so DOM order is what puts the swatch strip visually
+        // "under the text, in between each description line."
+        item.appendChild(lbl);
+        item.appendChild(swatch);
+        item.addEventListener('click', onClick);
+        listElCompact.appendChild(item);
+      }
+
       function renderPalettes(keepSelection, useSuggestions) {
         const prev = keepSelection ? selectedPalette : null;
         let got = [];
@@ -1429,6 +2570,7 @@
         }
         if (!got.length) { // p5 not ready yet - retry rather than show an empty list
           listEl.innerHTML = '<div class="sub" style="padding:6px 2px">Preparing palettes…</div>';
+          if (listElCompact) listElCompact.innerHTML = '<div class="lbl" style="padding:6px 2px">Preparing palettes…</div>';
           setTimeout(() => renderPalettes(keepSelection), 250);
           return;
         }
@@ -1440,6 +2582,7 @@
           return n;
         });
         listEl.innerHTML = '';
+        if (listElCompact) listElCompact.innerHTML = '';
         candidates.forEach((hexes, i) => {
           const row = document.createElement('div');
           row.className = 'palette-option';
@@ -1461,6 +2604,7 @@
           row.appendChild(sw);
           row.addEventListener('click', () => selectPalette(i));
           listEl.appendChild(row);
+          buildCompactPaletteRow(hexes, suggestionLabels ? suggestionLabels[i] : names[i], () => selectPalette(i));
         });
         const rnd = document.createElement('div');
         rnd.className = 'palette-option';
@@ -1471,6 +2615,10 @@
         rnd.appendChild(label);
         rnd.addEventListener('click', () => selectPalette(null));
         listEl.appendChild(rnd);
+        buildCompactPaletteRow(
+          'linear-gradient(90deg,#e34a4a,#e3a34a,#e3e34a,#5fc45f,#4aa8e3,#7a5fd0,#c94ab5)',
+          'Surprise me', () => selectPalette(null)
+        );
 
         // ARTIST'S PALETTE - the original unconstrained behaviour, where
         // every element invents its own colour across the full spectrum
@@ -1488,6 +2636,7 @@
         art.appendChild(artSw);
         art.addEventListener('click', () => selectPalette('artist'));
         listEl.appendChild(art);
+        buildCompactPaletteRow(artSw.style.background, "Artist's Palette", () => selectPalette('artist'));
 
         selectPalette(prev != null && candidates[prev] ? prev : (prev === 'artist' ? 'artist' : null));
       }
@@ -1504,9 +2653,35 @@
           r.classList.toggle('selected', isThis);
           r.querySelector('.tick').textContent = isThis ? '✓' : '';
         });
+        // #palette-panel's own compact rows - same order, no tick (the
+        // shared .mat-item.selected border/background already carries it).
+        if (listElCompact) {
+          const crows = listElCompact.querySelectorAll('.mat-item');
+          const cArtistRow = crows.length - 1, cRandomRow = crows.length - 2;
+          crows.forEach((r, idx) => {
+            const isThis = i === 'artist' ? (idx === cArtistRow)
+              : i === null ? (idx === cRandomRow)
+              : (idx === i);
+            r.classList.toggle('selected', isThis);
+          });
+        }
         refreshStrip();
         if (step === 1) renderShapes(); // live: shapes retint immediately
         updateStatus();
+        // #palette-panel (the quick picker off #palette-btn) has no separate
+        // "use this" commit button, unlike the old full-modal 'change' mode's
+        // "Use From Here" - apply immediately on click, same as materials'
+        // "already applied live on every click, nothing to commit". Gated on
+        // the INITIAL wizard already being done: while it's still up,
+        // applyUserSettings' own "Start Drawing" is what actually commits a
+        // pick, and calling changePaletteFromHere early would flip
+        // userSetupPending false before step 2 (shape types) is even
+        // reached - letting a stray click behind the overlay start drawing
+        // with unconfirmed settings (see isUiEvent's own guard on that flag).
+        if (typeof window.isUserSetupPending === 'function' && !window.isUserSetupPending()
+          && typeof window.changePaletteFromHere === 'function') {
+          window.changePaletteFromHere({ artist: i === 'artist', paletteIndex: i === 'artist' ? null : i });
+        }
       }
 
       // ——— step 2: shapes, live in the chosen palette ———
@@ -1573,6 +2748,7 @@
           }
           rowsEl.appendChild(row);
         });
+        updateShapeScrollHint();
       }
 
       // ——— navigation ———
@@ -1583,24 +2759,18 @@
       // the palettes coming from the sketch's own generator.
       const matBaseEl = document.getElementById('mat-base');
       const matStrutEl = document.getElementById('mat-strut');
-      const matLightEl = document.getElementById('mat-light');
-      // Lighting isn't a material, so it has no entry in babylon3D.js's
-      // option tables - but it belongs in this panel and uses the same
-      // swatch control, so its two choices live here. Each swatch previews
-      // the actual effect: flat paper wash vs. a lit pool against darkness.
-      const LIGHT_OPTIONS = [
-        { id: 'daylight', label: 'Daylight', swatch: 'linear-gradient(180deg,#f0e5cc,#e2d3b4)' },
-        { id: 'spotlight', label: 'Spotlight', swatch: 'radial-gradient(circle at 50% 36%,#f4e8ce 0%,#9c8d71 34%,#3a3630 66%,#131318 100%)' }
-      ];
-      let matOptions = { base: [], strut: [], light: LIGHT_OPTIONS };
-      let matChoice = { base: null, strut: null, light: null };
+      // Same options/selection, a second SMALL side-by-side rendering for
+      // #materials-panel (the quick picker off #material-btn) - see
+      // renderMaterials below, which keeps both in sync from one call.
+      const matpBaseEl = document.getElementById('matp-base');
+      const matpStrutEl = document.getElementById('matp-strut');
+      let matOptions = { base: [], strut: [] };
+      let matChoice = { base: null, strut: null };
 
       function renderMaterials() {
         if (typeof window.getMaterialOptions !== 'function') return;
-        matOptions = { ...window.getMaterialOptions(), light: LIGHT_OPTIONS };
+        matOptions = window.getMaterialOptions();
         matChoice = window.getSculptureMaterials();
-        matChoice.light = (typeof window.getSpotlightMode === 'function' && window.getSpotlightMode())
-          ? 'spotlight' : 'daylight';
         const build = (host, list, key, onPick) => {
           if (!host) return;
           host.innerHTML = '';
@@ -1625,11 +2795,36 @@
             host.appendChild(cell);
           });
         };
-        build(matBaseEl, matOptions.base, 'base', id => window.setSculptureMaterials({ ...matChoice, base: id }));
-        build(matStrutEl, matOptions.strut, 'strut', id => window.setSculptureMaterials({ ...matChoice, strut: id }));
-        build(matLightEl, LIGHT_OPTIONS, 'light', id => {
-          if (typeof window.setSpotlightMode === 'function') window.setSpotlightMode(id === 'spotlight');
-        });
+        // Compact swatch+label row, not the wizard's bigger stacked cell -
+        // see .mat-item's own CSS comment for why this panel gets its own
+        // markup instead of reusing .mat-cell/.mat-chip.
+        const buildCompact = (host, list, key, onPick) => {
+          if (!host) return;
+          host.innerHTML = '';
+          list.forEach(o => {
+            const item = document.createElement('div');
+            item.className = 'mat-item' + (matChoice[key] === o.id ? ' selected' : '');
+            const swatch = document.createElement('div');
+            swatch.className = 'swatch';
+            swatch.style.background = o.swatch;
+            const lbl = document.createElement('div');
+            lbl.className = 'lbl';
+            lbl.textContent = o.label;
+            item.appendChild(swatch);
+            item.appendChild(lbl);
+            item.addEventListener('click', () => {
+              onPick(o.id);
+              renderMaterials();
+            });
+            host.appendChild(item);
+          });
+        };
+        const pickBase = id => window.setSculptureMaterials({ ...matChoice, base: id });
+        const pickStrut = id => window.setSculptureMaterials({ ...matChoice, strut: id });
+        build(matBaseEl, matOptions.base, 'base', pickBase);
+        build(matStrutEl, matOptions.strut, 'strut', pickStrut);
+        buildCompact(matpBaseEl, matOptions.base, 'base', pickBase);
+        buildCompact(matpStrutEl, matOptions.strut, 'strut', pickStrut);
       }
 
       function materialLabel(key) {
@@ -1640,7 +2835,7 @@
       function updateStatus() {
         if (step === 2) {
           statusEl.textContent = matChoice.base
-            ? `${materialLabel('base')} base · ${materialLabel('strut')} struts · ${materialLabel('light')}`
+            ? `${materialLabel('base')} base · ${materialLabel('strut')} struts`
             : '';
           nextBtn.disabled = false;
         } else if (step === 0) {
@@ -1714,6 +2909,10 @@
           });
         }
         overlay.classList.add('hidden');
+        const controlsEl = document.getElementById('controls');
+        if (controlsEl) controlsEl.classList.add('show');
+        // The 2D screen just appeared for the first time this visit.
+        if (typeof window.triggerFirstCanvasHints === 'function') setTimeout(window.triggerFirstCanvasHints, 400);
       });
       document.getElementById('setup-shuffle').addEventListener('click', () => renderPalettes(false, false));
       // Live palette switching from the shapes step - no need to go back
@@ -1773,12 +2972,46 @@
         goTo(2);
       };
 
+      // Quick materials picker - expands from #material-btn itself rather
+      // than opening the step-2-of-3 wizard overlay above (openMaterialChange
+      // still exists but nothing calls it now - kept rather than removed in
+      // case it's wanted again). Same mechanics as #lighting-panel: a
+      // position:fixed child of #bottom-bar, toggled open/closed by the same
+      // button click, closed by tapping the composition too (see the
+      // #babylon-canvas pointerdown listener elsewhere, extended to check
+      // this panel as well).
       const materialFab = document.getElementById('material-btn');
-      if (materialFab) materialFab.addEventListener('click', () => window.openMaterialChange());
+      const materialsPanel = document.getElementById('materials-panel');
+      window.showMaterialsPanel = function () {
+        if (!materialsPanel) return;
+        // Mutually exclusive with the other two quick panels - all three
+        // are position:fixed at the exact same spot, so having more than
+        // one open at once would just stack them, not read as separate
+        // panels.
+        hideLightingPanel();
+        window.hidePalettePanel();
+        renderMaterials();
+        // No per-open button-clearance measurement needed here (unlike
+        // showLightingPanel's own right-padding calc) - #materials-panel-
+        // inner's flat padding-bottom already reserves room for
+        // #material-btn regardless of where it lands horizontally, since
+        // it's always anchored at the same bottom edge as the panel. See
+        // that CSS rule's own comment for why this is more robust than a
+        // horizontal clearance calc for THIS particular button.
+        materialsPanel.classList.add('show');
+        if (materialFab) materialFab.classList.add('active');
+      };
+      window.hideMaterialsPanel = function () {
+        if (!materialsPanel) return;
+        materialsPanel.classList.remove('show');
+        if (materialFab) materialFab.classList.remove('active');
+      };
+      if (materialFab) materialFab.addEventListener('click', () => {
+        if (materialsPanel && materialsPanel.classList.contains('show')) window.hideMaterialsPanel();
+        else window.showMaterialsPanel();
+      });
 
-      // Start a new composition. Same call the desktop menu's "Reset
-      // Composition" makes - this is the only route to it on touch, where
-      // the hamburger is hidden. resetComposition() guards its own re-entry
+      // Start a new composition. resetComposition() guards its own re-entry
       // (`if (resetCycleTimestamp > 0) return`), so an impatient double-tap
       // can't stack two cycles, and the fade to black IS the feedback - no
       // spinner needed for something that visibly takes over the screen.
@@ -1794,6 +3027,66 @@
         clearTimeout(arStatusTimer);
         arStatusTimer = setTimeout(() => arStatus.classList.remove('show'), 6000);
       };
+
+      // Called from sketchdesktopreset.js whenever totalElementsCreated
+      // changes (on creation and on reset) - kept as plain text updates
+      // rather than redrawing every p5 frame, since the count only ever
+      // changes at those two points.
+      const elementCountEl = document.getElementById('element-count');
+      window.updateElementCount = function (n, max) {
+        if (elementCountEl) elementCountEl.textContent = n + ' / ' + max;
+        // "At least one shape must be drawn to go into 3D mode" - gated
+        // here (not a fixed post-init timer) so it re-disables on undo/
+        // reset back down to an empty canvas too, not just on the way up.
+        // data-tip deliberately stays "3D View" regardless (see the static
+        // HTML) - it feeds the GENERIC label mechanisms (long-press, the
+        // onboarding flash-sweep), which only render a short single line.
+        // Swapping it to the long "why disabled" message used to make
+        // those show it too - on the flash-sweep in particular, meaning it
+        // could appear on mobile without the button ever being pressed at
+        // all. The actual explanation only belongs to a real press attempt
+        // now - see #mode-toggle-empty-toast's own pointerdown listener,
+        // which has its own wrapped styling built for a long message.
+        const toggleBtn = document.getElementById('mode-toggle-btn');
+        if (toggleBtn) toggleBtn.disabled = n <= 0;
+      };
+
+      // Lock: freezes new elements from spawning (sketchdesktopreset.js's
+      // handleDrag gate) without touching undo/redo, which stay available
+      // either way. Purely a toggle button - the actual gate lives in
+      // window.setLocked2D.
+      const lockBtn = document.getElementById('lock-btn');
+      const lockIcon = lockBtn ? lockBtn.querySelector('i') : null;
+      let locked2D = false;
+      window.setLockButtonState = function (isLocked) {
+        locked2D = !!isLocked;
+        if (!lockBtn) return;
+        lockBtn.classList.toggle('active', locked2D);
+        lockBtn.dataset.tip = locked2D ? 'Unlock composition' : 'Lock composition';
+        if (lockIcon) {
+          lockIcon.classList.toggle('fa-lock-open', !locked2D);
+          lockIcon.classList.toggle('fa-lock', locked2D);
+        }
+      };
+      if (lockBtn) {
+        lockBtn.addEventListener('click', () => {
+          window.setLockButtonState(!locked2D);
+          if (typeof window.setLocked2D === 'function') window.setLocked2D(locked2D);
+        });
+      }
+
+      // Undo/redo: sketchdesktopreset.js owns the actual history stack
+      // (elementHistory/historyPointer) and calls this back after every
+      // push/undo/redo so the buttons' enabled state always matches what's
+      // really there to step through.
+      const undoBtn = document.getElementById('undo-btn');
+      const redoBtn = document.getElementById('redo-btn');
+      window.updateUndoRedoButtons = function (canUndo, canRedo) {
+        if (undoBtn) undoBtn.disabled = !canUndo;
+        if (redoBtn) redoBtn.disabled = !canRedo;
+      };
+      if (undoBtn) undoBtn.addEventListener('click', () => { if (typeof window.undo2D === 'function') window.undo2D(); });
+      if (redoBtn) redoBtn.addEventListener('click', () => { if (typeof window.redo2D === 'function') window.redo2D(); });
 
       const arFab = document.getElementById('ar-btn');
       if (arFab && typeof window.isARQuickLookSupported === 'function'
@@ -1829,60 +3122,538 @@
       // scene so the struts support the new orientations; tap again to
       // revert to the true composition.
       const scrambleFab = document.getElementById('scramble-btn');
+      const die1 = document.getElementById('die-1');
+      const die2 = document.getElementById('die-2');
+      // Standard 7-pip die layout, keyed by face value.
+      const DICE_FACES = {
+        1: ['c'],
+        2: ['tl', 'br'],
+        3: ['tl', 'c', 'br'],
+        4: ['tl', 'tr', 'bl', 'br'],
+        5: ['tl', 'tr', 'c', 'bl', 'br'],
+        6: ['tl', 'tr', 'ml', 'mr', 'bl', 'br'],
+      };
+      const currentFace = { 1: 6, 2: 5 }; // one entry per die, tracked independently
+      function renderDieFace(dieEl, dieNum, value) {
+        if (!dieEl) return;
+        currentFace[dieNum] = value;
+        const lit = new Set(DICE_FACES[value] || []);
+        dieEl.querySelectorAll('.pip').forEach((pip) => {
+          const shown = lit.has(pip.dataset.pos);
+          pip.classList.toggle('show', shown);
+          // "red dot for 1" - only the single centre pip of the 1-face.
+          pip.classList.toggle('pip-one', shown && value === 1);
+        });
+      }
+      renderDieFace(die1, 1, currentFace[1]);
+      renderDieFace(die2, 2, currentFace[2]);
+      // Each die tumbles through a few random faces before landing on its
+      // OWN real result - independent of the other die, like an actual
+      // pair - timed to the CSS tumble animations (die-tumble-1/2, ~0.55s)
+      // rather than just swapping instantly; a real die doesn't teleport
+      // to its result, it visibly tumbles first.
+      function rollDice() {
+        if (!scrambleFab) return;
+        scrambleFab.classList.remove('rolling');
+        void scrambleFab.offsetWidth; // force reflow so a re-roll mid-animation restarts cleanly
+        scrambleFab.classList.add('rolling');
+        const TICK_MS = 70, TICKS = 6;
+        for (let i = 1; i <= TICKS; i++) {
+          setTimeout(() => {
+            [[die1, 1], [die2, 2]].forEach(([dieEl, dieNum]) => {
+              let next = 1 + Math.floor(Math.random() * 6);
+              if (next === currentFace[dieNum]) next = (next % 6) + 1; // never "reroll" the same face twice in a row
+              renderDieFace(dieEl, dieNum, next);
+            });
+          }, i * TICK_MS);
+        }
+        setTimeout(() => scrambleFab.classList.remove('rolling'), 570);
+      }
       if (scrambleFab) scrambleFab.addEventListener('click', () => {
         if (typeof window.setScrambleMode !== 'function') return;
         const on = !window.getScrambleMode();
         window.setScrambleMode(on);
+        rollDice();
         scrambleFab.classList.toggle('active', on);
         scrambleFab.dataset.tip = on ? 'Back to true' : 'Scramble the angles';
+        // The hover preview only refreshes its text on mouseenter - a click
+        // while still hovering (the button never lost focus) would
+        // otherwise leave the OLD label showing until the pointer actually
+        // left and came back. Re-run it now so the label catches up right
+        // away, matching whatever's really current. On a coarse/touch
+        // pointer there's no hover to eventually leave at all, so a bare
+        // tap here left the label on screen permanently - holdMs makes a
+        // tap a brief confirm-flash instead, same as everywhere else a
+        // touch-only preview auto-hides.
+        if (typeof window.showBtnPreview === 'function') window.showBtnPreview(scrambleFab, isCoarse ? 1400 : undefined);
       });
+
+      // Spotlight: direct on/off toggle for the same lit-vs-flat look the
+      // materials step used to offer as a "Daylight/Spotlight" swatch pair -
+      // one tap now instead of opening that panel. Session-only (see
+      // babylon3D.js) - every 3D entry starts off, so the button's state is
+      // synced off the real value whenever 3D mode is entered, not just
+      // tracked from clicks.
+      const spotlightFab = document.getElementById('spotlight-btn');
+      const lightingFab = document.getElementById('lighting-btn');
+
+      // Spotlight-only lighting panel - background brightness, active light
+      // count, overall intensity, and colour warmth (see babylon3D.js's
+      // applySpotlightLighting). Session-only like spotlightMode itself: no
+      // storage read here, sliders just reflect whatever the module's
+      // in-memory settings currently are. Declared here, ABOVE
+      // syncSpotlightButton, since that function's very first call (below)
+      // already needs hideLightingPanel - a const's declaration must run
+      // before anything can reference it, even though the function
+      // declarations themselves are hoisted.
+      const lightingPanel = document.getElementById('lighting-panel');
+      const lightSkydim = document.getElementById('light-skydim');
+      const lightCount = document.getElementById('light-count');
+      const lightIntensity = document.getElementById('light-intensity');
+      const lightWarmth = document.getElementById('light-warmth');
+      const lightingReset = document.getElementById('lighting-reset');
+      const lightingPanelInner = document.getElementById('lighting-panel-inner');
+      function syncLightingSliders() {
+        if (typeof window.getSpotlightLightingSettings !== 'function') return;
+        const s = window.getSpotlightLightingSettings();
+        if (lightSkydim) lightSkydim.value = s.skyDim;
+        if (lightCount) lightCount.value = s.lightCount;
+        if (lightIntensity) lightIntensity.value = s.intensityScale;
+        if (lightWarmth) lightWarmth.value = s.warmth;
+      }
+      function showLightingPanel() {
+        if (!lightingPanel) return;
+        // Mutually exclusive with the other two quick panels - see
+        // showMaterialsPanel's identical cross-hide calls for why (same
+        // fixed position, all three).
+        window.hideMaterialsPanel();
+        window.hidePalettePanel();
+        syncLightingSliders();
+        // Stays centred on the bar (its CSS default - left:50%, translateX
+        // -50%, both relative to #bottom-bar, itself already centred on the
+        // viewport) rather than chasing #lighting-btn's own position - an
+        // earlier version right-aligned to the button instead, but on a
+        // narrow phone that read as visibly off-centre once a screen-edge
+        // clamp kicked in. #lighting-btn is the LAST button in the bar (see
+        // its HTML comment), so centring still leaves it sitting close to
+        // the panel's own right side - not necessarily its exact corner,
+        // but close enough that the padding below reliably clears it.
+        //
+        // What still varies is exactly how much clearance that padding
+        // needs, since "close to the right side" isn't a fixed pixel value
+        // across every screen width/button count - measured fresh each
+        // open, after the panel's real (centred) position is settled, so
+        // this always matches reality instead of assuming a fixed offset.
+        if (lightingFab && lightingPanelInner) {
+          const panelRect = lightingPanel.getBoundingClientRect();
+          const fabRect = lightingFab.getBoundingClientRect();
+          lightingPanelInner.style.paddingRight = Math.max(20, panelRect.right - fabRect.left + 14) + 'px';
+        }
+        lightingPanel.classList.add('show');
+        if (lightingFab) lightingFab.classList.add('active');
+      }
+      function hideLightingPanel() {
+        if (!lightingPanel) return;
+        lightingPanel.classList.remove('show');
+        if (lightingFab) lightingFab.classList.remove('active');
+      }
+      // The button that opens it also closes it - no separate close button
+      // in the panel (see the HTML comment above #lighting-panel).
+      if (lightingFab) lightingFab.addEventListener('click', () => {
+        if (lightingPanel && lightingPanel.classList.contains('show')) hideLightingPanel();
+        else showLightingPanel();
+      });
+      [[lightSkydim, 'skyDim'], [lightCount, 'lightCount'], [lightIntensity, 'intensityScale'], [lightWarmth, 'warmth']]
+        .forEach(([el, key]) => {
+          if (!el) return;
+          el.addEventListener('input', () => {
+            if (typeof window.setSpotlightLighting !== 'function') return;
+            window.setSpotlightLighting({ [key]: parseFloat(el.value) });
+          });
+        });
+      if (lightingReset) lightingReset.addEventListener('click', () => {
+        if (typeof window.resetSpotlightLighting === 'function') window.resetSpotlightLighting();
+        syncLightingSliders();
+      });
+      // Clicking ANYWHERE outside one of these expand-from-button panels
+      // (the composition itself, another button, anywhere) also dismisses
+      // it, not just re-clicking the button that opened it - a generic
+      // "outside the panel and outside its own trigger button" check
+      // rather than hardcoding to #babylon-canvas specifically, since
+      // #palette-panel is reachable in 2D mode too, where there's no
+      // Babylon canvas at all (only the p5 one, which has no fixed id to
+      // target directly). pointerdown (not click) - orbit-dragging the
+      // camera starts with a pointerdown but the drag itself usually
+      // suppresses the browser's own 'click' event, so 'click' alone would
+      // miss most real interactions with the 3D piece.
+      const isOutside = (panel, fab, target) =>
+        panel && panel.classList.contains('show') && !panel.contains(target) && (!fab || (target !== fab && !fab.contains(target)));
+      document.addEventListener('pointerdown', e => {
+        const t = e.target;
+        if (!t) return;
+        if (isOutside(lightingPanel, lightingFab, t)) hideLightingPanel();
+        if (isOutside(materialsPanel, materialFab, t)) window.hideMaterialsPanel();
+        if (isOutside(palettePanel, paletteFab, t)) window.hidePalettePanel();
+      });
+
+      function syncSpotlightButton() {
+        if (!spotlightFab || typeof window.getSpotlightMode !== 'function') return;
+        const on = window.getSpotlightMode();
+        spotlightFab.classList.toggle('active', on);
+        // Always just "Spotlight" - the gold .active glow already shows
+        // whether it's on, so the label doesn't need to narrate a
+        // transition ("Normal lighting" read as "click to go back").
+        // Only reachable while spotlight is actually on AND we're actually
+        // in 3D - spotlightMode itself is session-persistent (babylon3D.js
+        // never resets it on exit), so checking `on` alone left this
+        // inline-styled 'flex' stuck from a previous 3D visit even after
+        // returning to 2D (deactivate3DMode only removes body.in-3d, an
+        // inline style beats the stylesheet's own default display:none).
+        // The MutationObserver below re-runs this on every body.in-3d
+        // change, so leaving 3D re-evaluates and correctly hides it again.
+        const in3D = document.body.classList.contains('in-3d');
+        if (lightingFab) lightingFab.style.display = (on && in3D) ? 'flex' : 'none';
+        if (!on || !in3D) hideLightingPanel();
+      }
+      if (spotlightFab) spotlightFab.addEventListener('click', () => {
+        if (typeof window.setSpotlightMode !== 'function') return;
+        window.setSpotlightMode(!window.getSpotlightMode());
+        syncSpotlightButton();
+        // holdMs on touch - see scrambleFab's identical click handler above
+        // for why: no hover to eventually leave means no other path ever
+        // hides it again.
+        if (typeof window.showBtnPreview === 'function') window.showBtnPreview(spotlightFab, isCoarse ? 1400 : undefined);
+      });
+      new MutationObserver(syncSpotlightButton).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+      syncSpotlightButton();
+
+      // Base/struts visibility: "turn off the struts and base so they can
+      // just look at the composition if they desire" - same direct on/off
+      // toggle shape as spotlight above, no panel. .active means HIDDEN
+      // (the button's own toggled-on state), so the icon/tip track the
+      // OPPOSITE of window.isStructureVisible().
+      const structureFab = document.getElementById('structure-toggle-btn');
+      const structureIcon = structureFab ? structureFab.querySelector('i') : null;
+      function syncStructureButton() {
+        if (!structureFab || typeof window.isStructureVisible !== 'function') return;
+        const hidden = !window.isStructureVisible();
+        structureFab.classList.toggle('active', hidden);
+        structureFab.dataset.tip = hidden ? 'Show base & struts' : 'Hide base & struts';
+        if (structureIcon) structureIcon.className = hidden ? 'fas fa-eye-slash' : 'fas fa-eye';
+      }
+      if (structureFab) structureFab.addEventListener('click', () => {
+        if (typeof window.setStructureVisible !== 'function') return;
+        window.setStructureVisible(!window.isStructureVisible());
+        syncStructureButton();
+        if (typeof window.showBtnPreview === 'function') window.showBtnPreview(structureFab, isCoarse ? 1400 : undefined);
+      });
+      syncStructureButton();
+
+      // "Start New" wipes the current composition (and its undo history)
+      // for good, so it's confirmed first rather than firing immediately.
+      const confirmOverlay = document.getElementById('confirm-overlay');
+      const confirmOk = document.getElementById('confirm-ok');
+      const confirmCancel = document.getElementById('confirm-cancel');
+      function showConfirm(onConfirm) {
+        if (!confirmOverlay) { onConfirm(); return; }
+        confirmOverlay.classList.remove('hidden');
+        requestAnimationFrame(() => confirmOverlay.classList.add('show'));
+        const cleanup = () => {
+          confirmOverlay.classList.remove('show');
+          setTimeout(() => confirmOverlay.classList.add('hidden'), 250); // match the opacity transition
+          confirmOk.removeEventListener('click', onOk);
+          confirmCancel.removeEventListener('click', onCancel);
+        };
+        const onOk = () => { cleanup(); onConfirm(); };
+        const onCancel = () => { cleanup(); };
+        confirmOk.addEventListener('click', onOk);
+        confirmCancel.addEventListener('click', onCancel);
+      }
 
       const refreshFab = document.getElementById('refresh-btn');
       if (refreshFab) refreshFab.addEventListener('click', () => {
         hideToast();
-        if (typeof window.resetComposition === 'function') window.resetComposition();
+        showConfirm(() => {
+          if (typeof window.resetComposition === 'function') window.resetComposition();
+        });
       });
 
       // ——— palette button + one-time hint ———
+      // Quick picker - expands from #palette-btn itself, same mechanics as
+      // #materials-panel/#lighting-panel (see #lighting-panel's own HTML
+      // comment for the full reasoning). openPaletteChange/the wizard's
+      // step-0 overlay still exist for Advanced Mode's initial multi-step
+      // flow, unaffected - this only replaces the STANDALONE "change
+      // palette any time" path the button used to open.
       const paletteFab = document.getElementById('palette-btn');
+      const palettePanel = document.getElementById('palette-panel');
       const toast = document.getElementById('palette-toast');
+      // Set once the user actually opens the panel - see the
+      // PALETTE_ATTRACT_AFTER_ELEMENTS interval further below, which stops
+      // arming the attract pulse for the rest of the session once this
+      // flips true (same "found it once, stop drawing the eye" contract as
+      // #mode-toggle-btn's own .pulse-done).
+      let paletteAttractDone = false;
+      window.showPalettePanel = function () {
+        if (!palettePanel) return;
+        // Mutually exclusive with the other two quick panels - all three
+        // share the same fixed position (see #lighting-panel's own
+        // identical cross-hide calls).
+        hideLightingPanel();
+        window.hideMaterialsPanel();
+        // Only fetch a brand-new set of 5 candidates the FIRST time this
+        // panel is ever opened - getPaletteCandidates() returns a fresh
+        // random batch on every call, and since a selection is tracked by
+        // INDEX into that batch (see selectPalette), re-fetching on every
+        // open silently swapped in different palettes under the same
+        // "selected" slot even though the user never touched Shuffle -
+        // reopening the panel looked like new palettes appearing on their
+        // own. Reopening now just re-shows the same batch/selection; only
+        // the explicit Shuffle button (#palettep-shuffle) regenerates.
+        if (!candidates.length) renderPalettes(true, false);
+        palettePanel.classList.add('show');
+        if (paletteFab) {
+          paletteFab.classList.add('active');
+          // The user just engaged with it - the attract pulse (see the
+          // composition-progress interval below) has done its job.
+          paletteFab.classList.remove('pulse-attract');
+        }
+        paletteAttractDone = true;
+      };
+      window.hidePalettePanel = function () {
+        if (!palettePanel) return;
+        palettePanel.classList.remove('show');
+        if (paletteFab) paletteFab.classList.remove('active');
+      };
       const openChange = () => {
         hideToast();
-        window.openPaletteChange();
+        if (palettePanel && palettePanel.classList.contains('show')) window.hidePalettePanel();
+        else window.showPalettePanel();
       };
       if (paletteFab) paletteFab.addEventListener('click', openChange);
       if (toast) toast.addEventListener('click', openChange);
+      const paletteShuffleFab = document.getElementById('palettep-shuffle');
+      if (paletteShuffleFab) paletteShuffleFab.addEventListener('click', () => renderPalettes(false, false));
 
       let toastTimer = null;
       function showToast() {
         if (!toast) return;
+        if (typeof window.__centerOverButton === 'function') window.__centerOverButton(toast, paletteFab);
         toast.classList.add('show');
+        if (typeof window.__pulseButtonOnce === 'function') window.__pulseButtonOnce(paletteFab);
         clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => toast.classList.remove('show'), 11000);
+        toastTimer = setTimeout(hideToast, 11000);
       }
       function hideToast() {
         if (!toast) return;
         clearTimeout(toastTimer);
         toast.classList.remove('show');
       }
+      // Exposed for #help-btn (window.replayHelp, in babylon3D.js) to replay
+      // this hint on demand in 2D.
+      window.showPaletteToast = showToast;
 
-      // Surface the hint ONCE per composition, and only once enough has been
-      // drawn that changing the palette is a meaningful choice - on an empty
-      // canvas it would just be noise. Re-arms when a new composition starts
-      // (element count drops).
-      const HINT_AFTER_ELEMENTS = 10;
-      let hintShown = false, lastCreated = 0;
+      // ——— "Explore in 3D" hint: nudges toward the marquee feature ———
+      const go3dToast = document.getElementById('go3d-toast');
+      const modeToggleBtn = document.getElementById('mode-toggle-btn');
+      let go3dToastTimer = null;
+      function showGo3DToast() {
+        if (!go3dToast) return;
+        if (modeToggleBtn && typeof window.__centerOverButton === 'function') window.__centerOverButton(go3dToast, modeToggleBtn);
+        go3dToast.classList.add('show');
+        if (modeToggleBtn && typeof window.__pulseButtonOnce === 'function') window.__pulseButtonOnce(modeToggleBtn);
+        clearTimeout(go3dToastTimer);
+        go3dToastTimer = setTimeout(hideGo3DToast, 11000);
+      }
+      function hideGo3DToast() {
+        if (!go3dToast) return;
+        clearTimeout(go3dToastTimer);
+        go3dToast.classList.remove('show');
+      }
+      if (go3dToast) go3dToast.addEventListener('click', () => {
+        hideGo3DToast();
+        if (modeToggleBtn && !modeToggleBtn.disabled) modeToggleBtn.click();
+      });
+      // Exposed for #help-btn (window.replayHelp, in babylon3D.js) to replay
+      // this hint on demand in 2D.
+      window.showGo3DToast = showGo3DToast;
+
+      // "only show the message when the button is clicked" - a NATIVE
+      // disabled button never fires 'click' (or mousedown/mouseup) at all,
+      // so this listens on 'pointerdown' instead, which still reaches a
+      // disabled button in every browser tested. Only acts while the
+      // button is actually disabled - once enabled, this is a no-op and
+      // the normal click just opens 3D as usual.
+      const modeToggleEmptyToast = document.getElementById('mode-toggle-empty-toast');
+      let modeToggleEmptyToastTimer = null;
+      function hideModeToggleEmptyToast() {
+        if (!modeToggleEmptyToast) return;
+        clearTimeout(modeToggleEmptyToastTimer);
+        modeToggleEmptyToast.classList.remove('show');
+      }
+      if (modeToggleBtn) modeToggleBtn.addEventListener('pointerdown', () => {
+        if (!modeToggleBtn.disabled || !modeToggleEmptyToast) return;
+        if (typeof window.__centerOverButton === 'function') window.__centerOverButton(modeToggleEmptyToast, modeToggleBtn);
+        modeToggleEmptyToast.classList.add('show');
+        if (typeof window.__pulseButtonOnce === 'function') window.__pulseButtonOnce(modeToggleBtn);
+        clearTimeout(modeToggleEmptyToastTimer);
+        modeToggleEmptyToastTimer = setTimeout(hideModeToggleEmptyToast, 4000);
+      });
+
+      // The wordless gesture demo (two fingerprints synced to the real
+      // camera) lives entirely in babylon3D.js now - it has to update
+      // camera3D every frame, so there's nothing left for this file to own.
+
+      // ——— "how to draw" demo: a fingertip drags a curved stroke across
+      // the 2D canvas, illustration only - no real shape gets created.
+      // Generation-token guarded the same way as the 3D gesture demo, so a
+      // replay (#help-btn) can't leave two runs animating the same path at
+      // once. ———
+      let drawHintGen = 0;
+      window.playDrawHintDemo = function () {
+        if (document.body.classList.contains('in-3d')) return;
+        const layer = document.getElementById('draw-hint');
+        const path = document.getElementById('draw-hint-path');
+        const finger = document.getElementById('draw-hint-finger');
+        if (!layer || !path || !finger) return;
+
+        const myGen = ++drawHintGen;
+        const isCurrent = () => myGen === drawHintGen && !document.body.classList.contains('in-3d');
+
+        // A real draw means "I'm taking over now" - dismiss immediately
+        // rather than leaving the demo playing on over the user's own
+        // stroke, or (worse) leaving it stuck frozen on screen the way
+        // interrupting the 3D gesture demo used to before its own fix:
+        // bumping the generation alone only stops the animation loop from
+        // updating further, it doesn't hide anything left on screen.
+        // p5 gives its canvas no fixed id (babylon3D.js works around the
+        // same thing elsewhere) - the first <canvas> in the document is it,
+        // since #babylon-canvas doesn't exist yet until 3D is entered once.
+        const p5Canvas = document.querySelector('canvas');
+        const cancel = () => {
+          if (myGen !== drawHintGen) return;
+          drawHintGen++;
+          const afterCancelGen = drawHintGen; // this cancellation's own generation, not the run it cancelled
+          finger.style.transition = 'opacity 0.2s';
+          path.style.transition = 'opacity 0.2s';
+          finger.style.opacity = '0';
+          path.style.opacity = '0';
+          setTimeout(() => {
+            if (drawHintGen !== afterCancelGen) return; // a newer run has since taken over - it owns cleanup now
+            layer.style.display = 'none';
+          }, 200);
+        };
+        if (p5Canvas) p5Canvas.addEventListener('pointerdown', cancel, { once: true });
+
+        // A gentle S-curve well clear of the bar - evocative of the kind of
+        // open stroke this app turns into a shape, not a straight ruled line.
+        const cx = window.innerWidth / 2, cy = window.innerHeight * 0.42;
+        const x1 = cx - 100, y1 = cy - 15;
+        const cx1 = cx - 10, cy1 = cy - 75;
+        const x2 = cx + 105, y2 = cy + 35;
+        path.setAttribute('d', `M ${x1},${y1} Q ${cx1},${cy1} ${x2},${y2}`);
+        const totalLen = path.getTotalLength();
+        path.style.strokeDasharray = String(totalLen);
+        path.style.strokeDashoffset = String(totalLen);
+        path.style.opacity = '1';
+
+        finger.style.transition = 'none';
+        finger.style.transform = `translate(${x1}px, ${y1}px) translate(-50%, -50%)`;
+        finger.style.opacity = '0';
+        layer.style.display = 'block';
+
+        const DRAW_MS = 1300, HOLD_MS = 500, FADE_MS = 350;
+        requestAnimationFrame(() => {
+          if (!isCurrent()) return;
+          finger.style.transition = `opacity ${FADE_MS}ms`;
+          finger.style.opacity = '1';
+          const start = performance.now();
+          function step(now) {
+            if (!isCurrent()) return;
+            const t = Math.min(1, (now - start) / DRAW_MS);
+            const eased = 0.5 - 0.5 * Math.cos(t * Math.PI);
+            path.style.strokeDashoffset = String(totalLen * (1 - eased));
+            const pt = path.getPointAtLength(eased * totalLen);
+            finger.style.transform = `translate(${pt.x}px, ${pt.y}px) translate(-50%, -50%)`;
+            if (t < 1) {
+              requestAnimationFrame(step);
+            } else {
+              setTimeout(() => {
+                if (!isCurrent()) return;
+                if (p5Canvas) p5Canvas.removeEventListener('pointerdown', cancel);
+                finger.style.opacity = '0';
+                path.style.transition = `opacity ${FADE_MS}ms`;
+                path.style.opacity = '0';
+                setTimeout(() => {
+                  if (myGen !== drawHintGen) return; // superseded - the newer run owns cleanup
+                  layer.style.display = 'none';
+                  path.style.transition = '';
+                }, FADE_MS);
+              }, HOLD_MS);
+            }
+          }
+          requestAnimationFrame(step);
+        });
+      };
+
+      // Runs once, right as the 2D canvas first becomes available: the
+      // draw demo first (the single most fundamental "how does this even
+      // work" question), then - once it's had its moment - the button-label
+      // sweep, so the two don't pile up the way earlier hints in this app
+      // once did before they were sequenced.
+      window.triggerFirstCanvasHints = function () {
+        window.playDrawHintDemo();
+        const DRAW_HINT_MS = 1300 + 500 + 350; // DRAW_MS + HOLD_MS + FADE_MS above
+        if (typeof window.flashBarTooltips === 'function') {
+          setTimeout(window.flashBarTooltips, DRAW_HINT_MS + 300);
+        }
+      };
+
+      // Surface both hints ONCE per composition, and only once enough has
+      // been drawn that the hint is a meaningful suggestion rather than
+      // noise on an empty canvas. Re-arms when a new composition starts
+      // (element count drops). The 3D hint has a lower threshold than the
+      // palette one - it's the more central feature, so it should surface
+      // first - and the palette hint waits for it to have already had its
+      // moment, so the two can't collide the way the old scramble hint
+      // once did with everything else near the bar.
+      const GO3D_HINT_AFTER_ELEMENTS = 15;
+      const HINT_AFTER_ELEMENTS = 20;
+      // "After 7 shapes are drawn, feature the palette button" - well
+      // before either toast hint above, since this draws the eye to the
+      // BUTTON itself (a quiet, continuous ring pulse - see .pulse-attract
+      // and mode-btn-pulse) rather than interrupting with a message.
+      // Separate from paletteAttractShown (the composition-restart re-arm
+      // flag below) is paletteAttractDone, set the moment the user actually
+      // OPENS the panel (see showPalettePanel) - that one does NOT reset on
+      // a new composition, matching #mode-toggle-btn's own .pulse-done:
+      // once someone has found the button once, it doesn't need to draw
+      // the eye again for the rest of the session.
+      const PALETTE_ATTRACT_AFTER_ELEMENTS = 7;
+      let go3dHintShown = false, hintShown = false, paletteAttractShown = false, lastCreated = 0;
       setInterval(() => {
         if (typeof window.getCompositionProgress !== 'function') return;
         let p;
         try { p = window.getCompositionProgress(); } catch (e) { return; }
         if (!p) return;
-        if (p.created < lastCreated) hintShown = false;   // composition restarted
+        if (p.created < lastCreated) { go3dHintShown = false; hintShown = false; paletteAttractShown = false; } // composition restarted
         lastCreated = p.created;
-        if (hintShown || p.setupPending) return;
+        if (p.setupPending) return;
         if (!overlay.classList.contains('hidden')) return;      // setup panel is up
-        if (document.body.classList.contains('in-3d')) return;  // nothing to change in 3D
-        if (p.created >= HINT_AFTER_ELEMENTS && p.created < p.max) {
+        if (document.body.classList.contains('in-3d')) return;  // already there
+
+        if (!paletteAttractDone && !paletteAttractShown && paletteFab
+            && p.created >= PALETTE_ATTRACT_AFTER_ELEMENTS && p.created < p.max) {
+          paletteAttractShown = true;
+          paletteFab.classList.add('pulse-attract');
+        }
+        if (!go3dHintShown && modeToggleBtn && !modeToggleBtn.disabled
+            && p.created >= GO3D_HINT_AFTER_ELEMENTS && p.created < p.max) {
+          go3dHintShown = true;
+          showGo3DToast();
+        }
+        if (!hintShown && go3dHintShown && !(go3dToast && go3dToast.classList.contains('show'))
+            && p.created >= HINT_AFTER_ELEMENTS && p.created < p.max) {
           hintShown = true;
           showToast();
         }
@@ -1890,6 +3661,92 @@
 
       // ——— welcome: quick start vs. fine tuning ———
       const welcomeOverlay = document.getElementById('welcome-overlay');
+      // rAF, not immediate - the initial opacity:0 has to actually paint
+      // before adding .show, or the browser can coalesce both style changes
+      // into one frame and skip the transition entirely.
+      requestAnimationFrame(() => {
+        welcomeOverlay.classList.add('show');
+        animateWelcomeIn();
+      });
+
+      // Splits an element's own text into one <span class="word"> per word,
+      // preserving the actual whitespace between them as real text nodes
+      // (not re-inserted via CSS) - each span starts hidden (see .word's
+      // own CSS) so JS can reveal them one at a time. Destructive (replaces
+      // the element's content) - fine here since it only ever runs once,
+      // right as the overlay first appears.
+      function splitIntoWordSpans(el) {
+        if (!el) return [];
+        const text = el.textContent;
+        el.textContent = '';
+        text.split(/(\s+)/).forEach((token) => {
+          if (token === '') return;
+          if (/^\s+$/.test(token)) {
+            el.appendChild(document.createTextNode(token));
+          } else {
+            const span = document.createElement('span');
+            span.className = 'word';
+            span.textContent = token;
+            el.appendChild(span);
+          }
+        });
+        return Array.from(el.querySelectorAll('.word'));
+      }
+      // "Fade in text word by word and button by button" - title, then
+      // subtitle, then each action item (both buttons, the checkbox row,
+      // the hint line) in turn, each step's own delay accumulating onto
+      // the last so the whole thing reads as one continuous reveal.
+      // Called from the SAME rAF as welcomeOverlay's own .show above (not
+      // immediately at parse time) so its timing baseline is "the moment
+      // the browser is actually ready to paint this", the same moment the
+      // overlay itself starts fading in - this page does a lot of
+      // synchronous work right at startup (p5/Babylon setup) that can
+      // block the main thread for a while before that first paint;
+      // starting the clock any earlier meant the whole reveal could
+      // silently finish behind the freeze and the user would only ever
+      // see the final, fully-revealed state the instant the overlay
+      // faded in.
+      //
+      // Staggered via real CSS transition-delay values, not setTimeout -
+      // each element's delay is computed up front and handed to the
+      // browser's own transition scheduling, then every .show class flips
+      // in one immediate synchronous pass; the stagger then lives entirely
+      // in those delay values, immune to whatever the main thread does
+      // afterward (a pile of independent setTimeout callbacks isn't - a
+      // busy thread can let several of them pile up past their due time at
+      // once, so they fire back-to-back the moment it frees up instead of
+      // staying spread out).
+      function animateWelcomeIn() {
+        const WORD_GAP = 65, ITEM_GAP = 150;
+        let delay = 200; // lets the overlay's own fade-in get started first
+        const scheduled = [];
+        splitIntoWordSpans(document.querySelector('#welcome-panel h1')).forEach((w) => {
+          scheduled.push({ el: w, delay });
+          delay += WORD_GAP;
+        });
+        delay += 150; // beat between title and subtitle
+        splitIntoWordSpans(document.querySelector('#welcome-panel .sub')).forEach((w) => {
+          scheduled.push({ el: w, delay });
+          delay += WORD_GAP;
+        });
+        delay += 200; // beat before the actions start appearing
+        document.querySelectorAll('#welcome-actions .fade-item').forEach((item) => {
+          scheduled.push({ el: item, delay });
+          delay += ITEM_GAP;
+        });
+        // One more rAF before applying .show - the word spans above were
+        // just CREATED this tick, so the browser hasn't painted their
+        // starting opacity:0 yet; changing to opacity:1 in that same tick
+        // (no observed "before" frame) collapses the transition into an
+        // instant jump instead of animating it, the same gotcha
+        // welcomeOverlay's own reveal already works around above.
+        requestAnimationFrame(() => {
+          scheduled.forEach(({ el, delay }) => {
+            el.style.transitionDelay = delay + 'ms';
+            el.classList.add('show');
+          });
+        });
+      }
       const randomCb = document.getElementById('welcome-random-cb');
       const pickRandom = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
@@ -1905,7 +3762,7 @@
         return pool.slice(0, 3 + Math.floor(Math.random() * 4));
       }
 
-      // "Get Started": commit a config and get out of the way. The palette is
+      // "Start Now": commit a config and get out of the way. The palette is
       // left unlocked (paletteIndex null = a fresh one per composition), which
       // IS the curated default - it's the untouched classic behaviour, and
       // locking a stranger to one palette on their first visit is the worse
@@ -1919,9 +3776,6 @@
               strut: pickRandom(opts.strut).id
             });
           }
-          if (typeof window.setSpotlightMode === 'function') {
-            window.setSpotlightMode(Math.random() < 0.5);
-          }
         }
         if (typeof window.applyUserSettings === 'function') {
           window.applyUserSettings({
@@ -1932,6 +3786,10 @@
         }
         welcomeOverlay.classList.add('hidden');
         overlay.classList.add('hidden');
+        const controlsEl = document.getElementById('controls');
+        if (controlsEl) controlsEl.classList.add('show');
+        // The 2D screen just appeared for the first time this visit.
+        if (typeof window.triggerFirstCanvasHints === 'function') setTimeout(window.triggerFirstCanvasHints, 400);
       }
 
       document.getElementById('welcome-start')
@@ -1940,15 +3798,6 @@
         welcomeOverlay.classList.add('hidden');
         window.openUserSetup();
       });
-
-      // The front door, reusable: the menu's "New Composition…" comes back
-      // through here rather than dropping a returning user straight into the
-      // three-step wizard.
-      window.openWelcome = function () {
-        if (typeof window.beginUserSetup === 'function') window.beginUserSetup();
-        overlay.classList.add('hidden');
-        welcomeOverlay.classList.remove('hidden');
-      };
 
       renderPalettes(false, false);
       goTo(0);

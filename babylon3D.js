@@ -7,59 +7,415 @@ let babylonEngine = null;
 let babylonScene = null;
 let camera3D = null;
 let is3DMode = false;
+let firstEntry3DHintsShown = false;
+// How many 2D elements existed at the last successful convertShapesTo3D()
+// build (from any source - activate3DMode, setScrambleMode, or a future
+// caller) - null until that first build. activate3DMode compares this
+// against window.getCompositionProgress()'s current count to skip
+// rebuilding (and re-growing every strut) on a 2D->3D->2D->3D round trip
+// that drew nothing new in between; scramble's own rebuild (setScrambleMode)
+// keeps this in sync too, so toggling scramble then leaving and returning
+// to 3D with nothing else changed also correctly reuses the already-
+// scrambled scene instead of rebuilding it back to a fresh unscrambled one.
+let lastBuild3DElementCount = null;
+let gestureDemoGen = 0; // bumped whenever a run is superseded or cancelled
+// The CURRENT run's own cancel closure (playGestureDemo below), so
+// deactivate3DMode can interrupt it too - that cancel only used to be
+// wired to a pointerdown on #babylon-canvas, so leaving 3D mid-demo any
+// OTHER way (the "2D" button) skipped it entirely: the fingers were left
+// frozen at full opacity, hidden only by #gesture-hint's own
+// body:not(.in-3d) display:none, and reappeared exactly where they'd
+// frozen the moment 3D was re-entered.
+let cancelCurrentGestureDemo = null;
+let scrambleAnimGen = 0; // bumped whenever a scramble transition is superseded (rapid re-toggling) or the scene tears down
+let strutGrowthQueue = []; // struts createSolidTube3D built this pass, waiting to be grown in - see animateStrutGrowth
+let strutGrowGen = 0; // bumped whenever a strut-growth run is superseded or cancelled
+let baseRevealGen = 0; // bumped whenever a base-reveal run is superseded or cancelled
 
 // Wait for everything to load
 window.addEventListener('load', () => {
   setTimeout(initBabylon3D, 1000);
 });
 
-function initBabylon3D() {
-  console.log('Initializing Babylon 3D system...');
-  
-  const toggleBtn = document.getElementById('mode-toggle-btn');
-  const instructions = document.getElementById('instructions');
-  
-  if (!toggleBtn || !instructions) {
-    console.error('Mode toggle button or instructions panel not found');
+// requestAnimationFrame tween that hands the CALLER a raw 0-1 t rather than
+// pre-applying an easing curve - camera-linked motion and purely decorative
+// flourishes (a materialize pulse, a turnaround "breathe") want different
+// curves, and forcing one easing on everything is how demos end up feeling
+// generic instead of considered. isActive() is checked every frame; the
+// tween resolves early (without finishing) the moment it goes false - used
+// both for "the user grabbed the camera" and "a newer run superseded this
+// one".
+function tweenRaw(durationMs, isActive, onFrame) {
+  return new Promise((resolve) => {
+    const start = performance.now();
+    function step(now) {
+      if (!isActive()) { resolve(); return; }
+      const t = Math.min(1, (now - start) / durationMs);
+      onFrame(t);
+      if (t < 1) requestAnimationFrame(step); else resolve();
+    }
+    requestAnimationFrame(step);
+  });
+}
+// Smooth, no overshoot - what actually drives the camera, so it arrives
+// rather than wobbles.
+function easeInOutSine(t) { return 0.5 - 0.5 * Math.cos(t * Math.PI); }
+// A touch of overshoot-and-settle - reserved for decoration (materializing,
+// the weight of a hand arriving/lifting), never for the camera itself.
+function easeOutBack(t) {
+  const c1 = 1.70158, c3 = c1 + 1;
+  const p = t - 1;
+  return 1 + c3 * p * p * p + c1 * p * p;
+}
+function setFinger(el, dx, dy, scale, opacity, rotationDeg) {
+  const rot = rotationDeg || 0;
+  // Position first, then rotate/scale - both act around the element's OWN
+  // (already-repositioned) centre, not the pre-translate origin, so the
+  // icon spins and grows in place rather than swinging around the anchor.
+  el.style.transform = `translate(-50%, -50%) translate(${dx}px, ${dy}px) rotate(${rot}deg) scale(${scale})`;
+  el.style.opacity = opacity;
+}
+// fa-hand-pointer's glyph points "up" in its own un-rotated state, i.e.
+// along screen angle -90deg in the dx/dy convention below (0deg = +x/right,
+// positive = clockwise, since screen y grows downward). Rotating it by
+// (angleDeg + 90) turns it to face along angleDeg instead.
+function pointerRotationFor(angleDeg) { return angleDeg + 90; }
+// Interpolates the SHORT way around the circle - without this, animating
+// from e.g. 64deg to 308deg would spin the long way (244deg) instead of the
+// equivalent short hop (-116deg).
+function lerpAngleDeg(fromDeg, toDeg, t) {
+  let delta = (toDeg - fromDeg) % 360;
+  if (delta > 180) delta -= 360;
+  if (delta < -180) delta += 360;
+  return fromDeg + delta * t;
+}
+
+// First-time-in-3D onboarding: fingerprints floating directly over the
+// scene (no panel), driven frame-by-frame from the real camera - true to
+// how the gestures actually work, not just symmetric-looking: ONE finger
+// drags to orbit (a two-finger drag would be wrong - it only takes one),
+// then a second finger joins it for an actual pinch - apart to zoom in,
+// together to zoom out - while the camera really does both in step. Their
+// motion IS the camera's motion, not a separate illustration of it. Used
+// both for the real first entry and for #help-btn, which replays it on
+// demand.
+//
+// The choreography is deliberate rather than a straight there-and-back:
+// fingers materialize with a touch of weight (a slight overshoot as they
+// settle, not a flat fade), each drag eases smoothly with the camera but
+// pauses and "breathes" for a beat at the far end before reversing - the
+// way a real hand rests a moment before pulling back - and the second
+// finger joins for the pinch rather than just appearing.
+// Resolves true if the demo ran to its natural end, false if the user
+// interrupted it (or it never had anything to show) - play3DIntroSequence
+// uses this to decide whether the SECOND half of the same intro (the
+// button-label walkthrough) still gets to run, or whether an interruption
+// here must cancel that too.
+async function playGestureDemo() {
+  if (!camera3D || !is3DMode) return false;
+  const f1 = document.getElementById('gesture-finger-1');
+  const f2 = document.getElementById('gesture-finger-2');
+  const layer = document.getElementById('gesture-hint');
+  if (!f1 || !f2 || !layer) return false;
+
+  // A generation token rather than a plain cancelled flag: a run only ever
+  // touches show/hide and removes its own pointerdown listener if it's
+  // still the CURRENT run when it finishes. Without that check, calling
+  // this twice in quick succession (a double-click on #help-btn) could let
+  // the older run's cleanup hide the newer run's fingers out from under it.
+  const myGen = ++gestureDemoGen;
+  const isCurrent = () => myGen === gestureDemoGen && is3DMode;
+
+  const canvas = document.getElementById('babylon-canvas');
+  let interrupted = false;
+  const cancel = () => {
+    if (myGen !== gestureDemoGen) return;
+    gestureDemoGen++;
+    interrupted = true;
+    // Bumping the generation only stops the tween loop from updating the
+    // fingers further - on its own that left them FROZEN wherever they
+    // happened to be on the interrupting frame, visible indefinitely,
+    // since nothing else was left to fade them out. A real drag means "I'm
+    // taking over now" - dismiss immediately rather than leaving a stuck
+    // ghost of the demo on screen.
+    f1.style.transition = 'opacity 0.2s';
+    f2.style.transition = 'opacity 0.2s';
+    f1.style.opacity = '0';
+    f2.style.opacity = '0';
+  };
+  cancelCurrentGestureDemo = cancel;
+  if (canvas) canvas.addEventListener('pointerdown', cancel, { once: true });
+
+  // Angled rather than axis-aligned, and reaching well past a literal
+  // fingertip-sized nudge, so the swipe and the pinch both read clearly at
+  // a glance instead of looking like a twitch. The two gestures tilt in
+  // different directions so they're visually distinct from each other, not
+  // just two motions along the same line. Each icon is rotated to face
+  // along its own gesture's angle (pointerRotationFor), rather than sitting
+  // upright regardless of where it's actually headed.
+  const ORBIT_ANGLE_DEG = -26;
+  const ORBIT_ANGLE = ORBIT_ANGLE_DEG * Math.PI / 180;
+  const ORBIT_UX = Math.cos(ORBIT_ANGLE), ORBIT_UY = Math.sin(ORBIT_ANGLE);
+  const ORBIT_DIST = 88;
+  // The finger has to swipe in the OPPOSITE direction from camera3D.alpha/
+  // beta's own +ORBIT_UX/+ORBIT_UY increase below - that's just how a real
+  // drag maps to orbit here (verified against real dragging, left alone).
+  // Showing the finger travelling the SAME way as alpha/beta increase was
+  // demonstrating the reverse of what an actual drag needs, even though the
+  // camera motion it played back was itself correct. +180 keeps the icon
+  // pointing the way it's now actually travelling.
+  const ORBIT_ROT = pointerRotationFor(ORBIT_ANGLE_DEG + 180);
+
+  const PINCH_ANGLE_DEG = 38;
+  const PINCH_ANGLE = PINCH_ANGLE_DEG * Math.PI / 180;
+  const PINCH_UX = Math.cos(PINCH_ANGLE), PINCH_UY = Math.sin(PINCH_ANGLE);
+  const PINCH_MIN = 20, PINCH_MAX = 96;
+  // The two pinch fingers point outward, away from each other, along the
+  // same line they're spreading on - f2 along the pinch angle itself, f1
+  // along its exact opposite.
+  const PINCH_ROT_OUT = pointerRotationFor(PINCH_ANGLE_DEG);
+  const PINCH_ROT_IN = pointerRotationFor(PINCH_ANGLE_DEG + 180);
+
+  // Tracks each finger's last-set position so the "breathe" beats - which
+  // pulse scale/opacity only - can hold position steady without needing to
+  // know which phase came before.
+  let pos1 = { dx: 0, dy: 0 }, pos2 = { dx: 0, dy: 0 };
+  const place1 = (dx, dy) => { pos1 = { dx, dy }; };
+  const place2 = (dx, dy) => { pos2 = { dx, dy }; };
+  const materializeFinger = async (el, get, rotationDeg, delayMs) => {
+    if (delayMs > 0) await tweenRaw(delayMs, isCurrent, () => {});
+    await tweenRaw(360, isCurrent, (t) => {
+      const p = get();
+      setFinger(el, p.dx, p.dy, easeOutBack(t), Math.min(1, t * 1.3), rotationDeg);
+    });
+  };
+
+  // MATERIALIZE: just the one finger that's about to do the orbit drag -
+  // the second doesn't exist yet, since orbiting only ever takes one.
+  place1(ORBIT_DIST * ORBIT_UX, ORBIT_DIST * ORBIT_UY);
+  await materializeFinger(f1, () => pos1, ORBIT_ROT, 0);
+  // A beat of stillness before the drag - a hand settling before it moves,
+  // not motion for its own sake.
+  await tweenRaw(160, isCurrent, () => {});
+
+  const startAlpha = camera3D.alpha;
+  const startBeta = camera3D.beta;
+  const startRadius = camera3D.radius;
+  // The swipe is diagonal, not horizontal, so the orbit it drives is split
+  // the same way across both camera axes - alpha (the horizontal orbit)
+  // gets the swipe's ORBIT_UX share, beta (tilting the view up over the top
+  // or down under the bottom) gets its ORBIT_UY share - rather than only
+  // ever spinning flat, which was the actual bug being fixed here: the
+  // demo showed a purely horizontal orbit no matter how the swipe was
+  // angled. Clamped to the camera's own configured tilt limits.
+  const ORBIT_ROT_BUDGET = 0.5;
+  const lowerBeta = camera3D.lowerBetaLimit != null ? camera3D.lowerBetaLimit : 0.05;
+  const upperBeta = camera3D.upperBetaLimit != null ? camera3D.upperBetaLimit : Math.PI - 0.05;
+  const clampBeta = (b) => Math.max(lowerBeta, Math.min(upperBeta, b));
+
+  if (isCurrent()) {
+    // ORBIT: one finger swipes along a diagonal while the camera actually
+    // orbits AND tilts by that same amount, in step - proof it can be
+    // explored from above and below, not just spun flat.
+    await tweenRaw(900, isCurrent, (t) => {
+      const e = easeInOutSine(t);
+      camera3D.alpha = startAlpha + e * ORBIT_ROT_BUDGET * ORBIT_UX;
+      camera3D.beta = clampBeta(startBeta + e * ORBIT_ROT_BUDGET * ORBIT_UY);
+      const d = ORBIT_DIST - e * (2 * ORBIT_DIST);
+      const dx = d * ORBIT_UX, dy = d * ORBIT_UY;
+      place1(dx, dy);
+      setFinger(f1, dx, dy, 1, 1, ORBIT_ROT);
+    });
+    // The turnaround "breathe" - a soft press-and-release right where a
+    // real fingertip would pause before pulling back, position held steady.
+    await tweenRaw(260, isCurrent, (t) => {
+      const s = 1 + 0.08 * Math.sin(t * Math.PI);
+      setFinger(f1, pos1.dx, pos1.dy, s, 1, ORBIT_ROT);
+    });
+    await tweenRaw(900, isCurrent, (t) => {
+      const e = easeInOutSine(t);
+      camera3D.alpha = startAlpha + ORBIT_ROT_BUDGET * ORBIT_UX * (1 - e);
+      camera3D.beta = clampBeta(startBeta + ORBIT_ROT_BUDGET * ORBIT_UY * (1 - e));
+      const d = -ORBIT_DIST + e * (2 * ORBIT_DIST);
+      const dx = d * ORBIT_UX, dy = d * ORBIT_UY;
+      place1(dx, dy);
+      setFinger(f1, dx, dy, 1, 1, ORBIT_ROT);
+    });
+  }
+
+  if (isCurrent()) {
+    // TRANSITION: the orbit finger settles onto one end of the pinch's
+    // diagonal - rotating to face that new direction along the way rather
+    // than snapping - while a second finger materializes at the other end,
+    // already facing outward. One finger becoming two, forming the pair
+    // for an actual pinch rather than it just appearing.
+    const startDx1 = pos1.dx, startDy1 = pos1.dy;
+    const targetDx1 = -PINCH_MIN * PINCH_UX, targetDy1 = -PINCH_MIN * PINCH_UY;
+    place2(PINCH_MIN * PINCH_UX, PINCH_MIN * PINCH_UY);
+    await Promise.all([
+      tweenRaw(320, isCurrent, (t) => {
+        const e = easeInOutSine(t);
+        const dx = startDx1 + (targetDx1 - startDx1) * e;
+        const dy = startDy1 + (targetDy1 - startDy1) * e;
+        const rot = lerpAngleDeg(ORBIT_ROT, PINCH_ROT_IN, e);
+        place1(dx, dy);
+        setFinger(f1, dx, dy, 1, 1, rot);
+      }),
+      (async () => {
+        await tweenRaw(140, isCurrent, () => {});
+        await materializeFinger(f2, () => pos2, PINCH_ROT_OUT, 0);
+      })(),
+    ]);
+  }
+
+  if (isCurrent()) {
+    // PINCH: two fingers spread apart along a diagonal (zoom in) then
+    // pinch back together (zoom out), while the camera actually zooms in
+    // step - the gesture that actually controls zoom, not a stand-in.
+    const lower = camera3D.lowerRadiusLimit || 1;
+    const zoomedRadius = Math.max(startRadius * 0.72, lower);
+    await tweenRaw(700, isCurrent, (t) => {
+      const e = easeInOutSine(t);
+      camera3D.radius = startRadius + (zoomedRadius - startRadius) * e;
+      const d = PINCH_MIN + e * (PINCH_MAX - PINCH_MIN);
+      const dx = d * PINCH_UX, dy = d * PINCH_UY;
+      place1(-dx, -dy);
+      place2(dx, dy);
+      setFinger(f1, -dx, -dy, 1, 1, PINCH_ROT_IN);
+      setFinger(f2, dx, dy, 1, 1, PINCH_ROT_OUT);
+    });
+    await tweenRaw(260, isCurrent, (t) => {
+      const s = 1 + 0.08 * Math.sin(t * Math.PI);
+      setFinger(f1, pos1.dx, pos1.dy, s, 1, PINCH_ROT_IN);
+      setFinger(f2, pos2.dx, pos2.dy, s, 1, PINCH_ROT_OUT);
+    });
+    await tweenRaw(700, isCurrent, (t) => {
+      const e = easeInOutSine(t);
+      camera3D.radius = zoomedRadius + (startRadius - zoomedRadius) * e;
+      const d = PINCH_MAX - e * (PINCH_MAX - PINCH_MIN);
+      const dx = d * PINCH_UX, dy = d * PINCH_UY;
+      place1(-dx, -dy);
+      place2(dx, dy);
+      setFinger(f1, -dx, -dy, 1, 1, PINCH_ROT_IN);
+      setFinger(f2, dx, dy, 1, 1, PINCH_ROT_OUT);
+    });
+  }
+
+  if (isCurrent()) {
+    // DEMATERIALIZE: both fingers lift away with the same weight they
+    // arrived with, staggered so it reads as two hands lifting, not one
+    // shape vanishing.
+    const dematerializeFinger = async (el, get, rotationDeg, delayMs) => {
+      if (delayMs > 0) await tweenRaw(delayMs, isCurrent, () => {});
+      await tweenRaw(320, isCurrent, (t) => {
+        const e = easeInOutSine(t);
+        const p = get();
+        setFinger(el, p.dx, p.dy, 1 - 0.3 * e, 1 - e, rotationDeg);
+      });
+    };
+    await Promise.all([
+      dematerializeFinger(f1, () => pos1, PINCH_ROT_IN, 60),
+      dematerializeFinger(f2, () => pos2, PINCH_ROT_OUT, 0),
+    ]);
+  }
+
+  if (canvas) canvas.removeEventListener('pointerdown', cancel);
+  if (cancelCurrentGestureDemo === cancel) cancelCurrentGestureDemo = null;
+  return !interrupted;
+}
+
+// The button-label walkthrough used to fire on its own independent timer
+// and pile on top of the gesture demo above the bar; this plays them as
+// one sequence instead. Used both for the real first entry (mobile only -
+// isReplay is false/omitted, so it stays gated behind isCoarse the same as
+// it always was; desktop has hover for that) and for #help-btn's replay
+// (isReplay true), which runs on ANY device - someone who explicitly asked
+// to see it again should get it even with a mouse.
+function play3DIntroSequence(isReplay) {
+  const isCoarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  const wantsBarSweep = (isReplay || isCoarse) && typeof window.replayBarPreviews === 'function';
+  // Chained off the ACTUAL end of the finger demo (previously a fixed
+  // 5200ms timer racing independently) - "all elements of the demo must
+  // disappear if it's interrupted" means an interrupted finger demo has to
+  // cancel the button-label walkthrough too, not leave it to fire moments
+  // later as though the user hadn't already grabbed the camera. completed
+  // is false both when the user interrupted it and when there was nothing
+  // to show in the first place (see playGestureDemo's own early returns).
+  playGestureDemo().then((completed) => {
+    if (!completed || !is3DMode || !wantsBarSweep) return;
+    window.replayBarPreviews();
+    // Second half of the same interruption contract: a drag/tap that lands
+    // DURING the label sweep itself (playGestureDemo's own cancel only
+    // covers the finger phase, already finished by now) must cancel it too.
+    const canvas = document.getElementById('babylon-canvas');
+    if (!canvas || typeof window.cancelBarFlash !== 'function') return;
+    const cancelSweep = () => window.cancelBarFlash();
+    canvas.addEventListener('pointerdown', cancelSweep, { once: true });
+    // 1s/button (walkBarPreviews' own STEP_MS) - drop the listener once the
+    // sweep has naturally finished so a later, unrelated tap doesn't call
+    // cancelBarFlash() for no reason.
+    const btnCount = document.querySelectorAll('#bottom-bar button[data-tip]').length;
+    setTimeout(() => canvas.removeEventListener('pointerdown', cancelSweep), (btnCount + 1) * 1000);
+  });
+}
+
+// #help-btn: "show me the messages again", any time. In 3D that's the full
+// intro sequence (ignoring whether it already played once); in 2D it's the
+// same draw demo + button-label walkthrough the canvas shows on its own
+// first appearance (window.triggerFirstCanvasHints, index3D.html), not the
+// palette/3D hint toasts - those are contextual nudges tied to how much has
+// actually been drawn, not a "how does this work" tour.
+window.replayHelp = function () {
+  if (is3DMode) {
+    play3DIntroSequence(true);
     return;
   }
-  
-  // Enable button after drawing starts
-  setTimeout(() => {
-    toggleBtn.disabled = false;
-    console.log('3D mode button enabled');
-  }, 2000);
-  
-  // Instructions fade in briefly, then get out of the way
-  let instructionsTimer = null;
-  const flashInstructions = () => {
-    instructions.classList.add('show');
-    clearTimeout(instructionsTimer);
-    instructionsTimer = setTimeout(() => instructions.classList.remove('show'), 4000);
-  };
-  
+  if (typeof window.triggerFirstCanvasHints === 'function') window.triggerFirstCanvasHints();
+};
+
+function initBabylon3D() {
+  console.log('Initializing Babylon 3D system...');
+
+  const toggleBtn = document.getElementById('mode-toggle-btn');
+
+  if (!toggleBtn) {
+    console.error('Mode toggle button not found');
+    return;
+  }
+
+  // Gated on actually having something to look at - see
+  // window.updateElementCount (index3D.html), which flips toggleBtn's
+  // disabled state live as totalElementsCreated changes (creation, undo,
+  // reset). "At least one shape must be drawn to go into 3D mode."
+
   toggleBtn.addEventListener('click', () => {
+    // Once it's actually been used, it no longer needs to draw the eye.
+    toggleBtn.classList.add('pulse-done');
     if (!is3DMode) {
       activate3DMode();
-      flashInstructions();
     } else {
       deactivate3DMode();
-      instructions.classList.remove('show');
     }
   });
-  
+
   // ESC to exit 3D mode
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && is3DMode) {
       deactivate3DMode();
-      instructions.classList.remove('show');
     }
   });
 }
 
 function activate3DMode() {
   console.log('Activating 3D mode...');
-  
+
+  // The 2D screen's own first-appearance button-label sweep may still be
+  // mid-flight (it can run for several seconds) - without cancelling it
+  // here, a leftover timer from THAT sweep can still land on a button
+  // visible in both modes (fullscreen, help) and flash it over whatever
+  // 3D shows next.
+  if (typeof window.cancelBarFlash === 'function') window.cancelBarFlash();
+
   // Get or create Babylon canvas
   let canvas = document.getElementById('babylon-canvas');
   if (!canvas) {
@@ -70,29 +426,56 @@ function activate3DMode() {
     document.body.appendChild(canvas);
   }
   
-  // Show Babylon canvas, hide P5 canvas
+  // Babylon canvas stays INVISIBLE for now (see the executeWhenReady gate
+  // below, right before is3DMode flips) - only its stacking is set up
+  // here. P5's input is disabled immediately either way (nothing should
+  // still draw new shapes once 3D is on its way in), but its CANVAS stays
+  // up and visible a little longer, so there's a live frame on screen
+  // throughout instead of a blank gap while Babylon gets ready.
+  //
+  // display:block (not the CSS default display:none) + visibility:hidden,
+  // deliberately NOT display:none, despite both looking identical to the
+  // user - display:none removes the canvas from layout entirely, and a
+  // canvas with no layout box reports clientWidth/clientHeight as 0. The
+  // engine's own hardware-scaling-level resize (right below) computes its
+  // target buffer size FROM clientWidth/clientHeight, so hiding it that way
+  // made every resize() during setup compute 0 and silently keep whatever
+  // stale size the canvas already had - permanently undoing the >1x device-
+  // pixel-ratio supersampling this whole block exists to apply, on every
+  // single 3D entry. visibility:hidden keeps the canvas fully painted-out
+  // (and non-interactive) while still occupying real, measurable layout.
   canvas.style.display = 'block';
-  canvas.style.zIndex = '10'; // Put Babylon on top
-  
+  canvas.style.visibility = 'hidden';
+  canvas.style.zIndex = '10'; // Put Babylon on top once it's shown
+
   const p5Canvas = document.querySelector('canvas');
   if (p5Canvas && p5Canvas.id !== 'babylon-canvas') {
-    p5Canvas.style.display = 'none';
     p5Canvas.style.pointerEvents = 'none'; // Disable P5 input
-    console.log('P5 canvas hidden and input disabled');
+    console.log('P5 input disabled');
   }
-  
+
   // Create Babylon engine and scene
   if (!babylonEngine) {
-    // Fill the viewport and render at native device resolution (capped at 2x,
-    // same as the 2D sketch) - without this, phones render at CSS pixels and
-    // the 3D view looks noticeably blurrier than the 2D one
+    // Fill the viewport and render at native device resolution - without
+    // this, phones render at CSS pixels and the 3D view looks noticeably
+    // blurrier than the 2D one. Capped at 3x, not the 2D sketch's own 2x
+    // (that cap is about ITS multiple full-resolution offscreen p5 layers -
+    // finalBgLayer/lineLayer/foregroundLayer/fadeLayer - getting expensive
+    // fast at higher densities, a constraint this single WebGL canvas
+    // doesn't share). Most current phones (the entire iPhone line included)
+    // report devicePixelRatio 3, and a 2x cap there means the actual render
+    // buffer is only 2/3 of the screen's real resolution - the browser then
+    // has to upscale it to fill the physical display, which reads as
+    // legitimately lower-res 3D than the same phone's own 2D view, and
+    // softer than a desktop hitting its own (usually <=2) devicePixelRatio
+    // with room to spare under this cap.
     canvas.style.width = '100%';
     canvas.style.height = '100%';
     babylonEngine = new BABYLON.Engine(canvas, true);
-    babylonEngine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 2));
+    babylonEngine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 3));
     babylonEngine.resize();
     babylonScene = createBabylonScene(canvas);
-    
+
     // Render loop
     babylonEngine.runRenderLoop(() => {
       if (babylonScene && is3DMode) {
@@ -108,9 +491,29 @@ function activate3DMode() {
     });
   }
   
-  // Convert P5 shapes to 3D
-  convertShapesTo3D();
-  
+  // Convert P5 shapes to 3D - but only if there's actually something new
+  // to show. The scene/meshes already persist across a 2D<->3D round trip
+  // (deactivate3DMode only hides the canvas, never disposes anything), so
+  // re-running this unconditionally on every re-entry was throwing away
+  // and rebuilding an identical scene - struts included - purely because
+  // the user looked away and back, not because anything changed. Only a
+  // real change earns a rebuild: nothing built yet (first entry this
+  // visit), or the element count differs from the last build (new shapes
+  // drawn/undone in 2D, or a scramble toggle's own rebuild - see
+  // lastBuild3DElementCount's own comment for why that one's covered too).
+  let currentElementCount = null;
+  if (typeof window.getCompositionProgress === 'function') {
+    try { currentElementCount = window.getCompositionProgress().created; } catch (e) {}
+  }
+  const needsRebuild = lastBuild3DElementCount === null || currentElementCount !== lastBuild3DElementCount;
+  let strutGrowthDone = Promise.resolve();
+  if (needsRebuild) {
+    convertShapesTo3D();
+    strutGrowthDone = animateStrutGrowth(1500);
+  } else {
+    console.log('3D scene unchanged since last build - reusing it as-is, no rebuild');
+  }
+
   // NOTE: the p5 draw loop is intentionally left running (not noLoop()'d)
   // while in 3D. New-shape creation is blocked separately (isUiEvent() in
   // sketchdesktopreset.js bails out of handleDrag() while is3DMode is true),
@@ -127,12 +530,62 @@ function activate3DMode() {
   const toggleBtn = document.getElementById('mode-toggle-btn');
   toggleBtn.textContent = '2D';
   toggleBtn.dataset.tip = 'Back to the canvas'; // hover label tracks what the button now does
-  
+
+  // There's a real mesh to export now - the export button starts disabled
+  // (see isBabylonSceneReady) since there's nothing to export before this.
+  const exportBtn = document.getElementById('export-btn');
+  if (exportBtn && typeof window.isBabylonSceneReady === 'function') {
+    exportBtn.disabled = !window.isBabylonSceneReady();
+  }
+
+  // Only NOW actually reveal the canvas - once every material's shader is
+  // genuinely compiled and every texture ready, not the instant the meshes
+  // exist. Babylon compiles shaders asynchronously (KHR_parallel_shader_
+  // compile): a material with no compiled effect yet simply isn't drawn
+  // for a frame rather than blocking, so showing the canvas immediately
+  // after convertShapesTo3D() meant the render loop's first several frames
+  // could each be missing whichever materials hadn't finished compiling -
+  // cheap unlit skeleton/wire materials first, the heavier lit+shadowed
+  // shape/base materials a beat later once their more complex shaders
+  // caught up. Slow enough on a phone GPU to see as "the skeleton shows,
+  // then the rest fills in ~0.25s later." executeWhenReady is the same
+  // fix already used for the skybox screenshot capture (see
+  // renderSphereBackgroundTo2D) - waiting for it here means the very first
+  // frame the user ever sees already has everything in it, every time this
+  // runs (re-entering 3D rebuilds fresh materials too, not just the first
+  // visit ever).
+  babylonScene.executeWhenReady(() => {
+    canvas.style.visibility = 'visible'; // see the visibility (not display) note above
+    if (p5Canvas && p5Canvas.id !== 'babylon-canvas') p5Canvas.style.display = 'none';
+  });
+
+  // First time 3D actually becomes usable this visit: play the onboarding
+  // sequence (gesture demo, then the button-label sweep). Every later entry
+  // is silent - #help-btn is there if it's wanted again. Waits for the
+  // struts to actually finish drawing themselves in first - starting the
+  // demo while they're still growing meant the gesture animation and the
+  // struts were both fighting for attention on screen at once.
+  if (!firstEntry3DHintsShown) {
+    firstEntry3DHintsShown = true;
+    strutGrowthDone.then(() => play3DIntroSequence());
+  }
+
   console.log('3D mode activated!');
 }
 
 function deactivate3DMode() {
   console.log('Deactivating 3D mode...');
+
+  // Same reasoning as activate3DMode's own call - the 3D sweep might still
+  // be mid-flight if the user backs out quickly.
+  if (typeof window.cancelBarFlash === 'function') window.cancelBarFlash();
+  // And the OTHER half of the same intro - the gesture demo's own cancel
+  // only used to be reachable via a pointerdown on #babylon-canvas, so
+  // backing out through the "2D" button skipped it: the fingers were left
+  // frozen (full opacity, mid-transform) behind #gesture-hint's own
+  // body:not(.in-3d) display:none, then reappeared exactly where they'd
+  // frozen the moment 3D was re-entered.
+  if (cancelCurrentGestureDemo) cancelCurrentGestureDemo();
 
   // Hide Babylon canvas, show P5 canvas
   const canvas = document.getElementById('babylon-canvas');
@@ -154,8 +607,8 @@ function deactivate3DMode() {
   // Update button
   const toggleBtn = document.getElementById('mode-toggle-btn');
   toggleBtn.textContent = '3D';
-  toggleBtn.dataset.tip = 'Explore in 3D';
-  
+  toggleBtn.dataset.tip = '3D View';
+
   console.log('Returned to 2D mode');
 }
 
@@ -463,7 +916,7 @@ function captureP5Background(scene) {
 // Silently render the cube skybox and screenshot it. The 2D sketch uses this
 // screenshot as its background, so entering 3D shows the IDENTICAL background
 // (same skybox, same textures, same camera pose: looking at the front face).
-function renderSphereBackgroundTo2D(targetLayer, bigCanvas, viewW, viewH) {
+function renderSphereBackgroundTo2D(targetLayer, bigCanvas, viewW, viewH, onReady) {
   if (typeof BABYLON === 'undefined') return false;
   try {
     const glCanvas = document.createElement('canvas');
@@ -494,6 +947,7 @@ function renderSphereBackgroundTo2D(targetLayer, bigCanvas, viewW, viewH) {
       targetLayer.drawingContext.drawImage(glCanvas, 0, 0, targetLayer.width, targetLayer.height);
       engine.dispose();
       console.log('2D background updated with skybox screenshot');
+      if (typeof onReady === 'function') onReady();
     });
     return true; // caller draws a flat-crop placeholder until the capture lands
   } catch (e) {
@@ -526,20 +980,174 @@ function rollScrambleQuat() {
     .multiply(BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Y, tilt()));
 }
 window.getScrambleMode = function () { return scrambleMode; };
+
+// Reads a Tier-1 shape's CURRENT orientation - whichever node actually
+// carries it, a contact/scramble tilt's TransformNode if one exists, else
+// the mesh's own plain Rz rotation - as a quaternion regardless of which
+// form it's in, so captureShapeTransforms/animateShapeTransition never have
+// to care which representation a shape happens to be using.
+function shapeOrientationQuat(node) {
+  return node.rotationQuaternion
+    ? node.rotationQuaternion.clone()
+    : BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, node.rotation ? node.rotation.z : 0);
+}
+// Every shape's root node, keyed by index, so a before/after pair from two
+// different convertShapesTo3D() builds can be matched up. create3DShape
+// wraps EVERY shape it creates (Tier-1 volumes and Tier-2 ornaments alike -
+// circle/rect/triangle/semiCircle, concentricCircle/concentricArc, halo,
+// squiggle/arc, open variants) in its own `tilt_${index}` TransformNode
+// unconditionally, so keying off that node name alone finds every shape
+// type's single consistent root - no need to fall back to a `shape_N` mesh
+// name, which several shape types (concentricCircle, halo, ...) never had.
+function shapeRootNodesByIndex() {
+  const out = {};
+  if (!babylonScene) return out;
+  babylonScene.transformNodes.forEach(n => {
+    const match = n.name.match(/^tilt_(\d+)$/);
+    if (!match) return;
+    out[match[1]] = n;
+  });
+  return out;
+}
+// Captures where every Tier-1 shape actually is RIGHT NOW, before a
+// scramble rebuild tears it all down - convertShapesTo3D disposes and
+// recreates every mesh from scratch, so without this there's nothing left
+// to animate FROM once the new (target) meshes exist.
+function captureShapeTransforms() {
+  const roots = shapeRootNodesByIndex();
+  const out = {};
+  Object.keys(roots).forEach(idx => {
+    const root = roots[idx];
+    root.computeWorldMatrix(true);
+    out[idx] = { pos: root.position.clone(), quat: shapeOrientationQuat(root) };
+  });
+  return out;
+}
+// Slides every shape from its captured OLD pose to wherever the just-
+// completed rebuild actually placed it, instead of the rebuild's instant
+// cut. The base and struts have no old pose to animate from (brand new
+// geometry every rebuild) and are handled as their own later steps - see
+// hideBaseAndStrutsImmediately/animateBaseReveal/animateStrutGrowth - kept
+// invisible for the whole span here so nothing scaffolding-related pops in
+// around the still-moving shapes.
+async function animateShapeTransition(oldTransforms, durationMs) {
+  if (!babylonScene) return;
+  const gen = ++scrambleAnimGen;
+  const isActive = () => gen === scrambleAnimGen && !!babylonScene;
+
+  const roots = shapeRootNodesByIndex();
+  const jobs = [];
+  Object.keys(roots).forEach(idx => {
+    const old = oldTransforms[idx];
+    if (!old) return; // a shape that didn't exist in the old state - nothing to animate from, leave it as rebuilt
+    const root = roots[idx];
+    const newQuat = shapeOrientationQuat(root);
+    const newPos = root.position.clone();
+    root.rotationQuaternion = old.quat.clone(); // drives rendering from here on, in place of .rotation - lets both forms interpolate the same way
+    root.position = old.pos.clone();
+    jobs.push({ root, oldQuat: old.quat, newQuat, oldPos: old.pos, newPos });
+  });
+  if (jobs.length === 0) return;
+
+  await tweenRaw(durationMs, isActive, (t) => {
+    const e = easeInOutSine(t);
+    jobs.forEach(({ root, oldQuat, newQuat, oldPos, newPos }) => {
+      BABYLON.Quaternion.SlerpToRef(oldQuat, newQuat, e, root.rotationQuaternion);
+      BABYLON.Vector3.LerpToRef(oldPos, newPos, e, root.position);
+    });
+  });
+  if (!isActive()) return;
+  jobs.forEach(({ root, newQuat, newPos }) => {
+    root.rotationQuaternion = newQuat;
+    root.position = newPos;
+  });
+}
+
+// Every base/connector-dot mesh this rebuild just created, kept together
+// since both the immediate hide and the later reveal always act on the
+// same set.
+function baseRevealMeshes() {
+  if (!babylonScene) return [];
+  // base_solid_*/base_outline_* only - NOT base_strutsupport_*/
+  // base_reinforced_* (the struts, which also happen to start with "base_"
+  // since they land ON it, but are their own separate reveal driven by
+  // primeStrutGrowth/animateStrutGrowth). Sweeping struts into this fade
+  // too meant their tiny primed stubs popped to full opacity right as the
+  // base finished, then immediately started growing - reading as an extra,
+  // unintended stage of its own right next to the base.
+  return babylonScene.meshes.filter(m => /^(base_solid_|base_outline_|conndot_)/.test(m.name) && m.getTotalVertices() > 0);
+}
+
+// Called synchronously right after a rebuild, before the shape-transition
+// tween even starts - the base is brand new geometry every rebuild (no old
+// pose to animate from, like the shapes have), so without this it would
+// just sit there fully visible for the whole time the shapes are still
+// gliding into place. Zeroing it out here means the ONLY thing on screen
+// while shapes move is the shapes themselves; animateBaseReveal (run once
+// they've landed) is the first time it's seen as anything but invisible.
+function hideBaseImmediately() {
+  baseRevealMeshes().forEach(m => { m.visibility = 0; });
+}
+
+// Ramps the base in smoothly once the shapes have finished arriving -
+// "tasteful, no quick jumping around" - a plain opacity fade rather than
+// any position/scale change, since the base doesn't move, it just needs to
+// stop being an instant on/off cut.
+async function animateBaseReveal(durationMs = 500) {
+  if (!babylonScene) return;
+  const gen = ++baseRevealGen;
+  const isActive = () => gen === baseRevealGen && !!babylonScene;
+  const meshes = baseRevealMeshes();
+  if (meshes.length === 0) return;
+  await tweenRaw(durationMs, isActive, (t) => {
+    const e = easeInOutSine(Math.max(0, Math.min(1, t)));
+    meshes.forEach(m => { m.visibility = e; });
+  });
+  if (!isActive()) return;
+  meshes.forEach(m => { m.visibility = 1; });
+}
+
 // Toggling rebuilds the whole 3D scene (convertShapesTo3D already tears down
-// and reconstructs cleanly - it's the same path the 2D->3D toggle uses).
-// Each activation re-rolls the tilts: it is a scramble, not a pose.
+// and reconstructs cleanly - it's the same path the 2D->3D toggle uses),
+// then animates every shape from where it just was to where the rebuild put
+// it, instead of the rebuild's instant cut. Each activation re-rolls the
+// tilts: it is a scramble, not a pose.
 window.setScrambleMode = function (on) {
   scrambleMode = !!on;
-  if (babylonScene) convertShapesTo3D();
+  if (!babylonScene) return;
+  const oldTransforms = captureShapeTransforms();
+  // preserveCamera: a scramble rebuilds every mesh from scratch, but the
+  // user's own orbit/zoom into the composition shouldn't be thrown away
+  // along with it - only the very first 2D->3D entry (activate3DMode)
+  // wants the auto-fit that recentres and re-frames the camera.
+  convertShapesTo3D(true);
+  // Three sequential steps, each waiting for the last to actually finish -
+  // "calculate the final positions, draw the base in tastefully, then
+  // reveal the struts bottom-to-top" - rather than everything new this
+  // rebuild made (base + struts, neither of which has an old pose to
+  // animate from) just sitting fully built the instant convertShapesTo3D
+  // returns. Both are zeroed out synchronously right here, before the
+  // shape-transition tween below even starts, so the ONLY thing visible
+  // while shapes are still gliding into place is the shapes themselves.
+  primeStrutGrowth();
+  hideBaseImmediately();
+  animateShapeTransition(oldTransforms, 600)
+    .then(() => animateBaseReveal(500))
+    .then(() => animateStrutGrowth(1500));
 };
 
-function convertShapesTo3D() {
+function convertShapesTo3D(preserveCamera) {
   if (!babylonScene) {
     console.error('Babylon scene not ready');
     return;
   }
-  
+  // Recorded here (not at each individual call site) so every real build -
+  // activate3DMode's own, setScrambleMode's, or any future caller - keeps
+  // this in sync the same way. See lastBuild3DElementCount's own comment.
+  if (typeof window.getCompositionProgress === 'function') {
+    try { lastBuild3DElementCount = window.getCompositionProgress().created; } catch (e) {}
+  }
+
   console.log('Converting shapes to 3D...');
   console.log('Window object keys:', Object.keys(window).filter(k => k.includes('skeleton') || k.includes('ornament') || k.includes('line')));
   
@@ -561,13 +1169,31 @@ function convertShapesTo3D() {
   // accumulate as orphaned nodes every time this function re-runs.
   const tiltNodesToRemove = babylonScene.transformNodes.filter(n => /^tilt_/.test(n.name));
   tiltNodesToRemove.forEach(node => node.dispose());
+  // Every strut this build creates registers itself here (see
+  // createSolidTube3D) so animateStrutGrowth can grow them all in from the
+  // base afterward - a fresh build discards whatever a previous,
+  // never-consumed queue still held (e.g. a rebuild triggered before the
+  // last one's growth animation ran).
+  strutGrowthQueue = [];
+  // Bumped HERE, not just inside the next animateStrutGrowth() call - a
+  // PREVIOUS build's growth tween can still be mid-flight (its own 1500ms
+  // RAF loop, running off entries captured in a local variable, not this
+  // queue) when a rebuild disposes the very tube meshes it's updating each
+  // frame. That tween's isActive() check only looks at strutGrowGen, so
+  // without bumping it right here - before the dispose() calls below run -
+  // there's a window where the stale gen still matches and the tween's
+  // next frame calls BABYLON.MeshBuilder.CreateTube(..., {instance: tube})
+  // on an already-disposed tube, throwing deep in Babylon's internals
+  // ("Cannot set properties of null"). Invalidating it before disposal
+  // closes that window instead of just narrowing it.
+  strutGrowGen++;
   // The base/strut materials just went with their meshes above - drop the
   // cached handles and the live-swap registries so this build makes new ones.
   resetSculptureMaterialRegistry();
   // Lights must exist before the first render of the materials built below -
   // a lit material with no lights in the scene renders black. Both calls are
   // idempotent, so re-entering 3D mode just re-asserts them.
-  if (spotlightMode) buildSpotlightRig();
+  buildLightRig();
   syncSpotlightEnvironment();
   
   // Get shapes from P5 sketch - try multiple ways
@@ -667,7 +1293,7 @@ function convertShapesTo3D() {
   });
   ornaments.forEach((shape, i) => {
     const rad = shapeVolumeRadius3D(shape);
-    if (!rad) return; // halo/concentricArc/squiggle/arc - Tier 2, handled below
+    if (!rad) return; // squiggle/arc - Tier 2, handled below (halo/concentricArc are real volume now, full Tier-1)
     const { x, y } = projectXY3D(shape);
     const node = { key: `ornament ${i}`, globalIndex: globalIndex++, origX: x, origY: y, r: rad.r, zOffset: rad.zOffset, ...tier1ShapeFields(shape, rad) };
     ornamentNodeFor[i] = node;
@@ -753,7 +1379,7 @@ function convertShapesTo3D() {
   if (baseNode) createBaseMesh3D(baseNode);
 
   // ===== Gravitational analysis: every element's real-world position + mass
-  // (resin shapes/lattices, metal skeleton, heavy wood base), gathered as
+  // (acrylic shapes/lattices, metal skeleton, heavy wood base), gathered as
   // meshes are created below so the entries always match what's actually
   // rendered - used after everything is placed to check whether the
   // sculpture would genuinely stand freestanding, and add a real support
@@ -811,6 +1437,11 @@ function convertShapesTo3D() {
   // point cantilevers its whole sweep off a single weld, which isn't
   // credible support ("colored arcs are not being supported").
   const arcEndSupports = [];
+  // Same idea, for line/bezier/spiral/arcline connectors whose anchor point
+  // got pushed off its target by raiseDeltaAboveFloor's floor-clearance
+  // shift (see FLOOR_RAISE_BREAKS_TOUCH and Pass 8b below) - queued by
+  // realizeConnector, given a thin rod of their own alongside arcEndSupports.
+  const connectorSupports = [];
 
   ornaments.forEach((shape, i) => {
     const node = ornamentNodeFor[i];
@@ -848,7 +1479,7 @@ function convertShapesTo3D() {
       // nothing real actually holding it up ("unsupported bullseye with
       // halo"). squiggle/arcShape ARE real wire elements and still count.
       if (anchorTarget && skeletonKind !== 'halo') skeletonConnectedNodes.add(anchorTarget);
-      // Tier-1 ornaments were already weighed with tier1Nodes above (resin);
+      // Tier-1 ornaments were already weighed with tier1Nodes above (acrylic);
       // Tier-2 (no real volume) is "line based" per the user's framing - weigh
       // it as thin metal at its own anchor point instead.
       if (!node && skeletonKind && markerPoint) {
@@ -974,6 +1605,15 @@ function convertShapesTo3D() {
     if (success && anchor && anchor.stringTargetNodes) {
       anchor.stringTargetNodes.forEach(n => skeletonConnectedNodes.add(n));
     }
+    // The floor-clearance raise pushed this connector's anchor off its
+    // target's surface (see FLOOR_RAISE_BREAKS_TOUCH) - the target shape
+    // still gets real support elsewhere (targetNode was withheld above so
+    // Pass 3's closure loop catches it), but the connector itself is now
+    // just as stranded as an unsupported arc far end. Queue it for the
+    // same thin-rod treatment (Pass 8b, alongside arcEndSupports).
+    if (success && anchor && anchor.strandedAnchorWorld) {
+      connectorSupports.push({ point: anchor.strandedAnchorWorld });
+    }
     if (success) {
       const pos = anchor && anchor.primaryAnchorWorld ? anchor.primaryAnchorWorld : { x: 0, y: 0, z: -layerZ };
       massEntries.push({ x: pos.x, y: pos.y, z: pos.z, mass: connectorMass(kind, el) });
@@ -1039,35 +1679,35 @@ function convertShapesTo3D() {
   // "These are all solid objects... they can't [pass through each other]...
   // they must be fastened to each other on the surface." EVERY aux support
   // in this file routes through this one function now, not just one pass -
-  // tries the direct line first, and if that would clip through some OTHER
-  // Tier-1 shape's volume along the way, bends through a waypoint pushed
-  // further back (away from the denser front of the piece) until both
-  // segments are clear, escalating over a bounded search. Falls back to
-  // the direct line only if nothing clear turns up at all (still real
-  // bracing, just not guaranteed obstruction-free in that rare case) -
-  // draws whichever path it settles on as 1-2 real tube segments.
-  // `grounded`: does this strut actually land on the BASE? Only the ones
-  // that do are the piece's real metalwork and take the chosen strut
-  // material - "only struts coming up from the base should be metallic or
-  // clear". Everything else is a shape-to-shape brace and is always black,
-  // whatever the material picker says. Passed down per STRUT rather than per
-  // segment, so a strut that has to bend around an obstruction still draws
-  // both of its segments as one consistent rod.
-  const drawClearStrut = (name, pA, pB, width, radiusCap, grounded, ...exclude) => {
-    let path = [pA, pB];
-    if (!segmentClearOfShapes(pA, pB, ...exclude)) {
-      const pushStep = Math.max(baseNode ? baseNode.zHalf : 1, 1);
-      for (let k = 1; k <= 12; k++) {
-        const waypoint = { x: pA.x, y: pA.y, z: Math.max(pA.z, pB.z) + pushStep * k };
-        if (segmentClearOfShapes(pA, waypoint, ...exclude) && segmentClearOfShapes(waypoint, pB, ...exclude)) {
-          path = [pA, waypoint, pB];
-          break;
-        }
-      }
+  // always draws pA-pB as a single straight rod. A strut that bends around
+  // an obstruction reads as a kinked, mechanical-looking piece of scaffolding
+  // rather than a real support - a caller with any real freedom over WHERE
+  // it attaches (the reinforced-bracing legs/diagonal below, via
+  // pickClearAngle) should pick a genuinely clear straight line instead of
+  // ever asking this to bend one. `grounded`: does this strut actually land
+  // on the BASE? Only the ones that do are the piece's real metalwork and
+  // take the chosen strut material - "only struts coming up from the base
+  // should be metallic or clear". Everything else is a shape-to-shape brace
+  // and is always black, whatever the material picker says.
+  const drawClearStrut = (name, pA, pB, width, radiusCap, grounded) => {
+    createSolidTube3D(name, pA, pB, width, radiusCap, grounded);
+  };
+  // For a strut with real directional freedom (the reinforced tripod legs
+  // and back-face diagonal below): try the ideal angle first, then a
+  // widening fan of offsets to either side, and draw whichever candidate's
+  // straight line is actually clear of every other Tier-1 shape - "pick a
+  // better angle to avoid other shapes," not bend the strut once it's
+  // already aimed. Falls back to the ideal angle's own line if nothing in
+  // the fan clears (still real bracing, just not guaranteed obstruction-free
+  // in that rare case, same as any other strut here).
+  const ANGLE_FAN_DEG = [0, 20, -20, 40, -40, 60, -60, 90, -90, 120, -120, 150, -150, 180];
+  const pickClearAngle = (idealAngle, makePoints, exclude, fanDeg = ANGLE_FAN_DEG) => {
+    for (const offDeg of fanDeg) {
+      const angle = idealAngle + offDeg * Math.PI / 180;
+      const { pA, pB } = makePoints(angle);
+      if (segmentClearOfShapes(pA, pB, ...exclude)) return { pA, pB };
     }
-    for (let seg = 0; seg < path.length - 1; seg++) {
-      createSolidTube3D(`${name}_${seg}`, path[seg], path[seg + 1], width, radiusCap, grounded);
-    }
+    return makePoints(idealAngle);
   };
 
   if (baseNode) {
@@ -1094,6 +1734,14 @@ function convertShapesTo3D() {
       const localZ = Math.max(-baseAnchor.halfD, Math.min(baseAnchor.halfD, z - baseCenterXZ.z));
       return { x: baseCenterXZ.x + localX, y: baseTopY, z: baseCenterXZ.z + localZ };
     };
+    // A strut with real vertical drop can afford the sideways reach the
+    // margin clamp above sometimes needs (see baseAttachPoint) - a LOW
+    // shape can't: the same horizontal offset, spread over almost no
+    // vertical distance, reads as an extreme, near-horizontal lean rather
+    // than a support leg - "it needs to be straight up and down." Past this
+    // angle from vertical, going straight down under the shape (ignoring
+    // the margin clamp) wins over staying off the margin.
+    const MAX_STRUT_ANGLE_FROM_VERTICAL = 30 * Math.PI / 180;
 
     const drawBaseStrut = (n, name, width = 2) => {
       // Lattices never get a direct-to-base connection, from ANY pass that
@@ -1105,8 +1753,13 @@ function convertShapesTo3D() {
       const wz = tier1WorldCenter(n).z;
       const lowestY = n.y - semiCircleAwareDistance(n, DOWN);
       const shapePoint = { x: n.x, y: lowestY, z: wz };
-      const basePoint = baseAttachPoint(n.x, wz);
-      drawClearStrut(`base_strutsupport_${name}`, shapePoint, basePoint, width, strutRadiusCap(n), true, n);
+      let basePoint = baseAttachPoint(n.x, wz);
+      const drop = shapePoint.y - basePoint.y; // negative/zero is degenerate (shape at or below the base top) - Math.max below guards it
+      const horizOffset = Math.hypot(basePoint.x - shapePoint.x, basePoint.z - shapePoint.z);
+      if (horizOffset > 1e-6 && Math.atan2(horizOffset, Math.max(drop, 0.01)) > MAX_STRUT_ANGLE_FROM_VERTICAL) {
+        basePoint = { x: shapePoint.x, y: basePoint.y, z: shapePoint.z };
+      }
+      drawClearStrut(`base_strutsupport_${name}`, shapePoint, basePoint, width, strutRadiusCap(n), true);
       markConnectionPoint(`conndot_basesupport_shape_${name}`, shapePoint, AUX_SUPPORT_HEAD_RADIUS);
       markConnectionPoint(`conndot_basesupport_base_${name}`, basePoint, AUX_SUPPORT_HEAD_RADIUS);
       connected.add(n);
@@ -1134,7 +1787,7 @@ function convertShapesTo3D() {
       const distB = semiCircleAwareDistance(b, { x: -dir.x, y: -dir.y, z: -dir.z });
       const pA = { x: ca.x + dir.x * distA, y: ca.y + dir.y * distA, z: ca.z + dir.z * distA };
       const pB = { x: cb.x - dir.x * distB, y: cb.y - dir.y * distB, z: cb.z - dir.z * distB };
-      drawClearStrut(`base_strutsupport_${name}`, pA, pB, width, Math.min(strutRadiusCap(a), strutRadiusCap(b)), false, a, b);
+      drawClearStrut(`base_strutsupport_${name}`, pA, pB, width, Math.min(strutRadiusCap(a), strutRadiusCap(b)), false);
       markConnectionPoint(`conndot_basesupport_a_${name}`, pA, AUX_SUPPORT_HEAD_RADIUS);
       markConnectionPoint(`conndot_basesupport_b_${name}`, pB, AUX_SUPPORT_HEAD_RADIUS);
       connected.add(a); connected.add(b);
@@ -1295,47 +1948,101 @@ function convertShapesTo3D() {
       const shapeCenter = { x: n.x, y: n.y, z: wz };
       const heightAbove = n.y - baseTopY;
       const legSpread = Math.min(Math.max(n.r * 0.5, 2), Math.max(heightAbove * 0.35, 1.5));
-      for (let li = 0; li < TRIPOD_LEG_COUNT; li++) {
-        const azimuth = (li / TRIPOD_LEG_COUNT) * Math.PI * 2;
-        const aimX = n.x + Math.cos(azimuth) * legSpread;
-        const aimZ = wz + Math.sin(azimuth) * legSpread;
-        const legBasePoint = baseAttachPoint(aimX, aimZ);
+      // Where this leg lands on the base is what has freedom - swing THAT
+      // around the shape (fanning legSpread out at a different azimuth)
+      // until the resulting straight line actually clears every other
+      // Tier-1 shape, rather than accepting the ideal azimuth's line and
+      // bending it later.
+      const makeLegPoints = (azimuth, spreadFrac = 1) => {
+        const spread = legSpread * spreadFrac;
+        const aimX = n.x + Math.cos(azimuth) * spread;
+        const aimZ = wz + Math.sin(azimuth) * spread;
+        let legBasePoint = baseAttachPoint(aimX, aimZ);
+        // Same guard as drawBaseStrut's own MAX_STRUT_ANGLE_FROM_VERTICAL
+        // check - baseAttachPoint's margin clamp can push the landing point
+        // well away from the leg's own (aimX, aimZ) when the shape sits low
+        // and near the base's edge, turning a short foot into a near-
+        // horizontal lean. Drop the clamped landing and go straight down
+        // from the aim point instead once that lean gets too extreme.
+        const preClampHoriz = Math.hypot(legBasePoint.x - aimX, legBasePoint.z - aimZ);
+        const preClampDrop = shapeCenter.y - legBasePoint.y;
+        if (preClampHoriz > 1e-6 && Math.atan2(preClampHoriz, Math.max(preClampDrop, 0.01)) > MAX_STRUT_ANGLE_FROM_VERTICAL) {
+          legBasePoint = { x: aimX, y: legBasePoint.y, z: aimZ };
+        }
         const dx = legBasePoint.x - shapeCenter.x, dy = legBasePoint.y - shapeCenter.y, dz = legBasePoint.z - shapeCenter.z;
         const dlen = Math.hypot(dx, dy, dz) || 1;
         const dir = { x: dx / dlen, y: dy / dlen, z: dz / dlen };
         const exitDist = semiCircleAwareDistance(n, dir);
         const legTopPoint = { x: shapeCenter.x + dir.x * exitDist, y: shapeCenter.y + dir.y * exitDist, z: shapeCenter.z + dir.z * exitDist };
-        drawClearStrut(`base_reinforced_leg_${ni}_${li}`, legTopPoint, legBasePoint, 3, strutRadiusCap(n), true, n);
+        return { pA: legTopPoint, pB: legBasePoint };
+      };
+      // A leg's whole point is to land on ITS OWN side of the shape (left
+      // foot to the left, right foot to the right) - swinging its azimuth
+      // to dodge a neighbor can end up aiming at a completely unrelated
+      // side of the base ("shooting out to the front" instead of staying
+      // left), which pickClearAngle's wide-open fan doesn't know to avoid.
+      // Try shrinking the SIDEWAYS spread first, at the true ideal azimuth
+      // (still the shape's own left/right, just less far out) - a straight
+      // drop under the shape's own center is the one direction guaranteed
+      // not to require dodging a neighbor, since that's the shape's own
+      // footprint. Only if even that's blocked (the shape is genuinely
+      // overlapping something else) does the angle fan get to run, same as
+      // any other pickClearAngle call.
+      const LEG_SPREAD_SHRINK = [1, 0.6, 0.3, 0];
+      const pickLegPoints = (idealAzimuth) => {
+        for (const frac of LEG_SPREAD_SHRINK) {
+          const candidate = makeLegPoints(idealAzimuth, frac);
+          if (segmentClearOfShapes(candidate.pA, candidate.pB, n)) return candidate;
+        }
+        return pickClearAngle(idealAzimuth, makeLegPoints, [n]);
+      };
+      for (let li = 0; li < TRIPOD_LEG_COUNT; li++) {
+        const idealAzimuth = (li / TRIPOD_LEG_COUNT) * Math.PI * 2;
+        const { pA: legTopPoint, pB: legBasePoint } = pickLegPoints(idealAzimuth);
+        drawClearStrut(`base_reinforced_leg_${ni}_${li}`, legTopPoint, legBasePoint, 3, strutRadiusCap(n), true);
         markConnectionPoint(`conndot_reinforced_leg_shape_${ni}_${li}`, legTopPoint, AUX_SUPPORT_HEAD_RADIUS);
         markConnectionPoint(`conndot_reinforced_leg_base_${ni}_${li}`, legBasePoint, AUX_SUPPORT_HEAD_RADIUS);
       }
-      const toShapeX = n.x - baseCenterXZ.x, toShapeZ = wz - baseCenterXZ.z;
-      const toShapeLen = Math.hypot(toShapeX, toShapeZ) || 1;
-      // baseAttachPoint already clamps into the safe anchor rectangle (never
-      // the bevel, never its 1" margin) - aim toward the shape and let it
-      // clamp, rather than hand-rolling a separate (unsafe) radius here.
-      const diagBasePoint = baseAttachPoint(
-        baseCenterXZ.x + (toShapeX / toShapeLen) * baseNode.r,
-        baseCenterXZ.z + (toShapeZ / toShapeLen) * baseNode.r
-      );
-      // Diagonal face brace: rotates ONLY about the X axis - X stays locked
-      // at 0 (never sways to a side face, which read as "pointless" since a
-      // side attachment does nothing to resist front/back tipping), while Y
-      // and Z vary freely so the brace can angle up or down toward wherever
-      // the base attachment actually sits instead of a fixed flat 90-degree
-      // offset. Z is floored just above 0 so it always stays on the BACK
-      // face, never swinging to the front.
-      const rawY = diagBasePoint.y - n.y, rawZ = Math.max(0.05, diagBasePoint.z - wz);
-      const rawLen = Math.hypot(rawY, rawZ) || 1;
-      const faceDir = { x: 0, y: rawY / rawLen, z: rawZ / rawLen };
-      const faceDist = semiCircleAwareDistance(n, faceDir);
-      const facePoint = { x: n.x, y: n.y + faceDir.y * faceDist, z: wz + faceDir.z * faceDist };
+      const idealBaseAngle = Math.atan2(wz - baseCenterXZ.z, n.x - baseCenterXZ.x);
       // A straight line from the back face to the base can still cut through
       // some OTHER shape sitting behind/beside this one - "supports from the
       // back diagonally, and doesn't go through any other shape behind it."
-      // Doesn't need to be a fixed angle - drawClearStrut bends it through an
-      // intermediate waypoint if the direct path isn't clear.
-      drawClearStrut(`base_reinforced_diag_${ni}`, facePoint, diagBasePoint, 3, strutRadiusCap(n), true, n);
+      // Where it lands on the base rim is what has freedom (swung around
+      // idealBaseAngle by pickClearAngle below) until the line actually
+      // clears, rather than accepting the ideal line and bending it later.
+      // baseAttachPoint already clamps into the safe anchor rectangle (never
+      // the bevel, never its 1" margin), so any rim angle lands somewhere
+      // genuinely safe to touch.
+      const makeDiagPoints = (baseAngle) => {
+        const diagBasePoint = baseAttachPoint(
+          baseCenterXZ.x + Math.cos(baseAngle) * baseNode.r,
+          baseCenterXZ.z + Math.sin(baseAngle) * baseNode.r
+        );
+        // Rotates ONLY about the X axis - X stays locked at 0 (never sways
+        // to a side face, which read as "pointless" since a side attachment
+        // does nothing to resist front/back tipping), while Y and Z vary
+        // freely so the brace can angle up or down toward wherever the base
+        // attachment actually sits. Z is floored just above 0 so it always
+        // stays on the BACK face, never swinging to the front.
+        const rawY = diagBasePoint.y - n.y, rawZ = Math.max(0.05, diagBasePoint.z - wz);
+        const rawLen = Math.hypot(rawY, rawZ) || 1;
+        const faceDir = { x: 0, y: rawY / rawLen, z: rawZ / rawLen };
+        const faceDist = semiCircleAwareDistance(n, faceDir);
+        const facePoint = { x: n.x, y: n.y + faceDir.y * faceDist, z: wz + faceDir.z * faceDist };
+        return { pA: facePoint, pB: diagBasePoint };
+      };
+      // Capped narrower than the shared ANGLE_FAN_DEG (which runs all the
+      // way to 180): the diagonal's whole point is bracing in THIS shape's
+      // own outward direction ("a diagonal support from behind to back
+      // face... in the shape's own direction") - a swing past ~45 degrees
+      // to dodge an obstruction lands on a genuinely different part of the
+      // base rim, reading as a strut aimed at nothing in particular rather
+      // than a brace for this shape. Past that point, landing back on the
+      // unmodified ideal line (even if it isn't perfectly obstruction-free)
+      // still looks and behaves like a real brace; a wide swing didn't.
+      const DIAG_ANGLE_FAN_DEG = [0, 20, -20, 40, -40];
+      const { pA: facePoint, pB: diagBasePoint } = pickClearAngle(idealBaseAngle, makeDiagPoints, [n], DIAG_ANGLE_FAN_DEG);
+      drawClearStrut(`base_reinforced_diag_${ni}`, facePoint, diagBasePoint, 3, strutRadiusCap(n), true);
       markConnectionPoint(`conndot_reinforced_diag_shape_${ni}`, facePoint, AUX_SUPPORT_HEAD_RADIUS);
       markConnectionPoint(`conndot_reinforced_diag_base_${ni}`, diagBasePoint, AUX_SUPPORT_HEAD_RADIUS);
       connected.add(n);
@@ -1451,7 +2158,7 @@ function convertShapesTo3D() {
           const p = { x: pA.x + (end.x - pA.x) * t, y: nWc.y, z: pA.z + (end.z - pA.z) * t };
           if (pointInsideTier1Volume(p, target)) { pB = p; break; }
         }
-        drawClearStrut(`base_strutsupport_latticebrace_${ni}`, pA, pB, 3, Math.min(strutRadiusCap(n), strutRadiusCap(target)), false, n, target);
+        drawClearStrut(`base_strutsupport_latticebrace_${ni}`, pA, pB, 3, Math.min(strutRadiusCap(n), strutRadiusCap(target)), false);
         markConnectionPoint(`conndot_latticebrace_a_${ni}`, pA, AUX_SUPPORT_HEAD_RADIUS);
         markConnectionPoint(`conndot_latticebrace_b_${ni}`, pB, AUX_SUPPORT_HEAD_RADIUS);
         connected.add(n); connected.add(target);
@@ -1481,14 +2188,13 @@ function convertShapesTo3D() {
     });
     if (latticeBraceCount > 0) console.log(`🦯 ${latticeBraceCount} horizontal lattice brace(s) - lattices float, held only by a level brace to a shape behind them, never a direct base connection`);
 
-    // Pass 8 (colored-arc far ends): each shape-type arc ornament is
-    // fastened to a shape at exactly ONE point - give its queued far end
-    // (see arcEndSupports) a THIN rod to the nearest real material: the
-    // closest shape surface, or straight down to the base when that's
-    // nearer. Skipped when the far end already rests against something.
-    let arcEndCount = 0;
-    arcEndSupports.forEach((sup, si) => {
-      const p = sup.point;
+    // Shared by Pass 8 (colored-arc far ends) and Pass 8b (stranded
+    // connector anchors, below): give a single stray point a THIN rod to
+    // the nearest real material - the closest shape surface, or straight
+    // down to the base when that's nearer. No-ops when the point already
+    // rests against something. `name` feeds both the strut and its
+    // connection-dot mesh names, so callers must pass something unique.
+    const supportStrandedPoint = (p, name) => {
       let best = null, bestGap = Infinity, bestTouch = null;
       tier1Nodes.forEach(nd => {
         if (nd.isBase) return;
@@ -1504,38 +2210,72 @@ function convertShapesTo3D() {
           bestTouch = { x: wc.x + dir.x * sd, y: wc.y + dir.y * sd, z: wc.z + dir.z * sd };
         }
       });
-      if (bestGap < 0.5) return; // already effectively resting on real material
-      const basePoint = baseAttachPoint(p.x, p.z);
+      if (bestGap < 0.5) return false; // already effectively resting on real material
+      let basePoint = baseAttachPoint(p.x, p.z);
+      // Same "straight up and down, not a shallow lean" rule as
+      // drawBaseStrut's identical margin-clamp fix above - only relevant
+      // to THIS fallback branch (straight to base); the useShape branch
+      // below is deliberately free to reach sideways to a nearby shape.
+      {
+        const drop = p.y - basePoint.y;
+        const horizOffset = Math.hypot(basePoint.x - p.x, basePoint.z - p.z);
+        if (horizOffset > 1e-6 && Math.atan2(horizOffset, Math.max(drop, 0.01)) > MAX_STRUT_ANGLE_FROM_VERTICAL) {
+          basePoint = { x: p.x, y: basePoint.y, z: p.z };
+        }
+      }
       const dropLen = Math.hypot(p.x - basePoint.x, p.y - basePoint.y, p.z - basePoint.z);
       // ALWAYS connect. An earlier version only drew this rod when it could
       // be short (to stop struts crossing the composition) and skipped it
-      // otherwise - but "otherwise" is exactly the case of an arc sweeping
-      // far out from the cluster, which is precisely the one that reads as
-      // floating with nothing holding it. A long sweeping arc welded at a
-      // single point is the LEAST self-supporting element in the piece, not
-      // the most. Length now governs only how the rod is drawn, never
-      // whether it exists: the shorter of (nearest shape surface, base) is
-      // chosen, drawClearStrut bends it around anything in the way, and the
-      // rod stays hair-thin (0.15 cap) so even a long one reads as a fine
-      // wire rather than scaffolding.
+      // otherwise - but "otherwise" is exactly the case of an arc/connector
+      // sweeping far out from the cluster, which is precisely the one that
+      // reads as floating with nothing holding it. A long sweeping arc
+      // welded at a single point is the LEAST self-supporting element in
+      // the piece, not the most. Length now governs only how the rod is
+      // drawn, never whether it exists: the shorter of (nearest shape
+      // surface, base) is chosen, drawClearStrut bends it around anything
+      // in the way, and the rod stays hair-thin (0.15 cap) so even a long
+      // one reads as a fine wire rather than scaffolding.
       const useShape = best && bestGap <= dropLen;
       if (useShape) {
-        drawClearStrut(`base_strutsupport_arcend_${si}`, p, bestTouch, 1.5, 0.15, false, best);
-        markConnectionPoint(`conndot_arcend_${si}`, bestTouch, AUX_SUPPORT_HEAD_RADIUS * 0.6);
+        drawClearStrut(`base_strutsupport_${name}`, p, bestTouch, 1.5, 0.15, false);
+        markConnectionPoint(`conndot_${name}`, bestTouch, AUX_SUPPORT_HEAD_RADIUS * 0.6);
       } else {
-        drawClearStrut(`base_strutsupport_arcend_${si}`, p, basePoint, 1.5, 0.15, true);
-        markConnectionPoint(`conndot_arcend_${si}`, basePoint, AUX_SUPPORT_HEAD_RADIUS * 0.6);
+        drawClearStrut(`base_strutsupport_${name}`, p, basePoint, 1.5, 0.15, true);
+        markConnectionPoint(`conndot_${name}`, basePoint, AUX_SUPPORT_HEAD_RADIUS * 0.6);
       }
-      arcEndCount++;
+      return true;
+    };
+
+    // Pass 8 (colored-arc far ends): each shape-type arc ornament is
+    // fastened to a shape at exactly ONE point - give its queued far end
+    // (see arcEndSupports) its own thin rod via supportStrandedPoint above.
+    let arcEndCount = 0;
+    arcEndSupports.forEach((sup, si) => {
+      if (supportStrandedPoint(sup.point, `arcend_${si}`)) arcEndCount++;
     });
     if (arcEndCount > 0) console.log(`🦯 ${arcEndCount} colored-arc far end(s) given a thin support rod - a single-point weld can't credibly hold a full sweep`);
+
+    // Pass 8b (stranded connector anchors): a line/bezier/spiral/arcline's
+    // anchor point is normally ON the target shape's surface by
+    // construction (computeConnectorAnchor slides the whole curve so one
+    // point touches it) - but raiseDeltaAboveFloor can shift that same
+    // point away from the surface to keep the connector's far reaches
+    // clear of the base (see FLOOR_RAISE_BREAKS_TOUCH), leaving the
+    // connector itself dangling even though the TARGET shape it aimed for
+    // still gets its own real support elsewhere. Same fix as arcEndSupports
+    // above, just for connectors instead of arc ornaments.
+    let connectorStrandedCount = 0;
+    connectorSupports.forEach((sup, si) => {
+      if (supportStrandedPoint(sup.point, `connanchor_${si}`)) connectorStrandedCount++;
+    });
+    if (connectorStrandedCount > 0) console.log(`🦯 ${connectorStrandedCount} connector(s) (line/bezier/spiral/arcline) whose anchor got pushed off its target by the floor-clearance raise, given their own thin support rod`);
 
     console.log(`🦯 ${strutCount} support strut(s) drawn - ${connected.size}/${tier1Nodes.length} Tier-1 elements now physically connected into one structure rooted at the base`);
   }
 
   // ===== Gravitational stability check: this is meant to stand as a real
   // freestanding miniature, so its mass-weighted center of gravity (every
-  // resin shape/lattice, metal skeleton connector, and the heavy wood base
+  // acrylic shape/lattice, metal skeleton connector, and the heavy wood base
   // itself, gathered into massEntries above as each was created) needs to
   // fall within the base's own footprint - a tall composition leaning hard
   // to one side would physically tip over otherwise. Runs AFTER the regular
@@ -1569,7 +2309,7 @@ function convertShapesTo3D() {
     // Desk-scale sanity: the base is assumed 12" wide in the real world (the
     // exact assumption baseAnchorHalfExtents' 1" strut margin already makes)
     // - scale world units to cm from that and report the piece's estimated
-    // real weight (resin shapes, thin metal wires, wood base), which should
+    // real weight (acrylic shapes, thin metal wires, wood base), which should
     // land in the comfortably-desk-plausible range.
     const cmPerWorld = 30.48 / foot.w;
     const estKg = totalMass * Math.pow(cmPerWorld, 3) / 1000;
@@ -1608,7 +2348,7 @@ function convertShapesTo3D() {
         const towardRim = { x: rdx / rlen, y: rdy / rlen, z: rdz / rlen };
         const surfaceDist = semiCircleAwareDistance(overhangNode, towardRim);
         const cogPoint = { x: oc.x + towardRim.x * surfaceDist, y: oc.y + towardRim.y * surfaceDist, z: oc.z + towardRim.z * surfaceDist };
-        drawClearStrut('base_outrigger', rimPoint, cogPoint, 3, strutRadiusCap(overhangNode), true, overhangNode);
+        drawClearStrut('base_outrigger', rimPoint, cogPoint, 3, strutRadiusCap(overhangNode), true);
         markConnectionPoint('conndot_outrigger_base', rimPoint, AUX_SUPPORT_HEAD_RADIUS);
         markConnectionPoint('conndot_outrigger_cog', cogPoint, AUX_SUPPORT_HEAD_RADIUS);
       }
@@ -1666,28 +2406,33 @@ function convertShapesTo3D() {
     // could manually back away to compensate - "can't zoom out enough to
     // see what's going on." Give it real headroom over whatever THIS
     // composition actually needs, not a one-size-fits-all guess.
+    // Always safe to widen the zoom-out ceiling to fit whatever this build
+    // actually needs, even when preserving the camera's own position below -
+    // raising a limit can't itself move the camera.
     camera3D.upperRadiusLimit = Math.max(2000, dist * 3);
     // The far clip plane must comfortably exceed how far the camera can
     // now actually zoom out to, or the camera could end up sitting beyond
     // its own visible range at the new upperRadiusLimit.
     camera3D.maxZ = Math.max(5000, camera3D.upperRadiusLimit * 1.5);
-
     camera3D.fov = fov;
-    camera3D.target = new BABYLON.Vector3(targetX, targetY, targetZ);
-    camera3D.alpha = -Math.PI / 2;
-    camera3D.beta = Math.PI / 2;
 
-    // Split the difference between the two extremes tried so far: matched to
-    // the 2D canvas's own zoom (continuous-feeling transition, but often cut
-    // off real chunks of the piece - especially the base) and the full
-    // bounding-sphere fit (guarantees everything's visible, but starts
-    // further out than the 2D view ever was). The midpoint still shows
-    // nearly everything on entry while feeling closer to a continuation of
-    // the 2D view than a hard zoom-out.
-    const canvasMatchDist = window.innerHeight / (2 * K3D_SCALE * Math.tan(fov / 2));
-    const startDist = (canvasMatchDist + dist) / 2;
-    camera3D.radius = Math.min(Math.max(startDist, camera3D.lowerRadiusLimit || 5), camera3D.upperRadiusLimit);
-    console.log(`📷 Camera: radius=${camera3D.radius.toFixed(1)} (2D-matching=${canvasMatchDist.toFixed(1)}, full-fit=${dist.toFixed(1)}), FOV=${fov}, target=(${targetX.toFixed(1)}, ${targetY.toFixed(1)}, ${targetZ.toFixed(1)}), boundingRadius=${boundingRadius.toFixed(1)}, upperRadiusLimit=${camera3D.upperRadiusLimit.toFixed(1)}`);
+    if (!preserveCamera) {
+      camera3D.target = new BABYLON.Vector3(targetX, targetY, targetZ);
+      camera3D.alpha = -Math.PI / 2;
+      camera3D.beta = Math.PI / 2;
+
+      // Split the difference between the two extremes tried so far: matched
+      // to the 2D canvas's own zoom (continuous-feeling transition, but
+      // often cut off real chunks of the piece - especially the base) and
+      // the full bounding-sphere fit (guarantees everything's visible, but
+      // starts further out than the 2D view ever was). The midpoint still
+      // shows nearly everything on entry while feeling closer to a
+      // continuation of the 2D view than a hard zoom-out.
+      const canvasMatchDist = window.innerHeight / (2 * K3D_SCALE * Math.tan(fov / 2));
+      const startDist = (canvasMatchDist + dist) / 2;
+      camera3D.radius = Math.min(Math.max(startDist, camera3D.lowerRadiusLimit || 5), camera3D.upperRadiusLimit);
+      console.log(`📷 Camera: radius=${camera3D.radius.toFixed(1)} (2D-matching=${canvasMatchDist.toFixed(1)}, full-fit=${dist.toFixed(1)}), FOV=${fov}, target=(${targetX.toFixed(1)}, ${targetY.toFixed(1)}, ${targetZ.toFixed(1)}), boundingRadius=${boundingRadius.toFixed(1)}, upperRadiusLimit=${camera3D.upperRadiusLimit.toFixed(1)}`);
+    }
   }
   
   console.log(`✅ Converted ${totalConverted} elements to 3D!`);
@@ -1720,6 +2465,21 @@ function convertShapesTo3D() {
   babylonScene.meshes.forEach(m => {
     m.renderingGroupId = m.name.startsWith('skyFace_') ? 0 : 1;
   });
+
+  // Every mesh above was just freshly disposed and recreated - re-point the
+  // shadow generator (if spotlight mode has one) at the new ones. A no-op
+  // when spotlight mode is off.
+  refreshShadowCasters();
+  // Same reason: every shape body just got a brand new material too, built
+  // at its own exact drawn colour (intensityScale 1) regardless of whatever
+  // the lighting panel is currently set to - re-applying here is what makes
+  // a scramble (or any other rebuild) keep the CURRENT Intensity/Warmth
+  // instead of the new shapes silently resetting to the neutral look.
+  applySpotlightLighting();
+  // Same reason again: the base/struts just got freshly disposed and
+  // recreated (all newly isVisible=true by default) - re-apply so a
+  // scramble while the structure is hidden doesn't silently bring it back.
+  applyStructureVisibility();
 }
 
 // ===== Helpers for exact 2D -> 3D conversion =====
@@ -1731,7 +2491,7 @@ const K3D_BLACK = { r: 0, g: 0, b: 0, a: 1 };
 // a real volume stacks its front face, side walls, and back face into the
 // same pixel, where the 2D only ever painted one translucent layer - so
 // the bodies get a uniform extra dose of translucency here. Deliberately
-// NOT applied to black outlines/wires, the marble base, resin struts, or
+// NOT applied to black outlines/wires, the marble base, acrylic struts, or
 // the red contact dots - the crisp opaque strokes are part of the 2D look.
 const BODY_ALPHA_3D = 0.6; // was 0.75 - still read heavier than the 2D wash (front face + walls + back face all stack into one pixel)
 // "Bring a little more color into 3D": alpha-blending a 0.6-alpha body over
@@ -1740,9 +2500,13 @@ const BODY_ALPHA_3D = 0.6; // was 0.75 - still read heavier than the 2D wash (fr
 // each body color away from its own gray (luminance-preserving), so the
 // pigment reads stronger while the watercolor translucency stays.
 const BODY_SATURATION_3D = 1.35;
-function saturate3D(rgba) {
+// Halo rings need their own, stronger push - see createHalo3D, which is
+// muted twice over (once by the 2D sketch itself, again by its own darken)
+// before BODY_SATURATION_3D's shared compensation ever runs.
+const HALO_SATURATION_BOOST = 1.3;
+function saturate3D(rgba, strength = BODY_SATURATION_3D) {
   const lum = 0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b;
-  const push = v => Math.max(0, Math.min(1, lum + (v - lum) * BODY_SATURATION_3D));
+  const push = v => Math.max(0, Math.min(1, lum + (v - lum) * strength));
   return { r: push(rgba.r), g: push(rgba.g), b: push(rgba.b), a: rgba.a };
 }
 // The one-stop body color treatment: saturation compensation + the global
@@ -1753,13 +2517,13 @@ function bodyColor3D(rgba) {
   c.a = rgba.a * BODY_ALPHA_3D;
   return c;
 }
-// Nearly-invisible "cast resin" glass look - used for concentricArc's solid
+// Nearly-invisible "cast acrylic" glass look - used for concentricArc's solid
 // wedge (see createConcentricArc3D), a real physical body the nested
 // stroke-only rings visually sit embedded inside, instead of bare open wire.
 // Kept at 95% transparent with no outline (see createConcentricArc3D) - just
 // enough presence to read as "there's clear material holding this together"
 // without visually competing with the rings it's supporting.
-const CLEAR_RESIN_COLOR = { r: 0.93, g: 0.96, b: 0.99, a: 0.05 };
+const CLEAR_ACRYLIC_COLOR = { r: 0.93, g: 0.96, b: 0.99, a: 0.05 };
 
 // ===== Volume density gradient (EXPORT ONLY) =====
 // On screen a body is 60% translucent, and that is what makes it read as a
@@ -1771,7 +2535,7 @@ const CLEAR_RESIN_COLOR = { r: 0.93, g: 0.96, b: 0.99, a: 0.05 };
 //
 // This replaces it: colour becomes a FUNCTION OF 3D POSITION - dense and
 // saturated at the core, lifting toward the rim, like pigment suspended in
-// cast resin. Because the field is evaluated in the mesh's own local space,
+// cast acrylic. Because the field is evaluated in the mesh's own local space,
 // every face of a shape agrees with every other, so the object reads as one
 // carved solid instead of six independently painted faces. That is the whole
 // point; a per-face material can't express it.
@@ -1786,6 +2550,14 @@ const CLEAR_RESIN_COLOR = { r: 0.93, g: 0.96, b: 0.99, a: 0.05 };
 const USDZ_GRADIENT_STRENGTH = 0.35; // 0 = flat (feature off), 1 = full falloff
 const USDZ_GRADIENT_CORE = 0.55;     // t at or below this stays fully dense
 const USDZ_GRADIENT_LIFT = 0.45;     // how far the rim lifts toward white
+// Open shapes' gradient is the WHOLE visual identity - the 2D original pools
+// solid at the closed side and fades to nothing at the open side - not a
+// barely-there depth hint on top of an otherwise-solid face like the radial
+// one above. No dead zone (fading starts immediately past the closed side)
+// and a much stronger lift, so the open edge genuinely reads as diffuse
+// rather than "still basically the same colour".
+const USDZ_OPEN_GRADIENT_LIFT = 0.96; // how far the open side lifts toward white - near-total, reads as transparent since AR bodies can't actually go translucent
+const USDZ_OPEN_GRADIENT_POOL_BOOST = 0.45; // extra saturation at t=0, concentrated at the pool and fading out by mid-gradient
 const USDZ_RAMP_TEXELS = 256;        // width of the 1-D ramp PNG
 // Per-mesh tessellation ceiling, SOFT: once reached, the remaining triangles
 // of that pass are emitted unsplit, so the real total can overshoot by the
@@ -1797,16 +2569,16 @@ const USDZ_GRADIENT_MAX_TRIS = 2000;
 // Marks a mesh as a solid coloured BODY, i.e. something the density gradient
 // should fill. Deliberately NOT applied to: black outlines and wires (crisp
 // opaque strokes are part of the 2D look), the struts and base (their own
-// materials), or the three CLEAR_RESIN_COLOR volumes, which are meant to be
+// materials), or the three CLEAR_ACRYLIC_COLOR volumes, which are meant to be
 // nearly invisible and which a gradient would only make noticeable.
-// The clear-resin volumes (5% alpha) exist to suggest "there is clear material
+// The clear-acrylic volumes (5% alpha) exist to suggest "there is clear material
 // holding this together" in a scene where bodies are translucent. In AR bodies
-// are OPAQUE, so the resin contributes nothing visible - while its surfaces sit
+// are OPAQUE, so the acrylic contributes nothing visible - while its surfaces sit
 // coplanar with the shape they wrap (the semiCircle ghost is a full disc over a
 // half-disc), which is a textbook z-fighting pair and the likeliest cause of
 // the shimmer on open semicircles. Dropped from USDZ, kept in OBJ so the Rhino
 // output is unchanged.
-function tagResinVolume(mesh) {
+function tagAcrylicVolume(mesh) {
   if (!mesh) return mesh;
   mesh.metadata = Object.assign({}, mesh.metadata, { skipUsdz: true });
   return mesh;
@@ -1860,6 +2632,27 @@ function densityAt(field, x, y, z) {
   return t < 0 ? 0 : t > 1 ? 1 : t;
 }
 
+// Directional counterpart to densityField/densityAt, for open shapes: 0/1
+// come from projecting onto a fixed 2D direction (the shape's own
+// gradientAngle, via metadata.exportGradientDir) instead of radial distance
+// from a centre. Same interface - min/max measured over the FINAL exported
+// positions, so added tessellation vertices are included - so it slots into
+// the same st-assignment path in collectUsdParts.
+function linearGradientField(positions, dirX, dirY) {
+  let minT = Infinity, maxT = -Infinity;
+  for (let i = 0; i < positions.length; i += 3) {
+    const t = positions[i] * dirX + positions[i + 1] * dirY;
+    if (t < minT) minT = t;
+    if (t > maxT) maxT = t;
+  }
+  if (!isFinite(minT)) minT = 0;
+  return { dirX, dirY, minT, maxT: Math.max(maxT, minT + 1e-6) };
+}
+function linearGradientAt(field, x, y) {
+  const t = (x * field.dirX + y * field.dirY - field.minT) / (field.maxT - field.minT);
+  return t < 0 ? 0 : t > 1 ? 1 : t;
+}
+
 // The colour at a given t: full strength through the core, lifting toward
 // white past USDZ_GRADIENT_CORE. saturate3D is reused so the dense end keeps
 // exactly the saturation compensation every other body colour gets.
@@ -1872,6 +2665,32 @@ function densityColorAt(rgba, t) {
   const core = saturate3D(rgba);
   const lift = (v) => v + (1 - v) * USDZ_GRADIENT_LIFT * eased;
   return { r: lift(core.r), g: lift(core.g), b: lift(core.b), a: rgba.a };
+}
+
+// Open-shape counterpart to densityColorAt: pools solid AND EXTRA SATURATED
+// at t=0 (the closed side, per exportGradientDir - see createOpenShape3D),
+// then lifts toward white across the FULL range to t=1 (the open side, near
+// enough to white to read as transparent - AR bodies can't actually go
+// translucent, so pushing color instead of alpha is the only lever). Smooth
+// ease-in-out rather than densityColorAt's core-then-falloff shape, since
+// there's no "dense plateau" to preserve here - the whole point is an
+// intense pooled-to-diffuse read end to end, matching the live 2D gradient.
+function openGradientColorAt(rgba, t) {
+  const eased = t * t * (3 - 2 * t);
+  const core = saturate3D(rgba);
+  // Extra vividness at the pool, spreading each channel further from the
+  // grey average - fades out over the same curve as the white lift, so the
+  // two handoff smoothly instead of fighting partway through.
+  const boost = USDZ_OPEN_GRADIENT_POOL_BOOST * (1 - eased);
+  const avg = (core.r + core.g + core.b) / 3;
+  const clamp01 = (v) => v < 0 ? 0 : v > 1 ? 1 : v;
+  const saturated = {
+    r: clamp01(avg + (core.r - avg) * (1 + boost)),
+    g: clamp01(avg + (core.g - avg) * (1 + boost)),
+    b: clamp01(avg + (core.b - avg) * (1 + boost))
+  };
+  const lift = (v) => v + (1 - v) * USDZ_OPEN_GRADIENT_LIFT * eased;
+  return { r: lift(saturated.r), g: lift(saturated.g), b: lift(saturated.b), a: rgba.a };
 }
 
 function p5ColToRGBA(c) {
@@ -1926,7 +2745,12 @@ function unlitMat(name, rgba) {
 // `parent` (optional): a TransformNode carrying a contact-tilt orientation -
 // when given, x/y/rotZ should already be the shape-local values (0/0/0) since
 // the node itself supplies the world position/rotation.
-function makeStrokeTube(name, localPts, radius, rgba, x, y, z, rotZ = 0, parent = null) {
+// `lit`: true for the rare stroke tubes that ARE a shape's own body (squiggle/
+// arc's drawn stroke, concentricArc's rings - types with no separate fill
+// mesh) so they pick up the spotlight highlight like every other shape body.
+// Defaults false since most callers are outlines/edges, which stay flat
+// black ink regardless of lighting mode.
+function makeStrokeTube(name, localPts, radius, rgba, x, y, z, rotZ = 0, parent = null, lit = false) {
   if (!localPts || localPts.length < 2) return null;
   const tube = BABYLON.MeshBuilder.CreateTube(name, {
     path: localPts,
@@ -1936,7 +2760,15 @@ function makeStrokeTube(name, localPts, radius, rgba, x, y, z, rotZ = 0, parent 
   }, babylonScene);
   tube.position = new BABYLON.Vector3(x, y, z);
   tube.rotation.z = rotZ;
-  tube.material = unlitMat(name + '_mat', rgba);
+  tube.material = lit ? shapeBodyMat(name + '_mat', rgba) : unlitMat(name + '_mat', rgba);
+  // Always a closed tube here (unlike shapeBodyMat's other, flat/prism
+  // consumers) - seen from outside only, so the far inner wall never needs
+  // to render. A per-call material (not cached), so this can't leak onto
+  // any other mesh - see strutSurfaceMaterial's identical fix for why it
+  // matters: without it, a translucent tube shows its own far wall through
+  // the near one, doubling its tessellation seams into a rippled look.
+  tube.material.backFaceCulling = true;
+  if (lit) shapeBodyMeshes.push(tube);
   if (parent) tube.parent = parent;
   return tube;
 }
@@ -1996,7 +2828,8 @@ function extrudePrism(name, profileXY, depth, rgba, x, y, z, rotZ = 0, parent = 
   }, babylonScene);
   mesh.position = new BABYLON.Vector3(x, y, z);
   mesh.rotation.z = rotZ;
-  mesh.material = unlitMat(name + '_mat', rgba);
+  mesh.material = shapeBodyMat(name + '_mat', rgba);
+  shapeBodyMeshes.push(mesh);
   if (parent) mesh.parent = parent;
   return mesh;
 }
@@ -2013,15 +2846,16 @@ function extrudePrism(name, profileXY, depth, rgba, x, y, z, rotZ = 0, parent = 
 // another's rather than the shapes needing to touch each other directly.
 // Two tiers:
 //   Tier 1 - anything with a real bounding volume (both skeletons, filled/open
-//   circle/rect/triangle/semiCircle, concentricCircle, concentricArc (a clear
-//   resin wedge behind its nested rings, since they're stroke-only on their
-//   own), lattices): mutual non-overlap is a HARD constraint, resolved via
+//   circle/rect/triangle/semiCircle, concentricCircle, concentricArc and halo
+//   (both wrapped in a clear acrylic wedge/cylinder behind their nested rings,
+//   since the rings themselves are stroke-only/decal-like on their own),
+//   lattices): mutual non-overlap is a HARD constraint, resolved via
 //   buildElementTree() below - by depth (Z) alone, since X/Y is frozen.
-//   Tier 2 - pass-through elements with no real volume (halo, squiggle,
-//   shape-type arc, and the 4 connector types): no overlap-avoidance
-//   needed (matches the user's original "arcs/lines/beziers/spirals may pass
-//   through shapes" exemption) - just a real touch point (or two, for a span)
-//   via computeConnectorAnchor(), defined near the connector mesh functions
+//   Tier 2 - pass-through elements with no real volume (squiggle, shape-type
+//   arc, and the 4 connector types): no overlap-avoidance needed (matches
+//   the user's original "arcs/lines/beziers/spirals may pass through shapes"
+//   exemption) - just a real touch point (or two, for a span) via
+//   computeConnectorAnchor(), defined near the connector mesh functions
 //   below.
 //
 // IMPORTANT: window.skeletons/window.ornaments are the SAME live objects the
@@ -2361,11 +3195,29 @@ function buildElementTree(nodes) {
       }
       return null;
     }
-    const result = searchZ(true) || searchZ(false);
+    let result = searchZ(true) || searchZ(false);
+
+    // An unlucky combination of independently-rolled scramble tilts can
+    // occasionally leave no Z-offset within the search budget that clears
+    // every already-placed neighbor (each shape's tilt changes how far it
+    // reaches in every direction, not just up/down - two large tilts can
+    // conspire to need more Z separation than the budget covers). Re-rolling
+    // THIS node's own tilt changes its own reach and, empirically, is
+    // enough to open up a clear Z - a different but still-real scramble,
+    // not a fallback that quietly gives up on the actual rule (nothing
+    // should overlap, scrambled or not).
+    if (!result && scrambleMode && !node.isBase) {
+      const RESCRAMBLE_RETRIES = 8;
+      for (let attempt = 0; attempt < RESCRAMBLE_RETRIES && !result; attempt++) {
+        node.scrambleQuat = rollScrambleQuat();
+        result = searchZ(true) || searchZ(false);
+      }
+    }
 
     if (!result) {
       // Should be unreachable (running the SAME search again with no
-      // occlusion-order requirement at all still found nothing within a
+      // occlusion-order requirement at all, even after re-rolling this
+      // node's own tilt several times, still found nothing within a
       // generous budget) - final safety net, bounded modestly rather than
       // at the full search budget, so this can never leave a shape at an
       // absurd distance even in the worst case.
@@ -2417,17 +3269,17 @@ function tier1WorldCenter(node) {
   return { x: node.x, y: node.y, z: node.z - node.zOffset };
 }
 
-// Clear resin, same material language as CLEAR_RESIN_COLOR (concentricArc's
-// wedge). This was the only strut look there was; it's now the 'resin' entry
+// Clear acrylic, same material language as CLEAR_ACRYLIC_COLOR (concentricArc's
+// wedge). This was the only strut look there was; it's now the 'acrylic' entry
 // in STRUT_MATERIAL_OPTIONS below, kept because it's the one non-solid
-// choice. A slightly more visible alpha than the resin wedge's 0.05, since
+// choice. A slightly more visible alpha than the acrylic wedge's 0.05, since
 // struts are real structural load-bearing members meant to be seen - just
 // not as a heavy black mass.
 const BASE_COLOR = { r: 0.93, g: 0.96, b: 0.99, a: 0.14 };
 const BASE_HEIGHT = 6; // real vertical extent (top rim to bottom rim) - a flat single ring read as 2D/edge-on from most angles
 // World units of clear air between the base's top and the lowest shape's
 // real reach. Was 1.5 - a technically-real gap, but the base is now an
-// OPAQUE marble slab (used to be translucent clear resin, which stayed
+// OPAQUE marble slab (used to be translucent clear acrylic, which stayed
 // visible even through a near-tangent shape), so a shape sitting right at
 // that thin margin - especially a thin, tall OPEN shape whose gradient
 // already fades toward transparent near its own open edge - can visually
@@ -2488,6 +3340,23 @@ const BASE_MATERIAL_OPTIONS = [
     body: { r: 0.55, g: 0.355, b: 0.185 },
     spec: 0.10, specPower: 16,   // satin, not lacquered
     outline: K3D_BLACK
+  },
+  {
+    // Same clear-acrylic material language as the strut option above (and
+    // CLEAR_ACRYLIC_COLOR elsewhere) - a genuinely translucent pedestal
+    // instead of an opaque stone/wood slab. Higher alpha than either of
+    // those (0.14/0.05): this is the single largest surface in the whole
+    // piece, and at their translucency it read as barely there at all -
+    // enough to still see it as a real, solid platform everything visibly
+    // stands ON, just a clear one. No grain/veining (see
+    // sculptureBaseTexture's kind check) - a flat tinted fill under real
+    // specular is what reads as cast acrylic, texture would read as stone.
+    id: 'acrylic', label: 'Clear acrylic', kind: 'acrylic',
+    swatch: 'linear-gradient(180deg,rgba(236,246,255,0.9),rgba(186,212,234,0.35))',
+    body: { r: 0.93, g: 0.96, b: 0.99 },
+    spec: 0.55, specPower: 80,   // glossy cast plastic - the highest polish of the four
+    alpha: 0.16,   // more translucent than the original 0.28, per direct feedback
+    outline: K3D_BLACK
   }
 ];
 
@@ -2517,10 +3386,12 @@ const STRUT_MATERIAL_OPTIONS = [
   },
   {
     // The look every strut had before this menu existed - kept as a real
-    // choice rather than dropped, since it's the only non-solid option and
-    // reads very differently (the black core inside each rod, invisible
-    // through an opaque metal shell, is what you actually see through this).
-    id: 'resin', label: 'Clear resin', kind: 'resin',
+    // choice rather than dropped, since it's the only genuinely translucent
+    // option (BASE_COLOR's alpha 0.14) rather than an opaque metal finish.
+    // A single solid tube like every other strut option - see
+    // createSolidTube3D - so "clear" reads as actually clear, nothing
+    // else visible through it.
+    id: 'acrylic', label: 'Clear acrylic', kind: 'acrylic',
     swatch: 'linear-gradient(180deg,rgba(236,246,255,0.9),rgba(186,212,234,0.35))',
     tone: BASE_COLOR
   }
@@ -2545,6 +3416,7 @@ let baseSurfaceMeshes = [];
 let baseOutlineMeshes = [];
 let strutShellMeshes = [];      // grounded: the chosen strut material
 let strutBlackMeshes = [];      // shape-to-shape braces: always black
+let shapeBodyMeshes = [];       // every mesh whose material came from shapeBodyMat - for instant spotlight-toggle refresh
 
 // Called from convertShapesTo3D's teardown. The meshes themselves are
 // disposed there with dispose(false, true), which takes their shared
@@ -2556,6 +3428,7 @@ function resetSculptureMaterialRegistry() {
   baseOutlineMeshes = [];
   strutShellMeshes = [];
   strutBlackMeshes = [];
+  shapeBodyMeshes = [];
   blackWireMats = new Map();
   blackWireMeshes = [];
 }
@@ -2627,7 +3500,7 @@ function sculptureBaseTexture(opt) {
       }
       ctx.stroke();
     }
-  } else {
+  } else if (opt.kind === 'wood') {
     // Wood: near-parallel wavy grain lines, each with its own wavelength and
     // phase so they drift together and apart the way real grain does, plus a
     // couple of knots for the eye to land on.
@@ -2655,6 +3528,10 @@ function sculptureBaseTexture(opt) {
       }
     }
   }
+  // Acrylic: neither branch above runs - the flat fill already laid down
+  // stays as-is, no grain/veining. A textured clear base would read as
+  // stone or plastic laminate, not cast acrylic; the material's own alpha
+  // + specular (see baseSurfaceMaterial) carry that look instead.
 
   tex.update();
   return tex;
@@ -2667,36 +3544,32 @@ function baseSurfaceMaterial() {
   const m = new BABYLON.StandardMaterial(`base_solid_mat_${opt.id}`, babylonScene);
   m.diffuseTexture = tex;
   m.backFaceCulling = false;
-  m.alpha = 1;
-  if (spotlightMode) {
-    // LIT. The emissive slot has to be given up here: leaving the texture in
-    // it would add the slab's full brightness back on top of the shading and
-    // flatten the very modelling the rig exists to produce. A small flat
-    // emissiveColor stands in as an ambient floor so the shadow side reads
-    // as dark stone rather than a hole.
-    m.disableLighting = false;
-    m.emissiveColor = new BABYLON.Color3(0.13, 0.13, 0.135);
-    m.specularColor = new BABYLON.Color3(opt.spec, opt.spec, opt.spec);
-    m.specularPower = opt.specPower;
-    // The slab's sides are a DOUBLESIDE ribbon, so which way its normals
-    // face depends on the ring winding - without this, the most visible
-    // surface on the whole pedestal could light as if it faced inward.
-    // Flips the normal per back-face instead of trusting the winding.
-    m.twoSidedLighting = true;
-  } else {
-    // Same unlit-with-a-texture shape as createOpenShape3D's material: both
-    // texture slots set, lighting off, so the drawn pixels come through
-    // exactly as painted.
-    m.emissiveTexture = tex;
-    m.specularColor = new BABYLON.Color3(0, 0, 0);
-    m.disableLighting = true;
-  }
+  // 1 for every opaque stone/wood option; the acrylic option is the one
+  // exception (see its own `alpha` in BASE_MATERIAL_OPTIONS).
+  m.alpha = opt.alpha !== undefined ? opt.alpha : 1;
+  // Always LIT now - normal and spotlight modes share the same real lighting
+  // rig (see buildLightRig). The emissive slot has to be given up here:
+  // leaving the texture in it would add the slab's full brightness back on
+  // top of the shading and flatten the very modelling the rig exists to
+  // produce. A small flat emissiveColor stands in as an ambient floor so the
+  // shadow side reads as dark stone rather than a hole.
+  m.disableLighting = false;
+  m.emissiveColor = new BABYLON.Color3(0.13, 0.13, 0.135);
+  m.specularColor = new BABYLON.Color3(opt.spec, opt.spec, opt.spec);
+  m.specularPower = opt.specPower;
+  // The slab's sides are a DOUBLESIDE ribbon, so which way its normals
+  // face depends on the ring winding - without this, the most visible
+  // surface on the whole pedestal could light as if it faced inward.
+  // Flips the normal per back-face instead of trusting the winding.
+  m.twoSidedLighting = true;
   // Flat stand-in colour for OBJ export - plain MTL can't carry the veining.
   // `usd` drives the AR/USDZ export: real stone and wood are lit, not
-  // self-lit, so emission stays low (see meshUsdSurface).
+  // self-lit, so emission stays low (see meshUsdSurface) - alpha carries
+  // through the same exportColor.a the acrylic strut/shape bodies already
+  // use, so a translucent base exports as genuinely translucent in AR too.
   m.metadata = {
-    exportColor: { r: opt.body.r, g: opt.body.g, b: opt.body.b, a: 1 },
-    usd: { metallic: 0, roughness: opt.kind === 'wood' ? 0.55 : 0.3, emissive: 0 }
+    exportColor: { r: opt.body.r, g: opt.body.g, b: opt.body.b, a: opt.alpha !== undefined ? opt.alpha : 1 },
+    usd: { metallic: 0, roughness: opt.kind === 'wood' ? 0.55 : opt.kind === 'acrylic' ? 0.15 : 0.3, emissive: 0 }
   };
   sculptureMatCache.base = m;
   sculptureMatCache.baseTex = tex;
@@ -2711,8 +3584,16 @@ function strutSurfaceMaterial(grounded) {
   const key = grounded ? 'strut' : 'strutBlack';
   if (sculptureMatCache[key]) return sculptureMatCache[key];
   const opt = grounded ? strutMaterialOption() : STRUT_MATERIAL_OPTIONS.find(o => o.id === 'black');
-  const m = unlitMat(`strut_mat_${key}_${opt.id}`, opt.kind === 'resin' ? opt.tone : { ...opt.tone, a: 1 });
-  if (opt.kind !== 'resin') {
+  const m = unlitMat(`strut_mat_${key}_${opt.id}`, opt.kind === 'acrylic' ? opt.tone : { ...opt.tone, a: 1 });
+  // A strut/brace is always a closed tube, only ever seen from outside -
+  // unlike unlitMat's other consumers (flat discs/prisms that DO need their
+  // back face to stay visible), there's no reason to render its own far
+  // inner wall. Left off (unlitMat's default), a translucent tube shows that
+  // far wall THROUGH the near one - doubling up its own tessellation seams
+  // into a rippled/segmented look, worst on the clear-acrylic option but
+  // visible on any alpha < 1.
+  m.backFaceCulling = true;
+  if (opt.kind !== 'acrylic') {
     applyMetalFinish(m, opt);
     // Real metal in AR: fully metallic, and NOT emissive - it should catch
     // the room's light rather than glow, which is the whole point of seeing
@@ -2728,12 +3609,12 @@ function strutSurfaceMaterial(grounded) {
 //  - Fresnel ramp: leftColor where the surface faces the camera, rightColor
 //    at grazing angles (the shader mixes on abs(dot(view, normal)), so
 //    backFaceCulling being off elsewhere in this file doesn't invert it).
-//  - In spotlight mode, real light replaces the faked cylinder shading with
-//    the genuine article, and adds what the fake never could: a specular
-//    hotspot that travels along the rod as you orbit. The ramp stays on, but
-//    now only modulates the dimmed emissive FLOOR - keeping the silhouette
-//    dark and the facing side lifted UNDERNEATH the real lighting rather
-//    than competing with it.
+//  - Real light (normal and spotlight modes share the same rig now) replaces
+//    the faked cylinder shading with the genuine article, and adds what the
+//    fake never could: a specular hotspot that travels along the rod as you
+//    orbit. The ramp stays on, but now only modulates the dimmed emissive
+//    FLOOR - keeping the silhouette dark and the facing side lifted
+//    UNDERNEATH the real lighting rather than competing with it.
 function applyMetalFinish(m, spec) {
   const fr = new BABYLON.FresnelParameters();
   fr.bias = 0.06;
@@ -2741,14 +3622,51 @@ function applyMetalFinish(m, spec) {
   fr.leftColor = new BABYLON.Color3(spec.hi.r, spec.hi.g, spec.hi.b);
   fr.rightColor = new BABYLON.Color3(spec.lo.r, spec.lo.g, spec.lo.b);
   m.emissiveFresnelParameters = fr;
-  if (spotlightMode) {
-    m.disableLighting = false;
-    m.diffuseColor = new BABYLON.Color3(spec.tone.r, spec.tone.g, spec.tone.b);
-    m.emissiveColor = new BABYLON.Color3(spec.tone.r * 0.22, spec.tone.g * 0.22, spec.tone.b * 0.22);
-    m.specularColor = new BABYLON.Color3(spec.hi.r * 0.55, spec.hi.g * 0.55, spec.hi.b * 0.55);
-    m.specularPower = 64; // tight hotspot - polished metal, not satin
-    m.twoSidedLighting = true; // same insurance as the base - unlitMat leaves culling off
-  }
+  m.disableLighting = false;
+  m.diffuseColor = new BABYLON.Color3(spec.tone.r, spec.tone.g, spec.tone.b);
+  m.emissiveColor = new BABYLON.Color3(spec.tone.r * 0.22, spec.tone.g * 0.22, spec.tone.b * 0.22);
+  m.specularColor = new BABYLON.Color3(spec.hi.r * 0.55, spec.hi.g * 0.55, spec.hi.b * 0.55);
+  m.specularPower = 64; // tight hotspot - polished metal, not satin
+  return m;
+}
+
+// ===== Shape-body lit highlight =====
+// unlitMat's exact-color guarantee must survive untouched for FILL bodies
+// too - the difference from base/struts is that base/struts dim
+// emissiveColor and lean on real diffuse (Lambert) shading, which would
+// shift a shape's drawn hue by facing angle. Shape bodies keep diffuseColor
+// BLACK and emissiveColor at the exact drawn rgba (both unchanged from
+// unlitMat) and add ONLY a specular term on top - a pure additive highlight
+// with zero risk to the underlying colour.
+//
+// Tuned softer/broader than the struts (specularPower 64, tight polished
+// metal): these are translucent cast-acrylic bodies (see BODY_ALPHA_3D/
+// CLEAR_ACRYLIC_COLOR), not polished metal, so a tight bright-white glint
+// would read as the wrong material. StandardMaterial's specular term stays
+// visible on translucent/alpha-blended surfaces by default (same reason a
+// glass window still shows a bright reflection despite being see-through).
+const SHAPE_SPEC_COLOR = { r: 0.68, g: 0.68, b: 0.72 }; // brighter, slightly cool neutral - a real glossy catch-light, still short of a metal hotspot
+const SHAPE_SPEC_POWER = 20; // broad soft highlight (struts use 64 for a tight polished-metal glint)
+function shapeBodyMat(name, rgba) {
+  const m = unlitMat(name, rgba);
+  m.disableLighting = false;
+  m.specularColor = new BABYLON.Color3(SHAPE_SPEC_COLOR.r, SHAPE_SPEC_COLOR.g, SHAPE_SPEC_COLOR.b);
+  m.specularPower = SHAPE_SPEC_POWER;
+  // Same insurance as base/struts: backFaceCulling is off (unlitMat), so
+  // without this the visible side of a shape whose normal winding faces
+  // "inward" would light as if it faced away from every light.
+  m.twoSidedLighting = true;
+  // diffuseColor (black) and emissiveColor (rgba) are untouched from
+  // unlitMat above - only the specular term picks up the rig.
+  //
+  // Original emissive (the shape's exact drawn colour), read back by
+  // applySpotlightLighting's intensity scaling below - diffuseColor being
+  // black means a shape's own body brightness never responds to a light's
+  // intensity at all (only its thin specular highlight does), so without
+  // this the lighting panel's Intensity slider would visibly brighten
+  // struts/base (real diffuse response) while every shape fill just sat
+  // there unchanged - "Intensity doesn't affect the shapes."
+  m.metadata.baseEmissive = { r: m.emissiveColor.r, g: m.emissiveColor.g, b: m.emissiveColor.b };
   return m;
 }
 
@@ -2787,6 +3705,7 @@ function blackWireMaterial(alpha) {
   const key = alpha.toFixed(2);
   if (blackWireMats.has(key)) return blackWireMats.get(key);
   const m = unlitMat(`blackwire_mat_${key}`, { ...BLACK_WIRE_METAL.tone, a: alpha });
+  m.backFaceCulling = true; // closed tube, seen from outside only - see strutSurfaceMaterial's identical fix for why
   applyMetalFinish(m, BLACK_WIRE_METAL);
   m.metadata.usd = { metallic: 1, roughness: 0.38, emissive: 0 }; // blackened steel, same family as the struts
 
@@ -2838,8 +3757,43 @@ const SPOTLIGHT_CONTRAST = 1.35;     // 1.0 = untouched
 const SPOTLIGHT_EXPOSURE = 1.06;
 const SPOTLIGHT_VIGNETTE_WEIGHT = 1.1; // was 2.4 - a gentle corner falloff, not a black frame
 
+// User-facing lighting panel (spotlight mode only - see applySpotlightLighting).
+// Deliberately session-only like spotlightMode itself: every fresh page load
+// resets to these defaults rather than persisting a prior tuning session.
+const SPOTLIGHT_LIGHTING_DEFAULTS = { skyDim: SPOTLIGHT_SKY_DIM, lightCount: 4, intensityScale: 1, warmth: 0 };
+let spotlightLightingSettings = { ...SPOTLIGHT_LIGHTING_DEFAULTS };
+
+// Normal and spotlight modes share the SAME real lighting, shadows, and
+// shape/base/strut highlight now - both are lit; spotlight's only remaining
+// job is the environmental "pop" (dimmed sky, contrast, vignette - see
+// syncSpotlightEnvironment). Deliberately session-only, never persisted:
+// always starts normal, spotlight is an explicit per-visit enhancement, not
+// a sticky default someone can get stuck in without realising it.
 let spotlightMode = false;
-let spotlightLights = [];
+let sceneLights = [];
+let sceneShadowGenerator = null;
+
+// "Turn off the struts and base so they can just look at the composition" -
+// a pure display toggle, session-only like spotlightMode above (always
+// starts visible; nobody should come back to a hidden base without asking
+// again). Every base/strut mesh shares one of these 4 name prefixes - see
+// baseRevealMeshes' own identical split between base_solid_/base_outline_
+// (the base) and base_strutsupport_/base_reinforced_ (the struts, which
+// also happen to start with "base_" since they land ON it).
+let structureVisible = true;
+const STRUCTURE_MESH_PREFIX = /^(base_solid_|base_outline_|base_strutsupport_|base_reinforced_)/;
+function applyStructureVisibility() {
+  if (!babylonScene) return;
+  babylonScene.meshes.forEach(m => {
+    if (STRUCTURE_MESH_PREFIX.test(m.name)) m.isVisible = structureVisible;
+  });
+}
+// Exposed for #structure-toggle-btn (index3D.html).
+window.setStructureVisible = function (visible) {
+  structureVisible = !!visible;
+  applyStructureVisibility();
+};
+window.isStructureVisible = function () { return structureVisible; };
 
 // One restore for every stored preference - deliberately down here rather
 // than beside `sculptureMaterials`, since it has to run after BOTH `let`s
@@ -2850,12 +3804,15 @@ let spotlightLights = [];
     if (!saved) return;
     if (BASE_MATERIAL_OPTIONS.some(o => o.id === saved.base)) sculptureMaterials.base = saved.base;
     if (STRUT_MATERIAL_OPTIONS.some(o => o.id === saved.strut)) sculptureMaterials.strut = saved.strut;
-    if (typeof saved.spotlight === 'boolean') spotlightMode = saved.spotlight;
   } catch (e) { /* storage disabled/private mode - the defaults are fine */ }
 })();
 
-function buildSpotlightRig() {
-  if (!babylonScene || spotlightLights.length) return;
+// Built once and never disposed - babylonScene itself lives for the whole
+// page session (activate/deactivate 3D just toggles visibility, never
+// tears the scene down), so a plain "already built" guard is enough; no
+// dispose path is needed since these never go away once created.
+function buildLightRig() {
+  if (!babylonScene || sceneLights.length) return;
   // Directions point FROM the light INTO the scene. The rig is fixed in
   // world space, not welded to the camera, so orbiting genuinely walks you
   // around a lit object - the highlight travels, the shadow side turns
@@ -2881,12 +3838,129 @@ function buildSpotlightRig() {
   rim.specular = new BABYLON.Color3(0.8, 0.88, 1);
   rim.intensity = 0.85;
 
-  spotlightLights = [key, fill, rim];
+  // Side accent, roughly horizontal from the right - deliberately a very
+  // different angle from key (high, front-left, mostly downward) and rim
+  // (from behind). A tilted/scrambled shape's own facets face all sorts of
+  // directions, so specular highlights are very angle-sensitive - this is
+  // what catches a second glint on a face the key light misses entirely,
+  // instead of leaving one whole side of the piece with no highlight at
+  // all. Neutral/cool so it reads as a second real light source rather
+  // than a second copy of the key's own warm glow.
+  const accent = new BABYLON.DirectionalLight('spot_accent', new BABYLON.Vector3(-1, -0.2, -0.3), babylonScene);
+  accent.diffuse = new BABYLON.Color3(0.85, 0.9, 1);
+  accent.specular = new BABYLON.Color3(0.9, 0.94, 1);
+  accent.intensity = 0.7;
+
+  sceneLights = [key, fill, rim, accent];
+  // Each light's own ORIGINAL intensity/diffuse, so applySpotlightLighting
+  // (the lighting panel) always recomputes from this fixed baseline rather
+  // than compounding onto whatever the last slider move already changed -
+  // and so normal mode (which never applies the panel's settings) can
+  // always show the exact same rig this function just built.
+  sceneLights.forEach(light => { light.metadata = { intensity: light.intensity, diffuse: light.diffuse.clone() }; });
+  applySpotlightLighting();
+
+  // Real cast shadows from the key light only (a shadow map per light would
+  // be needless cost, and a single consistent shadow direction reads better
+  // than three overlapping ones anyway) - onto the base, from the shapes and
+  // struts sitting on it. autoUpdateExtends (Babylon's default, left alone
+  // here) refits the light's orthographic frustum to the shadow casters'
+  // actual bounds every frame, so this doesn't need hand-tuned bounds that
+  // would drift wrong for a bigger/smaller composition or after a scramble.
+  sceneShadowGenerator = new BABYLON.ShadowGenerator(1024, key);
+  sceneShadowGenerator.useBlurExponentialShadowMap = true;
+  // blurKernel is measured in shadow-map TEXELS, not world units - the
+  // light's orthographic frustum auto-fits to the whole composition
+  // (autoUpdateExtends), which can easily span 100+ world units across a
+  // 1024-texel map. 32 texels there was several world units of blur radius,
+  // enough to round every shape's silhouette down to a soft blob regardless
+  // of its real outline (a triangle read as a circle). Small enough now to
+  // soften jagged edges without erasing the caster's actual shape.
+  sceneShadowGenerator.blurKernel = 4;
+  sceneShadowGenerator.transparencyShadow = true; // shapes/struts are alpha-blended (acrylic) - without this Babylon skips them as shadow casters entirely
+  // Struts are thin, curved, and often run nearly PARALLEL to the key
+  // light's own direction (a support leg rising toward it) - exactly the
+  // worst case for shadow-map depth precision, where a curved caster
+  // incorrectly self-shadows its own surface in a rippled/banded pattern
+  // ("shadow acne") because the map can't distinguish which points on a
+  // near-grazing surface are actually in front of which. Babylon's default
+  // bias (0.00005) is tuned for ordinary flat/faceted geometry and is far
+  // too tight here. Both biases push the comparison depth out far enough
+  // to stop a strut from shadowing itself; normalBias (offsets along the
+  // surface normal, before the depth check) is the more effective one for
+  // a curved surface specifically, bias is the usual flat safety margin.
+  sceneShadowGenerator.bias = 0.004;
+  sceneShadowGenerator.normalBias = 0.06;
+  refreshShadowCasters();
 }
 
-function disposeSpotlightRig() {
-  spotlightLights.forEach(l => l.dispose());
-  spotlightLights = [];
+// Every mesh that can cast a shadow (shape bodies, struts) and the one that
+// receives them (the base) are already tracked in their own arrays for the
+// live material-refresh system above - reused here rather than re-walking
+// the scene graph. Called once when the rig is first built, and again at
+// the end of every convertShapesTo3D rebuild (scramble, or entering 3D)
+// since that disposes and recreates every one of those meshes.
+function refreshShadowCasters() {
+  if (!sceneShadowGenerator) return;
+  const casters = [...shapeBodyMeshes, ...strutShellMeshes, ...strutBlackMeshes]
+    .filter(m => m && !m.isDisposed());
+  sceneShadowGenerator.getShadowMap().renderList = casters;
+  baseSurfaceMeshes.forEach(m => { if (m && !m.isDisposed()) m.receiveShadows = true; });
+}
+
+// Blends a light's own base colour toward a warm (orange) or cool (blue)
+// tint - capped well short of a full override so each light keeps enough of
+// its own identity (the rim stays coolER than the key even at max warmth,
+// not identically orange) rather than every light flattening to one hue.
+function warmthTint(color, warmth) {
+  if (!warmth) return color.clone();
+  const warm = new BABYLON.Color3(1, 0.72, 0.45);
+  const cool = new BABYLON.Color3(0.7, 0.82, 1);
+  const target = warmth > 0 ? warm : cool;
+  return BABYLON.Color3.Lerp(color, target, Math.min(1, Math.abs(warmth)) * 0.6);
+}
+
+// Applies the lighting panel's settings to the rig - light count (how many
+// of the 4 are enabled, key first since it's also the shadow caster),
+// overall intensity scale, and colour warmth. Deliberately a no-op on the
+// LIGHTS whenever spotlight mode is off: normal mode always shows the
+// plain, unmodified rig regardless of what the panel is set to, since the
+// panel is explicitly a spotlight-only enhancement (see index3D.html - only
+// reachable from the lightbulb while spotlight is on). Recomputes every
+// light fully from its own metadata.intensity/diffuse baseline (set once in
+// buildLightRig) each time, so repeated calls while dragging a slider never
+// compound onto a previous call's result.
+function applySpotlightLighting() {
+  if (!sceneLights.length) return;
+  const s = spotlightLightingSettings;
+  sceneLights.forEach((light, i) => {
+    const base = light.metadata;
+    if (!spotlightMode) {
+      light.setEnabled(true);
+      light.intensity = base.intensity;
+      light.diffuse = base.diffuse.clone();
+      return;
+    }
+    light.setEnabled(i < s.lightCount);
+    light.intensity = base.intensity * s.intensityScale;
+    light.diffuse = warmthTint(base.diffuse, s.warmth);
+  });
+
+  // Shape bodies are diffuseColor-black by design (see shapeBodyMat) - their
+  // own brightness is carried entirely by emissiveColor, which a light's
+  // intensity never touches at all (only their thin specular highlight
+  // does). Without this, the Intensity slider visibly brightened the
+  // diffuse-lit metal (struts/base) while every shape fill just sat there
+  // unchanged. Scaled directly here instead, from each material's own
+  // ORIGINAL emissive (metadata.baseEmissive, set once at creation) so
+  // repeated slider drags recompute fresh rather than compounding.
+  shapeBodyMeshes.forEach(mesh => {
+    if (!mesh || mesh.isDisposed() || !mesh.material || !mesh.material.metadata) return;
+    const base = mesh.material.metadata.baseEmissive;
+    if (!base) return;
+    const scale = spotlightMode ? s.intensityScale : 1;
+    mesh.material.emissiveColor = new BABYLON.Color3(base.r * scale, base.g * scale, base.b * scale);
+  });
 }
 
 // Skybox dimming + global grade. Idempotent, and safe to call whenever -
@@ -2894,7 +3968,7 @@ function disposeSpotlightRig() {
 // at full brightness while spotlight mode is on.
 function syncSpotlightEnvironment() {
   if (!babylonScene) return;
-  const dim = spotlightMode ? SPOTLIGHT_SKY_DIM : 1;
+  const dim = spotlightMode ? spotlightLightingSettings.skyDim : 1;
   babylonScene.meshes.forEach(m => {
     if (!m.name.startsWith('skyFace_') || !m.material) return;
     // diffuseTexture and emissiveTexture are the SAME texture object on a
@@ -2962,19 +4036,50 @@ function refreshSculptureSurfaces(doBase, doStrut, doStrutBlack) {
   }
 }
 
+// Deliberately session-only, never persisted - every fresh page load starts
+// in normal mode, and spotlight is an explicit per-visit enhancement. Normal
+// and spotlight now share the SAME real lighting/shadows/highlights (see
+// buildLightRig, called unconditionally from convertShapesTo3D); toggling
+// this only changes the environmental "pop" (see syncSpotlightEnvironment).
 window.getSpotlightMode = function () { return spotlightMode; };
 window.setSpotlightMode = function (on) {
   const next = !!on;
   if (next === spotlightMode) return;
   spotlightMode = next;
-  try {
-    localStorage.setItem(SCULPTURE_MATERIAL_STORAGE_KEY,
-      JSON.stringify({ ...sculptureMaterials, spotlight: spotlightMode }));
-  } catch (e) { /* storage disabled - the mode still applies this session */ }
+  // Session-only, same as spotlightMode itself - turning spotlight OFF
+  // clears any tuning so the NEXT time it's switched on starts from the
+  // same defaults, rather than a stale look from three toggles ago.
+  if (!spotlightMode) spotlightLightingSettings = { ...SPOTLIGHT_LIGHTING_DEFAULTS };
   if (!babylonScene) return;
-  if (spotlightMode) buildSpotlightRig(); else disposeSpotlightRig();
+  applySpotlightLighting();
   syncSpotlightEnvironment();
-  refreshSculptureSurfaces(true, true, true); // lighting changes every surface, black braces included
+};
+
+// ——— public API for the spotlight lighting panel in index3D.html ———
+// All session-only (see SPOTLIGHT_LIGHTING_DEFAULTS) and inert while
+// spotlight mode is off - the panel itself is only reachable while it's on.
+window.getSpotlightLightingSettings = function () { return { ...spotlightLightingSettings }; };
+window.getSpotlightLightingDefaults = function () { return { ...SPOTLIGHT_LIGHTING_DEFAULTS }; };
+window.setSpotlightLighting = function (opts = {}) {
+  const s = spotlightLightingSettings;
+  if (typeof opts.skyDim === 'number') s.skyDim = Math.max(0.15, Math.min(1.3, opts.skyDim));
+  if (typeof opts.lightCount === 'number') s.lightCount = Math.max(1, Math.min(4, Math.round(opts.lightCount)));
+  // Babylon's lighting model has no hard ceiling at 1.0 ("100%") - intensity
+  // is just a multiplier a shader term gets scaled by, same as the base
+  // rig's own key light already sitting above 1 (1.25) before this panel
+  // existed. 4x (400%) is a soft UI cap for a sane slider range, not a real
+  // engine limit - raise it further here if that's ever not enough headroom.
+  if (typeof opts.intensityScale === 'number') s.intensityScale = Math.max(0.3, Math.min(4, opts.intensityScale));
+  if (typeof opts.warmth === 'number') s.warmth = Math.max(-1, Math.min(1, opts.warmth));
+  if (!babylonScene) return;
+  applySpotlightLighting();
+  syncSpotlightEnvironment();
+};
+window.resetSpotlightLighting = function () {
+  spotlightLightingSettings = { ...SPOTLIGHT_LIGHTING_DEFAULTS };
+  if (!babylonScene) return;
+  applySpotlightLighting();
+  syncSpotlightEnvironment();
 };
 
 // ——— public API for the materials picker in index3D.html ———
@@ -2997,8 +4102,7 @@ window.setSculptureMaterials = function (opts = {}) {
   if (wantBase) sculptureMaterials.base = wantBase;
   if (wantStrut) sculptureMaterials.strut = wantStrut;
   try {
-    localStorage.setItem(SCULPTURE_MATERIAL_STORAGE_KEY,
-      JSON.stringify({ ...sculptureMaterials, spotlight: spotlightMode }));
+    localStorage.setItem(SCULPTURE_MATERIAL_STORAGE_KEY, JSON.stringify(sculptureMaterials));
   } catch (e) { /* storage disabled - the choice still applies this session */ }
   refreshSculptureSurfaces(baseChanged, strutChanged, false);
 };
@@ -3007,13 +4111,13 @@ window.setSculptureMaterials = function (opts = {}) {
 // used to compute the sculpture's true center of gravity (mass-weighted, not
 // just a geometric centroid) so it reads as a plausible standing physical
 // object - "give each shape and element a weight as if they were made of
-// resin, line based elements (skeleton) are made of metal, base is a heavy
+// acrylic, line based elements (skeleton) are made of metal, base is a heavy
 // wood base." Relative magnitudes matter more than real-world accuracy here:
-// metal is much denser than resin, but the skeleton's thin wire cross-section
-// still nets a tiny mass next to a solid resin shape; the base is bigger AND
+// metal is much denser than acrylic, but the skeleton's thin wire cross-section
+// still nets a tiny mass next to a solid acrylic shape; the base is bigger AND
 // denser than everything else combined, which is what should normally keep
 // the COG low and inside its footprint without any extra support at all.
-const DENSITY_RESIN = 1.15;  // g/cm^3-ish, applied to every Tier-1 shape/lattice's solid volume
+const DENSITY_ACRYLIC = 1.15;  // g/cm^3-ish, applied to every Tier-1 shape/lattice's solid volume
 const DENSITY_METAL = 8.0;   // steel/bronze-ish, applied to every thin skeleton connector's volume
 const DENSITY_WOOD = 1.3;    // "heavy" hardwood, applied to the base's solid cylinder volume
 const STABILITY_FOOTPRINT_FACTOR = 0.8; // COG must land within this fraction of the base radius, not just barely inside it, to count as genuinely freestanding
@@ -3050,7 +4154,7 @@ function tier1NodeVolume(n) {
 }
 
 function tier1NodeMass(n) {
-  return tier1NodeVolume(n) * (n.isBase ? DENSITY_WOOD : DENSITY_RESIN);
+  return tier1NodeVolume(n) * (n.isBase ? DENSITY_WOOD : DENSITY_ACRYLIC);
 }
 
 // Approximate world-space length of a Tier-2 connector's own curve, straight
@@ -3160,7 +4264,7 @@ function baseFixedOrientation() {
 function createBaseTier1Node(realTier1Nodes) {
   if (realTier1Nodes.length === 0) return null;
   // Mass-weighted, not a plain geometric average - "if there's a balance
-  // issue, you can move the base to the best location." A heavy resin shape
+  // issue, you can move the base to the best location." A heavy acrylic shape
   // should pull the base's center toward it more than a small one would, the
   // same way a real pedestal gets centered under a sculpture's actual weight
   // rather than the midpoint of its outline. Every shape's mass (from its own
@@ -3207,7 +4311,7 @@ function createBaseTier1Node(realTier1Nodes) {
 // Renders the base at its final resolved position as a real solid marble
 // slab - a rectangular extrude (fitted to the sculpture's actual footprint,
 // see renderW/renderD) with a beveled TOP edge only (bottom stays a sharp,
-// flat edge), not the earlier circular resin drum. Built entirely from
+// flat edge), not the earlier circular acrylic drum. Built entirely from
 // EXPLICIT world-space point rings (no path-tangent-derived auto-orientation
 // involved anywhere) to avoid a real bug hit here once already:
 // ExtrudeShapeCustom's Frenet frame is ambiguous along a perfectly straight
@@ -3307,10 +4411,10 @@ function createBaseMesh3D(node) {
 // connecting element"), but the base itself is now a real solid pedestal
 // too, so a strut genuinely bearing load on it should read as a real solid
 // support member, not a schematic hint. A thin black CORE runs inside the
-// clear resin shell (not a bigger black tube wrapped around it - an opaque
-// tube larger than the resin one would just fully hide the resin tube
-// inside it, not outline it) - same "cast inside clear resin" look as
-// concentricArc's rings, visible through the resin shell's own translucency.
+// clear acrylic shell (not a bigger black tube wrapped around it - an opaque
+// tube larger than the acrylic one would just fully hide the acrylic tube
+// inside it, not outline it) - same "cast inside clear acrylic" look as
+// concentricArc's rings, visible through the acrylic shell's own translucency.
 // A support rod's thickness should be proportional to what it actually
 // holds - a tiny bullseye propped up by the same fat standard rod as a
 // giant rect read as "a little ridiculous." Cap at ~8% of the supported
@@ -3333,22 +4437,104 @@ function createSolidTube3D(name, pA, pB, w2D, radiusCap = null, grounded = true)
   // strutRadiusCap) scales that down for small supported shapes.
   let radius = Math.max((w2D || 2) / K3D_SCALE / 2, 0.35);
   if (radiusCap) radius = Math.min(radius, radiusCap);
-  const path = [new BABYLON.Vector3(pA.x, pA.y, pA.z), new BABYLON.Vector3(pB.x, pB.y, pB.z)];
-  const core = BABYLON.MeshBuilder.CreateTube(`${name}_core`, {
-    path, radius: Math.max(radius * 0.4, 0.05), tessellation: 12, cap: BABYLON.Mesh.CAP_ALL
-  }, babylonScene);
-  core.material = unlitMat(`${name}_core_mat`, K3D_BLACK);
+  // Every strut is built bottom -> top (base/lower end first, shape/upper
+  // end last), like a real support post going up off the base - and since
+  // these are mounted fasteners, not just touching points, each end
+  // continues a little PAST the real surface it lands on: the lower end
+  // sinks further down into the base plate (only for struts that actually
+  // land on the base - a shape-to-shape brace has no base end), and the
+  // upper end continues a little further along the same line into the
+  // shape's own volume, so both read as physically socketed rather than
+  // just resting on top. Capped relative to the strut's own length so a
+  // short brace can't have its embedded ends cross over each other.
+  const lo = pA.y <= pB.y ? pA : pB;
+  const hi = pA.y <= pB.y ? pB : pA;
+  const dirX = (hi.x - lo.x) / dist, dirY = (hi.y - lo.y) / dist, dirZ = (hi.z - lo.z) / dist;
+  const loEmbed = Math.min(grounded ? 0.6 : 0.35, dist * 0.3);
+  const hiEmbed = Math.min(0.35, dist * 0.3);
+  const start = { x: lo.x - dirX * loEmbed, y: lo.y - dirY * loEmbed, z: lo.z - dirZ * loEmbed };
+  const end = { x: hi.x + dirX * hiEmbed, y: hi.y + dirY * hiEmbed, z: hi.z + dirZ * hiEmbed };
+  const path = [new BABYLON.Vector3(start.x, start.y, start.z), new BABYLON.Vector3(end.x, end.y, end.z)];
+  // updatable: true - without it, the vertex buffer Babylon allocates at
+  // creation is static; animateStrutGrowth's later CreateTube(...,
+  // {instance}) calls DO update the CPU-side vertex array (so reading it
+  // back looks correct), but silently never re-upload to the GPU, so the
+  // strut visibly stays at whatever length it had at creation - full,
+  // since createSolidTube3D always builds the real final path first -
+  // instead of the growth ever actually being seen on screen.
   const tube = BABYLON.MeshBuilder.CreateTube(name, {
-    path, radius, tessellation: 16, cap: BABYLON.Mesh.CAP_ALL
+    path, radius, tessellation: 16, cap: BABYLON.Mesh.CAP_ALL, updatable: true
   }, babylonScene);
   // Shared material - the chosen one if this strut stands on the base, plain
-  // black if it's a shape-to-shape brace. See strutSurfaceMaterial. The black
-  // core above stays black in every case: it's what you see through the
-  // translucent resin option, and it's simply hidden inside the rod under
-  // every opaque one.
+  // black if it's a shape-to-shape brace. See strutSurfaceMaterial. A single
+  // solid tube, always - no separate core mesh inside it (the clear-acrylic
+  // option used to hide a black one behind its translucent shell; removed
+  // so "clear" genuinely means clear, nothing visible through it).
   tube.material = strutSurfaceMaterial(grounded);
   (grounded ? strutShellMeshes : strutBlackMeshes).push(tube);
+  // Register with animateStrutGrowth - built at full length by default (so
+  // anything that never calls it just sees a normal finished strut), but
+  // whoever orchestrates the current rebuild (initial 2D->3D entry, or a
+  // scramble transition once its shapes have settled) can grow every strut
+  // in this list from its base end up to its shape end instead.
+  strutGrowthQueue.push({ tube, start, end, radius });
   return tube;
+}
+
+// Shared by primeStrutGrowth and animateStrutGrowth so both ever move a
+// strut's visible endpoint the same way.
+function growStrutEntryTo(entry, t) {
+  const { tube, start, end, radius } = entry;
+  const cur = {
+    x: start.x + (end.x - start.x) * t,
+    y: start.y + (end.y - start.y) * t,
+    z: start.z + (end.z - start.z) * t,
+  };
+  const path = [new BABYLON.Vector3(start.x, start.y, start.z), new BABYLON.Vector3(cur.x, cur.y, cur.z)];
+  BABYLON.MeshBuilder.CreateTube(null, { path, radius, instance: tube });
+}
+
+// Shrinks every strut this build just created down to a short stub RIGHT
+// NOW, synchronously, without consuming/starting anything - createSolidTube3D
+// always builds each strut at its real full length first (so a caller that
+// never animates anything still gets a normal finished strut), which is
+// exactly what would otherwise sit fully built and visible for the whole
+// 600ms a scramble's shapes take to glide into place, since animateStrutGrowth
+// itself isn't called until after that finishes. Call this immediately after
+// convertShapesTo3D, before any shape-transition tween starts, so the struts
+// are already invisible-short for the entire time the shapes are still
+// moving - then animateStrutGrowth (called once they've landed) is the FIRST
+// time the user ever sees them at anything but a stub, instead of a full
+// strut quietly shrinking then regrowing after already having been seen.
+function primeStrutGrowth() {
+  strutGrowthQueue.forEach(entry => growStrutEntryTo(entry, 0.02));
+}
+
+// Grows every strut this build just created from its base (or brace) end up
+// to its shape end, instead of them just appearing full-length - "drawn"
+// bottom to top, matching how they're already embedded/oriented (see
+// createSolidTube3D). Snaps each strut down to a short stub at its start
+// point, then lerps the visible end point out to the real one, updating the
+// existing tube mesh in place (CreateTube's `instance` option) rather than
+// rebuilding it every frame.
+async function animateStrutGrowth(durationMs = 1500) {
+  if (!babylonScene) return;
+  const entries = strutGrowthQueue;
+  strutGrowthQueue = [];
+  if (entries.length === 0) return;
+  const gen = ++strutGrowGen;
+  const isActive = () => gen === strutGrowGen && !!babylonScene;
+
+  // No-op if primeStrutGrowth already did this (the normal path) - still
+  // needed as the starting point for any caller that skipped priming.
+  entries.forEach(entry => growStrutEntryTo(entry, 0.02));
+
+  await tweenRaw(durationMs, isActive, (t) => {
+    const e = easeInOutSine(Math.max(0, Math.min(1, t)));
+    entries.forEach(entry => growStrutEntryTo(entry, Math.max(0.02, e)));
+  });
+  if (!isActive()) return;
+  entries.forEach(entry => growStrutEntryTo(entry, 1));
 }
 
 // Small red sphere marking a real connection/contact point in world space -
@@ -3377,9 +4563,10 @@ function markConnectionPoint(name, pointWorld, radius = 0.35) {
 // geometric center) for any shape type that has a real, hard-edged volume -
 // matching create3DShape's/createOpenShape3D's/createConcentricCircle3D's real
 // mesh math exactly. Returns null for types with no real volume to bound
-// (squiggle/arc-shape/halo - all stroke-only or soft glow; concentricArc now
-// DOES have real volume - a clear resin wedge behind its rings, see
-// createConcentricArc3D - and is a full Tier-1 participant too).
+// (squiggle/arc-shape - stroke-only, no fill at all; concentricArc and halo
+// both DO have real volume - a solid clear-acrylic shell/wedge wrapped around
+// their rings, see createConcentricArc3D/createHalo3D - and are full Tier-1
+// participants too).
 // Deliberately NOT gated on style==='filled': open-style rect/triangle/
 // semiCircle (openRect/openTriangle/openSemiCircle - this is what BOTH
 // skeleton shapes always are, per createShapeElement) use the exact same
@@ -3414,14 +4601,30 @@ function shapeVolumeRadius3D(shape) {
   }
   if (shape.type === 'concentricArc') {
     // Reclassified as Tier-1 (real volume) - the nested stroke-only rings
-    // now get a solid clear-resin wedge behind them (see createConcentricArc3D)
+    // now get a solid clear-acrylic wedge behind them (see createConcentricArc3D)
     // so they read as a real physical object instead of bare floating wire.
     // r is the outer ring radius, same formula as concentricCircle above.
     const rings = shape.rings || 4;
     const diff3 = (shape.diff || 10) / K3D_SCALE;
     return { r: rings * diff3, zOffset: 0 };
   }
-  if (shape.style === 'halo') return null; // soft radial glow, no hard edge to bound
+  if (shape.style === 'halo') {
+    // Reclassified as Tier-1 (real volume), the same reasoning that already
+    // moved concentricArc: createHalo3D wraps the whole ring stack in a
+    // solid clear-acrylic shell (haloAcrylic_) sized to the halo's own outer
+    // radius - a real physical object that needs real support, not a decal.
+    // Was `return null` (Tier-2, single-anchor touch only) from when a halo
+    // really was just flat alpha-blended discs with nothing solid around
+    // them; the shell addition made that stale, and left every halo
+    // ("bullseye encased in clear") without the connectivity-closure
+    // guarantee every other Tier-1 shape gets - it could end up touching
+    // just one other shape at a single point with no real strut of its own.
+    // zOffset must match the shell's own true center: createHalo3D centers
+    // it at world Z = zPos - haloRingSpan(rings)/2 (see tier1WorldCenter,
+    // world = zPos - zOffset).
+    const rings = shape.rings || 3;
+    return { r: s / 2, zOffset: haloRingSpan(rings) / 2 };
+  }
   // Deliberately just the in-plane corner/rim distance, NOT padded by the
   // shape's Z-thickness (was `+ depth/2` here) - that padding was a real bug,
   // not just extra safety margin: computeContactTilt reorients a tilted
@@ -3445,7 +4648,7 @@ function shapeVolumeRadius3D(shape) {
       // Circumradius of the equilateral profile used in create3DShape
       return { r: s / Math.sqrt(3), zOffset: 0 };
     default:
-      return null; // squiggle, arc (shape-type), halo - stroke-only/glow, still Tier-2 pass-through
+      return null; // squiggle, arc (shape-type) - stroke-only, still Tier-2 pass-through
   }
 }
 
@@ -3468,11 +4671,24 @@ function computeShapeProfile3D(shape, rad) {
     return { localProfile: { kind: 'isotropic', R: rad.r }, zHalf: 0.25 + (rings - 1) * 0.3 };
   }
   if (shape.type === 'concentricArc') {
-    // rad.r (outer ring radius) drives the resin wedge's size, NOT `s`
+    // rad.r (outer ring radius) drives the acrylic wedge's size, NOT `s`
     // (targetSize-based - unrelated to a concentricArc's real footprint) -
-    // matches the depth createConcentricArc3D's resin wedge actually uses.
-    const resinDepth = Math.max(0.8, rad.r * 2 * 0.12);
-    return { localProfile: { kind: 'isotropic', R: rad.r }, zHalf: resinDepth / 2 };
+    // matches the depth createConcentricArc3D's acrylic wedge actually uses.
+    const acrylicDepth = Math.max(0.8, rad.r * 2 * 0.12);
+    return { localProfile: { kind: 'isotropic', R: rad.r }, zHalf: acrylicDepth / 2 };
+  }
+  if (shape.style === 'halo') {
+    // Checked before the switch below since a halo's shape.type is 'circle'
+    // (see sketchdesktopreset.js) - it needs its OWN real depth here, not
+    // the generic circle case's, since its true volume is createHalo3D's
+    // clear-acrylic shell (haloAcrylic_), not a flat disc: shellDepth must match
+    // that function's own front/shellMargin math exactly, or a support query
+    // here disagrees with what's actually rendered.
+    const rings = shape.rings || 3;
+    const front = haloRingSpan(rings);
+    const shellMargin = Math.max(0.4, rad.r * 0.06);
+    const shellDepth = front + shellMargin * 2;
+    return { localProfile: { kind: 'isotropic', R: rad.r }, zHalf: shellDepth / 2 };
   }
   const zHalf = Math.max(0.8, s * 0.12) / 2; // matches create3DShape's `depth` / 2
   switch (shape.type) {
@@ -3526,7 +4742,21 @@ function tier1ShapeFields(shape, rad) {
     s: (shape.targetSize || 50) / K3D_SCALE,
     rotZ: -(shape.rot || 0),
     localProfile: profile ? profile.localProfile : null,
-    zHalf: profile ? profile.zHalf : rad.r
+    zHalf: profile ? profile.zHalf : rad.r,
+    // Only meaningful for concentricArc - see semiCircleAwareDistance,
+    // which needs the wedge's real angular sweep to know when a query
+    // direction points into its empty (uncovered) side rather than
+    // treating it as a full isotropic ring like localProfile does.
+    arcStart: shape.type === 'concentricArc' ? (shape.arcStart || 0) : undefined,
+    arcSweep: shape.type === 'concentricArc' ? (shape.arcSweep || Math.PI) : undefined,
+    // Only meaningful for semiCircle - see semiCircleAwareDistance. An
+    // "open" semiCircle's flat/missing half isn't actually empty: it's
+    // completed by a real (if faint, ~10% alpha) translucent ghost disc at
+    // the EXACT SAME radius as the drawn half (create3DShape's
+    // shape_${index}_ghost) - a strut can legitimately reach the shape
+    // through that half, at its true full radius, not just near its core.
+    // Only the solid/filled style genuinely has nothing there.
+    semiCircleOpen: shape.type === 'semiCircle' ? (shape.style === 'open') : undefined
   };
 }
 
@@ -3804,20 +5034,58 @@ function clearWireZTilt(samplePixelPts, deltaPixel, touchZ, anchorT, zTilt, tier
   return best;
 }
 
-// semiCircle's real shape is a half-disc (bulge at local y<0, flat/open edge
-// at y=0 - see arcPathLocal), but its shared localProfile stays isotropic
+// semiCircle's real shape is a half-disc (bulge at local y<0, flat edge at
+// y=0 - see arcPathLocal), but its shared localProfile stays isotropic
 // (matches a full circle in every direction) for safety - two attempts at a
 // real polygon profile there each broke 3D mode outright in different ways
 // once fed into buildElementTree's placement machinery (a page hang, then a
 // blank canvas). This is a narrow, SEPARATE correction used only where
 // struts pick a touch point - never in placement/collision, which stays on
-// the safe isotropic path. If the query direction points into the shape's
-// empty half, cap the reach down near its own thickness instead of the full
-// isotropic radius, so a strut aimed through an open semiCircle's missing
-// material doesn't reach as far as where a full circle's edge would be.
+// the safe isotropic path. If the query direction points into the flat
+// half's side and there's genuinely nothing built there (the SOLID/filled
+// style - see the semiCircleOpen check just below, which skips this
+// entirely for the OPEN style: that one has a real, if faint, ghost disc
+// completing that exact half - see tier1ShapeFields), cap the reach down
+// near the shape's own thickness instead of the full isotropic radius, so a
+// strut aimed at a filled semiCircle's missing material doesn't reach as
+// far as where a full circle's edge would be.
+//
+// concentricArc gets the same treatment for the same reason: its
+// localProfile is isotropic (a full ring at the outer radius), but the
+// actual rendered wedge (see createConcentricArc3D) only covers
+// [arcStart, arcStart+arcSweep] - typically a half-sweep, same idea as
+// semiCircle. A query direction outside that sweep has no real material out
+// at the ring radius at all, just the thin pie-slice edge back toward the
+// center - without this, a strut approaching from the wedge's empty side
+// (e.g. straight down, if the sweep doesn't cover "down") lands at the full
+// isotropic radius, far past where the shape actually is.
 function semiCircleAwareDistance(nodeInfo, worldDir) {
   const baseDist = supportDistanceWorld(nodeInfo, nodeInfo.contactDir, worldDir);
+  if (nodeInfo.shapeType === 'concentricArc') {
+    let q = nodeInfo.fixedOrientation || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, nodeInfo.rotZ || 0);
+    if (nodeInfo.scrambleQuat) q = nodeInfo.scrambleQuat.multiply(q);
+    const localDir = worldToLocalDir(worldDir, q);
+    // Matches arcPathLocal's own (R*cos(t), -R*sin(t)) parametrization, so
+    // this angle lands in the exact same frame arcStart/arcSweep are
+    // defined in.
+    let angle = Math.atan2(-localDir.y, localDir.x);
+    const a0 = nodeInfo.arcStart || 0;
+    const a1 = a0 + (nodeInfo.arcSweep != null ? nodeInfo.arcSweep : Math.PI);
+    while (angle < a0) angle += Math.PI * 2;
+    while (angle >= a0 + Math.PI * 2) angle -= Math.PI * 2;
+    if (angle > a1) {
+      const zHalf = nodeInfo.zHalf != null ? nodeInfo.zHalf : nodeInfo.r;
+      return Math.min(baseDist, zHalf * 1.5);
+    }
+    return baseDist;
+  }
   if (nodeInfo.shapeType !== 'semiCircle') return baseDist;
+  // The ghost disc completes an open semiCircle's missing half at the exact
+  // same radius the isotropic profile already assumes (see
+  // tier1ShapeFields) - baseDist is already correct as-is, uncapped, same
+  // as a real full circle. Only a SOLID/filled semiCircle (no ghost) still
+  // needs the cap below.
+  if (nodeInfo.semiCircleOpen) return baseDist;
   let q = nodeInfo.fixedOrientation || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, nodeInfo.rotZ || 0);
   if (nodeInfo.scrambleQuat) q = nodeInfo.scrambleQuat.multiply(q);
   const localDir = worldToLocalDir(worldDir, q);
@@ -3872,39 +5140,36 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
     orientQuat = scrambleQuat.multiply(
       contactQuat || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, rotZ));
   }
-  let tiltNode = null;
-  if (orientQuat) {
-    // Pivot at the shape's TRUE geometric center, not its anchor point -
-    // for circle/rect/triangle/semiCircle these coincide (zOffset 0), but
-    // concentricCircle's anchor sits off-center from its ring stack
-    // (zOffset != 0, see shapeVolumeRadius3D). Rotating around the wrong
-    // pivot would displace the shape's real center away from the position
-    // buildElementTree verified as non-overlapping - defeating the
-    // whole point of the contact math. World Z of the true center = zPos -
-    // zOffset (zOffset is in the same layerZ-space anchorZ/zPos already use).
-    const vol = shapeVolumeRadius3D(shape);
-    const trueCenterZ = zPos - (vol ? vol.zOffset : 0);
-    tiltNode = new BABYLON.TransformNode(`tilt_${index}`, babylonScene);
-    tiltNode.position = new BABYLON.Vector3(xPos, yPos, trueCenterZ);
-    tiltNode.rotationQuaternion = orientQuat;
-  }
-  const meshX = tiltNode ? 0 : xPos;
-  const meshY = tiltNode ? 0 : yPos;
-  const meshZ = tiltNode ? 0 : zPos;
-  const meshRotZ = tiltNode ? 0 : rotZ;
+  // ALWAYS wrap every shape in its own tilt_${index} node - even with no
+  // real tilt (orientQuat null, plain Rz used instead) - so every shape
+  // type (including concentricCircle/concentricArc/halo/squiggle, which
+  // never get a "shape_${index}" mesh of their own) has ONE consistent,
+  // predictably-named root that scramble-transition animation (see
+  // shapeRootNodesByIndex in the scramble-animation section below) can
+  // always find and move as a unit, regardless of shape type or naming.
+  const vol = shapeVolumeRadius3D(shape);
+  const trueCenterZ = zPos - (vol ? vol.zOffset : 0);
+  const tiltNode = new BABYLON.TransformNode(`tilt_${index}`, babylonScene);
+  tiltNode.position = new BABYLON.Vector3(xPos, yPos, trueCenterZ);
+  tiltNode.rotationQuaternion = orientQuat || BABYLON.Quaternion.RotationAxis(BABYLON.Axis.Z, rotZ);
+  const meshX = 0;
+  const meshY = 0;
+  const meshZ = 0;
+  const meshRotZ = 0;
 
   try {
     // ---- circle / halo ----
     if (shape.type === 'circle') {
       if (shape.style === 'halo') {
-        return createHalo3D(shape, index, xPos, yPos, zPos, s, swr);
+        return createHalo3D(shape, index, xPos, yPos, zPos, s, swr, tiltNode);
       }
       const disc = tagVolumeBody(BABYLON.MeshBuilder.CreateCylinder(`shape_${index}`, {
         diameter: s, height: depth, tessellation: 64
       }, babylonScene));
       disc.rotation.x = Math.PI / 2;
       disc.position = new BABYLON.Vector3(meshX, meshY, meshZ);
-      disc.material = unlitMat(`mat_${index}`, fill);
+      disc.material = shapeBodyMat(`mat_${index}`, fill);
+      shapeBodyMeshes.push(disc);
       if (tiltNode) disc.parent = tiltNode;
       addPrismOutline(`outline_${index}`, arcPathLocal(s / 2, 0, Math.PI * 2, 64), depth, swr, meshX, meshY, meshZ, 0, [], false, tiltNode);
       return true;
@@ -3917,7 +5182,8 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
       const box = tagVolumeBody(BABYLON.MeshBuilder.CreateBox(`shape_${index}`, { width: w, height: h, depth: depth }, babylonScene));
       box.position = new BABYLON.Vector3(meshX, meshY, meshZ);
       box.rotation.z = meshRotZ;
-      box.material = unlitMat(`mat_${index}`, fill);
+      box.material = shapeBodyMat(`mat_${index}`, fill);
+      shapeBodyMeshes.push(box);
       if (tiltNode) box.parent = tiltNode;
       const rp = [
         new BABYLON.Vector3(-w / 2, -h / 2, 0), new BABYLON.Vector3(w / 2, -h / 2, 0),
@@ -3955,18 +5221,26 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
         // "Complete the circle with 90% translucency" - createOpenShape3D's
         // own gradient already fades to fully transparent right at the
         // flat/open edge, so a strut or connector landing near there reads
-        // as touching nothing. A faint (10% opacity) FULL disc - literally
-        // the same half-disc wedge geometry every filled semiCircle already
-        // uses, just mirrored to a full sweep - suggests the whole circle's
-        // real presence without competing with the actual rendered half. No
+        // as touching nothing. A faint (10% opacity) disc over just the
+        // MISSING half - not the other tagAcrylicVolume() call sites' full
+        // duplicate-footprint ghosts - suggests the whole circle's real
+        // presence without competing with the actual rendered half. No
         // outline (matches the earlier "no black line" call); the earlier
         // flat-cap attempt at this was reverted on suspicion of causing a
         // blank-canvas crash, but that was actually a separate bug (the
         // semiCircle support-profile change) - this is new rendering-only
         // geometry, not a repeat of that.
+        // Deliberately NOT tagAcrylicVolume() (skipUsdz): that tag exists
+        // because the OTHER acrylic ghosts sit exactly coplanar with a real
+        // shape's own surface, which z-fights and shimmers in AR. This one
+        // covers only the half the real shape ISN'T already drawing, so
+        // there's nothing to fight - it's the one piece of "integrity"
+        // structure AR was missing that 2D/3D already show. Its ~10% alpha
+        // is well under USDZ_GLASS_BELOW, so meshUsdSurface exports it
+        // as-is rather than forcing it toward opaque.
         if (success) {
-          const ghostFill = CLEAR_RESIN_COLOR; // colorless (not tinted with the shape's own hue) - same neutral clear-resin material used elsewhere in the piece
-          tagResinVolume(extrudePrism(`shape_${index}_ghost`, arcPathLocal(s / 2, 0, Math.PI * 2, 96), depth, ghostFill, meshX, meshY, meshZ, meshRotZ, tiltNode));
+          const ghostFill = CLEAR_ACRYLIC_COLOR; // colorless (not tinted with the shape's own hue) - same neutral clear-acrylic material used elsewhere in the piece
+          extrudePrism(`shape_${index}_ghost`, arcPathLocal(s / 2, Math.PI, Math.PI * 2, 48), depth, ghostFill, meshX, meshY, meshZ, meshRotZ, tiltNode);
         }
         return success;
       }
@@ -3990,7 +5264,7 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
     if (shape.type === 'squiggle') {
       if (!shape.sv || shape.sv.length < 2) return false;
       const pts = shape.sv.map(p => new BABYLON.Vector3(p.x / K3D_SCALE, -p.y / K3D_SCALE, 0));
-      makeStrokeTube(`shape_${index}`, pts, swr, fill, xPos, yPos, zPos, rotZ);
+      makeStrokeTube(`shape_${index}`, pts, swr, fill, meshX, meshY, meshZ, meshRotZ, tiltNode, true);
       return true;
     }
 
@@ -3998,7 +5272,7 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
     if (shape.type === 'arc') {
       const a0 = shape.arcStart || 0;
       const a1 = a0 + (shape.arcSweep || Math.PI);
-      makeStrokeTube(`shape_${index}`, arcPathLocal(s / 2, a0, a1, 48), swr, fill, xPos, yPos, zPos, rotZ);
+      makeStrokeTube(`shape_${index}`, arcPathLocal(s / 2, a0, a1, 48), swr, fill, meshX, meshY, meshZ, meshRotZ, tiltNode, true);
       return true;
     }
 
@@ -4007,8 +5281,10 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
       diameter: s, height: 0.3, tessellation: 64
     }, babylonScene));
     disc.rotation.x = Math.PI / 2;
-    disc.position = new BABYLON.Vector3(xPos, yPos, zPos);
-    disc.material = unlitMat(`mat_${index}`, fill);
+    disc.position = new BABYLON.Vector3(meshX, meshY, meshZ);
+    disc.material = shapeBodyMat(`mat_${index}`, fill);
+    shapeBodyMeshes.push(disc);
+    if (tiltNode) disc.parent = tiltNode;
     return true;
   } catch (e) {
     console.error(`Failed to create shape ${index} (${shape.type}/${shape.style}):`, e);
@@ -4019,28 +5295,40 @@ function create3DShape(shape, index, layerZ = 0, contactDir = null, resolvedXY =
 // Total Z depth a halo's own ring stack actually spans - 8 gradient layers
 // (each += 0.03) plus (rings-1) solid rings (each += 0.5), exactly matching
 // createHalo3D's own `front` stepping below. Shared with
-// computeConnectorAnchor's 'halo' case so the resin shell's real extent and
+// computeConnectorAnchor's 'halo' case so the acrylic shell's real extent and
 // the touch-point math computed against it can never drift apart.
 function haloRingSpan(rings) {
   return 8 * 0.03 + Math.max(0, rings - 1) * 0.5;
 }
 
-function createHalo3D(shape, index, x, y, z, s, swr) {
+function createHalo3D(shape, index, x, y, z, s, swr, tiltNode = null) {
   // 2D: maxRadius = s/2; radius_i = maxR*(rings-i)/rings
   // i=0: radial gradient (solid core -> transparent rim), no stroke
   // i>0: solid muted color + black stroke (sw * 0.5)
   const rings = shape.rings || 3;
   const maxR = s / 2;
   let front = 0; // each later element drawn slightly in front (like 2D painter order)
+  const mx = tiltNode ? 0 : x;
+  const my = tiltNode ? 0 : y;
+  const mz = tiltNode ? 0 : z;
 
   for (let i = 0; i < rings; i++) {
     const radius = maxR * (rings - i) / rings;
     const raw = p5ColToRGBA(shape.haloColors && shape.haloColors[i] ? shape.haloColors[i] : shape.c);
+    // A halo's ring color gets muted TWICE before bodyColor3D's own
+    // saturation compensation ever sees it - the 2D sketch's own "*0.7
+    // saturation, *0.8 lightness" pass, then the *0.85 darken just below -
+    // so by the time BODY_SATURATION_3D's shared push runs, there's less
+    // real color range left to push against, and halos read flatter than
+    // every other body at the identical multiplier. A dedicated extra push
+    // on the still-vivid raw color, before any of that muting touches it,
+    // brings them back in line with the rest of the piece.
+    const vivid = saturate3D(raw, HALO_SATURATION_BOOST);
     // 2D mutes: saturation*0.7, lightness*0.8, alpha 0.8 (approximated in RGB)
     // - then the global 3D body treatment (translucency + saturation
     // compensation) on top; the gradient ring's stops already derive from
     // muted's r/g/b/a, so this covers both the solid rings and the glow
-    const muted = bodyColor3D({ r: raw.r * 0.85, g: raw.g * 0.85, b: raw.b * 0.85, a: 0.8 });
+    const muted = bodyColor3D({ r: vivid.r * 0.85, g: vivid.g * 0.85, b: vivid.b * 0.85, a: 0.8 });
 
     if (i === 0) {
       // Real smooth radial gradient (canvas-drawn onto a DynamicTexture),
@@ -4069,7 +5357,7 @@ function createHalo3D(shape, index, x, y, z, s, swr) {
       const disc = BABYLON.MeshBuilder.CreateDisc(`halo_${index}_glow`, {
         radius, tessellation: 64, sideOrientation: BABYLON.Mesh.DOUBLESIDE
       }, babylonScene);
-      disc.position = new BABYLON.Vector3(x, y, z - front);
+      disc.position = new BABYLON.Vector3(mx, my, mz - front);
       const gradMat = new BABYLON.StandardMaterial(`haloGradMat_${index}`, babylonScene);
       gradMat.diffuseTexture = tex;
       gradMat.emissiveTexture = tex;
@@ -4078,6 +5366,7 @@ function createHalo3D(shape, index, x, y, z, s, swr) {
       gradMat.specularColor = new BABYLON.Color3(0, 0, 0);
       gradMat.backFaceCulling = false;
       disc.material = gradMat;
+      if (tiltNode) disc.parent = tiltNode;
       front += 8 * 0.03; // same total depth budget the old 8-layer stack used - keeps haloRingSpan's formula (and the shell/anchor math built on it) unchanged
     } else {
       // Thin solid cylinder per ring = real 3D volume
@@ -4085,9 +5374,11 @@ function createHalo3D(shape, index, x, y, z, s, swr) {
         diameter: radius * 2, height: 0.4, tessellation: 64
       }, babylonScene));
       disc.rotation.x = Math.PI / 2;
-      disc.position = new BABYLON.Vector3(x, y, z - front);
-      disc.material = unlitMat(`haloMat_${index}_${i}`, muted);
-      makeStrokeTube(`haloOutline_${index}_${i}`, arcPathLocal(radius, 0, Math.PI * 2, 64), swr * 0.5, K3D_BLACK, x, y, z - front - 0.25);
+      disc.position = new BABYLON.Vector3(mx, my, mz - front);
+      disc.material = shapeBodyMat(`haloMat_${index}_${i}`, muted);
+      shapeBodyMeshes.push(disc);
+      if (tiltNode) disc.parent = tiltNode;
+      makeStrokeTube(`haloOutline_${index}_${i}`, arcPathLocal(radius, 0, Math.PI * 2, 64), swr * 0.5, K3D_BLACK, mx, my, mz - front - 0.25, 0, tiltNode);
       front += 0.5;
     }
   }
@@ -4095,14 +5386,14 @@ function createHalo3D(shape, index, x, y, z, s, swr) {
   // A halo is otherwise just a stack of flat, camera-facing discs - real
   // color but no actual volume around it, floating like a decal. Same
   // treatment concentricArc's bare stroke rings got: a solid, mostly-
-  // transparent clear-resin shell sized to the halo's own outer radius -
+  // transparent clear-acrylic shell sized to the halo's own outer radius -
   // but spanning (and centered on) the FULL depth of the ring stack
   // (z - front to z), not just parked behind the backmost ring, so every
   // ring actually sits INSIDE the shell's volume instead of the shell
   // reading as a flat plate trailing behind them.
   const shellMargin = Math.max(0.4, maxR * 0.06);
   const shellDepth = front + shellMargin * 2;
-  tagResinVolume(extrudePrism(`haloResin_${index}`, arcPathLocal(maxR, 0, Math.PI * 2, 64), shellDepth, CLEAR_RESIN_COLOR, x, y, z - front / 2));
+  tagAcrylicVolume(extrudePrism(`haloAcrylic_${index}`, arcPathLocal(maxR, 0, Math.PI * 2, 64), shellDepth, CLEAR_ACRYLIC_COLOR, mx, my, mz - front / 2, 0, tiltNode));
 
   return true;
 }
@@ -4116,6 +5407,7 @@ function createConcentricCircle3D(shape, index, x, y, z, tiltNode = null) {
   // this), not the anchor itself, so each ring's local offset needs the same
   // correction to land in exactly the same place a non-tilted stack would.
   const zOffset = (rings - 1) * 0.3;
+  const outerR = rings * diff3;
 
   for (let i = rings; i > 0; i--) {
     const radius = i * diff3;
@@ -4136,18 +5428,41 @@ function createConcentricCircle3D(shape, index, x, y, z, tiltNode = null) {
       : new BABYLON.Vector3(x, y, z + localZ);
     if (tiltNode) disc.parent = tiltNode;
     const col = bodyColor3D(p5ColToRGBA(shape.concentricColors && shape.concentricColors[i - 1] ? shape.concentricColors[i - 1] : shape.c));
-    disc.material = unlitMat(`concentricMat_${index}_${i}`, col);
+    disc.material = shapeBodyMat(`concentricMat_${index}_${i}`, col);
+    shapeBodyMeshes.push(disc);
   }
+
+  // Enclose the whole tapering ring stack in a solid, mostly-transparent
+  // clear-acrylic cylinder - the "cast in real material, not floating discs"
+  // treatment concentricArc/halo already got, and for a sharper reason
+  // here: a strut/contact touch point is computed against this shape's
+  // ISOTROPIC profile (see computeShapeProfile3D - a uniform-radius
+  // cylinder spanning the full depth, not the true tapering silhouette
+  // above), so without a real surface matching that same radius/depth, a
+  // touch point could land past the actual (smaller, further-back) ring at
+  // that depth, in empty air - exactly why a concentricCircle could read as
+  // unsupported despite already being guaranteed a real strut. Deliberately
+  // a plain cylinder at the outer radius, not a literal tapered cone
+  // hugging each ring's true size, so the physical mesh and the analytic
+  // profile everything else (buildElementTree, computeContactTilt) already
+  // assumes can never disagree about where the surface actually is.
+  const shellMargin = Math.max(0.4, outerR * 0.06);
+  const shellDepth = (rings - 1) * 0.6 + shellMargin * 2;
+  const shellX = tiltNode ? 0 : x;
+  const shellY = tiltNode ? 0 : y;
+  const shellZ = tiltNode ? 0 : z - (rings - 1) * 0.3; // true center - matches zOffset above
+  tagAcrylicVolume(extrudePrism(`concentricAcrylic_${index}`, arcPathLocal(outerR, 0, Math.PI * 2, 64), shellDepth, CLEAR_ACRYLIC_COLOR, shellX, shellY, shellZ, 0, tiltNode));
+
   return true;
 }
 
 function createConcentricArc3D(shape, index, x, y, z, swr, rotZ, tiltNode = null) {
   // 2D: noFill! STROKED arcs with concentric colors, diameter = i * diff * 2.
   // On their own these are bare open wire (stroke tubes, no fill) - reclassified
-  // as Tier-1 with a real volume: a solid, mostly-transparent "clear resin"
+  // as Tier-1 with a real volume: a solid, mostly-transparent "clear acrylic"
   // wedge sized to the ring stack's own outer radius/sweep, so the nested
   // rings read as cast/embedded inside a real physical block, the way a
-  // wireframe or metal armature gets held in a clear resin casting, rather
+  // wireframe or metal armature gets held in a clear acrylic casting, rather
   // than floating as unsupported open curves.
   const rings = shape.rings || 4;
   const diff3 = (shape.diff || 10) / K3D_SCALE;
@@ -4160,19 +5475,30 @@ function createConcentricArc3D(shape, index, x, y, z, swr, rotZ, tiltNode = null
   const meshZ = tiltNode ? 0 : z;
   const meshRotZ = tiltNode ? 0 : rotZ;
 
-  const resinDepth = Math.max(0.8, outerR * 2 * 0.12); // must match computeShapeProfile3D's concentricArc zHalf*2
+  const acrylicDepth = Math.max(0.8, outerR * 2 * 0.12); // must match computeShapeProfile3D's concentricArc zHalf*2
   const arcPts = arcPathLocal(outerR, a0, a1, 48);
   const wedgeProfile = [new BABYLON.Vector3(0, 0, 0), ...arcPts];
-  tagResinVolume(extrudePrism(`concentricArcResin_${index}`, wedgeProfile, resinDepth, CLEAR_RESIN_COLOR, meshX, meshY, meshZ, meshRotZ, tiltNode));
+  // Deliberately NOT tagAcrylicVolume() (skipUsdz): unlike the OTHER acrylic
+  // ghosts (semiCircle's old full-disc completion, the halo shell), this
+  // wedge doesn't sit coplanar with any other shape's own fill - the rings
+  // it holds are bare stroke tubes with no flat face to z-fight against, and
+  // this IS the shape's only real volume (without it there'd be nothing
+  // here at all in AR, just floating wire). shapeVolumeRadius3D/
+  // computeShapeProfile3D already size a strut's attachment point to this
+  // same outerR, so once this mesh is actually present in AR a strut lands
+  // right on its real outer surface rather than reaching into empty space
+  // where an invisible casing used to be. Its ~alpha is well under
+  // USDZ_GLASS_BELOW, so meshUsdSurface exports it translucent as-is.
+  extrudePrism(`concentricArcAcrylic_${index}`, wedgeProfile, acrylicDepth, CLEAR_ACRYLIC_COLOR, meshX, meshY, meshZ, meshRotZ, tiltNode);
   // No outline - a real black edge read as too heavy/solid for something meant
-  // to look like clear resin. The near-invisible fill plus the rings it holds
+  // to look like clear acrylic. The near-invisible fill plus the rings it holds
   // is enough to convey "there's material here," per the user's call.
 
   for (let i = rings; i > 0; i--) {
     const radius = i * diff3;
     if (radius <= 0) continue;
     const col = bodyColor3D(p5ColToRGBA(shape.concentricColors && shape.concentricColors[i - 1] ? shape.concentricColors[i - 1] : shape.c));
-    makeStrokeTube(`concentricArc_${index}_${i}`, arcPathLocal(radius, a0, a1, 48), swr, col, meshX, meshY, meshZ - (rings - i) * 0.05, meshRotZ, tiltNode);
+    makeStrokeTube(`concentricArc_${index}_${i}`, arcPathLocal(radius, a0, a1, 48), swr, col, meshX, meshY, meshZ - (rings - i) * 0.05, meshRotZ, tiltNode, true);
   }
   return true;
 }
@@ -4209,6 +5535,14 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ, tiltNode = null) {
   const transparent = openCSS(0);
   const theta = shape.gradientAngle || 0;
   const dx = Math.cos(theta), dy = Math.sin(theta);
+  // Gradient direction in Babylon local coords, hoisted up from where the
+  // fade walls compute it below (search gx/gy) so the USDZ export metadata
+  // can tag the SAME direction - without this, AR fell back to a generic
+  // radial "denser at the centre" fake-volume gradient that has nothing to
+  // do with the shape's actual 2D gradientAngle, which is why open shapes'
+  // colours read as flat/uniform in AR instead of a real linear gradient.
+  const gx = shape.type === 'semiCircle' ? 0 : dx;
+  const gy = shape.type === 'semiCircle' ? 1 : -dy;
 
   if (shape.type === 'rect') {
     const w = S2, h = S2 * 0.6;
@@ -4312,10 +5646,17 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ, tiltNode = null) {
   m.diffuseTexture = tex;
   m.emissiveTexture = tex;
   m.useAlphaFromDiffuseTexture = true;
-  m.disableLighting = true;
-  m.specularColor = new BABYLON.Color3(0, 0, 0);
+  // Always zeroed: diffuseColor defaults to white and StandardMaterial
+  // multiplies it into the diffuseTexture for the LIT term, so left alone it
+  // would tint the shape's real drawn pixels by whatever the light rig
+  // contributes below. emissiveTexture (unaffected by lighting) is what
+  // actually carries the shape's exact colour.
+  m.diffuseColor = new BABYLON.Color3(0, 0, 0);
   m.backFaceCulling = true; // single-sided faces so front+back don't double the alpha
   m.alpha = BODY_ALPHA_3D; // multiplies the texture's own alpha - global 3D translucency, see BODY_ALPHA_3D
+  m.disableLighting = false;
+  m.specularColor = new BABYLON.Color3(SHAPE_SPEC_COLOR.r, SHAPE_SPEC_COLOR.g, SHAPE_SPEC_COLOR.b);
+  m.specularPower = SHAPE_SPEC_POWER;
 
   // Z VOLUME: textured front + back faces separated by depth
   const depth = Math.max(0.8, s * 0.12);
@@ -4333,6 +5674,7 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ, tiltNode = null) {
   back.rotation.z = meshRotZ;
   back.material = m;
   if (tiltNode) back.parent = tiltNode;
+  shapeBodyMeshes.push(front, back);
 
   // Side wall matching the shape silhouette, with alpha FADING along the same
   // gradient as the 2D fill (no solid boundary - the open edge stays open)
@@ -4379,7 +5721,13 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ, tiltNode = null) {
       // so transforming by its matrix would land the fill half a depth
       // behind its own outline - the outline tubes are placed at meshZ.
       // Shift local Z by +depth/2 to put the prism back on the true centre.
-      exportZOffset: depth / 2
+      exportZOffset: depth / 2,
+      // The shape's REAL 2D gradient direction (same gx/gy the fade walls
+      // use just below), so collectUsdParts can build a linear gradient
+      // along it instead of falling back to volumeGradient's generic radial
+      // "denser at the centre" field - which has no relationship to
+      // gradientAngle and is why these read as flat/uniform in AR otherwise.
+      exportGradientDir: { x: gx, y: gy }
     };
   }
   // Skipped by BOTH exporters: the front plane's polygon substitution
@@ -4398,9 +5746,8 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ, tiltNode = null) {
     // it hunts for the edge closest to fully-open, so with the sign flipped
     // it grabs an arc segment near the bulge instead of the true flat edge,
     // leaving a gap mid-arc while still stroking straight across the real
-    // open side.)
-    const gx = shape.type === 'semiCircle' ? 0 : dx;
-    const gy = shape.type === 'semiCircle' ? 1 : -dy;
+    // open side.) gx/gy themselves are computed once, up near dx/dy, and
+    // reused here and in the export metadata below.
     let minDot = Infinity, maxDot = -Infinity;
     profile.forEach(p => {
       const t = p.x * gx + p.y * gy;
@@ -4445,9 +5792,10 @@ function createOpenShape3D(shape, index, x, y, z, s, rotZ, tiltNode = null) {
         }, babylonScene);
         seg.position = new BABYLON.Vector3(meshX, meshY, meshZ);
         seg.rotation.z = meshRotZ;
-        seg.material = unlitMat(`open_${index}_w${wallIdx}_mat`, {
+        seg.material = shapeBodyMat(`open_${index}_w${wallIdx}_mat`, {
           r: fillRGBA.r, g: fillRGBA.g, b: fillRGBA.b, a: a
         });
+        shapeBodyMeshes.push(seg);
         seg.metadata = { skipExport: true }; // fade decoration only; front polygon covers export
         if (tiltNode) seg.parent = tiltNode;
         wallIdx++;
@@ -4574,6 +5922,11 @@ function lineTubeAbsolute(name, pts2D, w2D, col, layerZ, zTilt = 0, anchorT = 0.
     blackWireMeshes.push({ mesh: tube, alpha: rgba.a });
   } else {
     tube.material = unlitMat(name + '_mat', rgba);
+    // Per-call material (not cached, so this can't leak onto any other
+    // mesh) - always a closed tube, seen from outside only. See
+    // strutSurfaceMaterial's identical fix for why: without it, a
+    // translucent tube shows its own far wall through the near one.
+    tube.material.backFaceCulling = true;
   }
   return tube;
 }
@@ -4889,8 +6242,24 @@ function raiseDeltaAboveFloor(deltaPixel, samplePixelPoints, tier1Placed) {
     if (below > worstBelow) worstBelow = below;
   });
   if (worstBelow <= 0) return deltaPixel;
-  return { dx: deltaPixel.dx, dy: deltaPixel.dy - worstBelow * K3D_SCALE };
+  // worstBelow (world units) rides along on the result - the anchor point
+  // this delta was built to land exactly on a target's surface gets pushed
+  // up by the SAME uniform shift as every other sample point, since dy
+  // moves once for the whole curve. A shape whose only connector needed a
+  // big raise (a spiral/arc with far coils dipping well below the floor)
+  // can end up with its "connected" wire no longer actually touching it at
+  // all - see FLOOR_RAISE_BREAKS_TOUCH below, which uses this to decide
+  // whether that credit is still earned.
+  return { dx: deltaPixel.dx, dy: deltaPixel.dy - worstBelow * K3D_SCALE, raisedBy: worstBelow };
 }
+// How far raiseDeltaAboveFloor is allowed to push a connector's anchor off
+// a target's actual surface before its "real touch" credit (skeletonConnectedNodes)
+// is revoked - a small raise (the function's own deliberate +1 unit of
+// clear air, or a couple more) still reads as touching; several world
+// units reads as a visible gap ("this shape has no support"), so the
+// shape falls back to the base-strut passes' own safety net instead of
+// silently counting on a connector that no longer reaches it.
+const FLOOR_RAISE_BREAKS_TOUCH = 4;
 function computeConnectorAnchor(kind, raw, globalIndex, tier1Placed, forcedTarget = null, claimedSecondary = null) {
   if (!tier1Placed || tier1Placed.length === 0) return null;
 
@@ -5055,6 +6424,10 @@ function computeConnectorAnchor(kind, raw, globalIndex, tier1Placed, forcedTarge
         }
       }
       zTilt = clearWireZTilt(wireSamplePts, deltaPixel, touchWorld.z, anchorT, zTilt, tier1Placed, target);
+      // Same uniform dy shift as the target-credit check above, expressed
+      // as a world point - the anchor's TRUE final position (see
+      // raiseDeltaAboveFloor: only dy moves, so x/z stay exactly touchWorld's).
+      const lineTouchBroken = (deltaPixel.raisedBy || 0) > FLOOR_RAISE_BREAKS_TOUCH;
       return {
         mode: 'delta',
         deltaPixel,
@@ -5062,7 +6435,8 @@ function computeConnectorAnchor(kind, raw, globalIndex, tier1Placed, forcedTarge
         anchorT,
         zTilt,
         primaryAnchorWorld: touchWorld,
-        targetNode: target
+        targetNode: lineTouchBroken ? null : target,
+        strandedAnchorWorld: lineTouchBroken ? { x: touchWorld.x, y: touchWorld.y + deltaPixel.raisedBy, z: touchWorld.z } : null
       };
     }
     case 'spiral': {
@@ -5111,6 +6485,7 @@ function computeConnectorAnchor(kind, raw, globalIndex, tier1Placed, forcedTarge
       // A spiral wire is solid too - same depth-clearance as line/bezier/arc.
       let zTilt = leanToSecondary(farEndWorld, globalIndex + 1);
       zTilt = clearWireZTilt(spiralPts, deltaPixel, touchWorld.z, anchorT, zTilt, tier1Placed, target);
+      const spiralTouchBroken = (deltaPixel.raisedBy || 0) > FLOOR_RAISE_BREAKS_TOUCH;
       return {
         mode: 'delta',
         deltaPixel,
@@ -5118,7 +6493,8 @@ function computeConnectorAnchor(kind, raw, globalIndex, tier1Placed, forcedTarge
         anchorT,
         zTilt,
         primaryAnchorWorld: touchWorld,
-        targetNode: target
+        targetNode: spiralTouchBroken ? null : target,
+        strandedAnchorWorld: spiralTouchBroken ? { x: touchWorld.x, y: touchWorld.y + deltaPixel.raisedBy, z: touchWorld.z } : null
       };
     }
     case 'arcline': {
@@ -5221,16 +6597,21 @@ function computeConnectorAnchor(kind, raw, globalIndex, tier1Placed, forcedTarge
         }
         zTilt = clearWireZTilt(arcWirePts, deltaPixel, touchWorld.z, anchorT, zTilt, tier1Placed, target);
       }
+      // The same uniform dy shift applies to every point on the curve,
+      // string-target breakpoints included - if it broke the primary
+      // anchor's touch it broke theirs too.
+      const arcTouchBroken = (deltaPixel.raisedBy || 0) > FLOOR_RAISE_BREAKS_TOUCH;
       return {
         mode: 'delta',
         deltaPixel,
         targetWorldZ: touchWorld.z,
         anchorT,
         zTilt,
-        stringTargetNodes,
+        stringTargetNodes: arcTouchBroken ? undefined : stringTargetNodes,
         primaryAnchorWorld: touchWorld,
         stringAnchors,
-        targetNode: target
+        targetNode: arcTouchBroken ? null : target,
+        strandedAnchorWorld: arcTouchBroken ? { x: touchWorld.x, y: touchWorld.y + deltaPixel.raisedBy, z: touchWorld.z } : null
       };
     }
     case 'squiggle': {
@@ -5265,7 +6646,7 @@ function computeConnectorAnchor(kind, raw, globalIndex, tier1Placed, forcedTarge
       // Push the halo's center further out, along the same direction its
       // touch point already faces, so its real SHELL's boundary lands on
       // the target's surface instead of its bare center. The shell
-      // (createHalo3D's clear-resin container, sized to span/contain the
+      // (createHalo3D's clear-acrylic container, sized to span/contain the
       // WHOLE ring stack - see haloRingSpan) is a real oriented profile -
       // wide in-plane (haloR) but thin straight through, NOT a uniform
       // sphere - pushing by a flat haloR in every direction used to
@@ -5685,7 +7066,14 @@ function tessellateForGradient(geom) {
 function collectExportMeshes() {
   return babylonScene.meshes.filter(m =>
     !m.name.startsWith('skyFace_') && m.isEnabled() && m.getTotalVertices() > 0 &&
-    !(m.metadata && m.metadata.skipExport)
+    !(m.metadata && m.metadata.skipExport) &&
+    // isEnabled() alone doesn't cover this - it's Babylon's scene-graph
+    // enable/disable, a different flag from isVisible (what
+    // window.setStructureVisible actually toggles for "Hide base &
+    // struts"). Without this, turning that off only hid the base/struts
+    // from the live viewport - they'd still silently reappear in every
+    // OBJ/AR export regardless of what's showing on screen.
+    m.isVisible !== false
   );
 }
 
@@ -5708,10 +7096,10 @@ const USDZ_TARGET_SIZE_M = 0.32;  // longest dimension in metres - desk-sized
 // On screen the shape bodies are 60% opaque so you can read the layering
 // through them. In AR that same stack of 50+ translucent meshes has to be
 // depth-sorted by a real-time renderer, and the result is mush - washed-out
-// colour and faces winking through each other. A physical resin sculpture on
+// colour and faces winking through each other. A physical acrylic sculpture on
 // a desk also simply reads more solid than the screen version. So anything
 // meant to be a BODY is pushed close to opaque, while genuinely near-
-// invisible things (the clear-resin strut option at 0.14, concentricArc's
+// invisible things (the clear-acrylic strut option at 0.14, concentricArc's
 // wedge at 0.05) keep their transparency - they'd become ugly solids
 // otherwise. Tune with these two.
 // Bodies are translucent again, but only because the thing that ruined it the
@@ -5767,7 +7155,7 @@ const USDZ_DITHER_TILE = 8; // dither matrix is TILE x TILE
 // density field we already have: a shape is thick through its core and thin
 // at its edges. So the core is driven fully OPAQUE, which hides the far wall
 // exactly where you'd be looking through the most material, and the rim stays
-// see-through. The result reads as a solid piece of cast resin with soft
+// see-through. The result reads as a solid piece of cast acrylic with soft
 // edges rather than a hollow shell - and unlike slicing or nested shells it
 // costs no extra geometry and cannot sort badly, because it changes only a
 // single alpha channel in the ramp.
@@ -5883,14 +7271,29 @@ function usdTextureCanvas(mesh) {
 // It also reuses the stReader -> UsdUVTexture network the base already
 // proved, instead of opening a UsdPrimvarReader_float3 path whose Quick Look
 // support is inconsistent.
-function buildRampCanvas(rgba, opacity) {
+// premultiplyAt(t) is an optional override for the constant `opacity`
+// premultiply below - see openGradientColorAt's call site (the only current
+// user) for why: that ramp already lifts colour toward white as t -> 1 to
+// FAKE fading to transparent (this renderer's opacity is one flat scalar
+// per mesh, it can't actually vary across a surface - see the PREMULTIPLIED
+// note below). Premultiplying that near-white tip by the SAME flat body
+// opacity as the solid end (0.6 typically) dims it right back down to a flat
+// mid-grey - "near white" times "0.6" is grey, not pale - which is exactly
+// backwards: the illusion needs the open end to render AS BRIGHT as it
+// looks, not dimmed to match the solid end's real translucency. Density
+// gradients (the default, unset here) don't have this problem - they're a
+// pigment-density hint, never meant to read as fading to transparent - so
+// they keep the original flat premultiply, unchanged.
+function buildRampCanvas(rgba, opacity, colorAt, premultiplyAt) {
+  colorAt = colorAt || densityColorAt;
+  premultiplyAt = premultiplyAt || (() => opacity);
   const cv = document.createElement('canvas');
   cv.width = USDZ_RAMP_TEXELS;
   cv.height = 1;
   const ctx = cv.getContext('2d');
   for (let i = 0; i < USDZ_RAMP_TEXELS; i++) {
     const t = i / (USDZ_RAMP_TEXELS - 1);
-    const c = densityColorAt(rgba, t);
+    const c = colorAt(rgba, t);
     // PREMULTIPLIED by the body alpha. The ghost-plane episode proved this
     // renderer composites emission WITHOUT scaling it by opacity (a fully
     // transparent texel still painted). So for a translucent emissive body,
@@ -5899,7 +7302,7 @@ function buildRampCanvas(rgba, opacity) {
     // background underneath. If bodies come out too dim on device, raise
     // this factor toward 1 - do not touch the opacity, which controls how
     // much of the room shows through.
-    const pre = opacity;
+    const pre = premultiplyAt(t);
     ctx.clearRect(i, 0, 1, 1);
     ctx.fillStyle = `rgba(${Math.round(c.r * pre * 255)},${Math.round(c.g * pre * 255)},${Math.round(c.b * pre * 255)},1)`;
     ctx.fillRect(i, 0, 1, 1);
@@ -6020,19 +7423,48 @@ function collectUsdParts() {
     // would resurrect the padded-rectangle ghost planes. A gradient mesh
     // takes the normal geometry path and gains only `st`.
     let gradField = null;
+    let gradFieldIsLinear = false; // true for open shapes - see exportGradientDir below
     let selfLit = false;
     let ditherName = null;
     if (!textured && mesh.metadata && mesh.metadata.volumeGradient) {
+      // Open shapes carry their real 2D gradient direction (exportGradientDir,
+      // set in createOpenShape3D) and get a LINEAR ramp along it, pooling
+      // solid at the closed side and lifting toward white at the open side -
+      // their gradient IS the whole visual identity. Everything else (closed
+      // bodies via tagVolumeBody) keeps the original radial "denser at the
+      // centre" ramp, unchanged - that one is a barely-there depth hint, not
+      // the main event, and stays deliberately subtle.
+      const dir = mesh.metadata.exportGradientDir;
+      gradFieldIsLinear = !!dir;
+      const colorAt = gradFieldIsLinear ? openGradientColorAt : densityColorAt;
+
       const base = meshExportColor(mesh);
       const rgba = { r: base.c.r, g: base.c.g, b: base.c.b, a: base.a };
       const bodyAlpha = meshUsdSurface(mesh).a;
-      // Key on colour AND opacity, so every shape sharing both shares one ramp.
-      const key = 'ramp_' + [rgba.r, rgba.g, rgba.b, bodyAlpha].map(v => v.toFixed(3)).join('_');
+      // Open shapes fake their fade-to-transparent edge by lifting colour
+      // toward white (openGradientColorAt) rather than actually varying
+      // opacity (this renderer's opacity is one flat scalar per mesh - see
+      // buildRampCanvas). Premultiplying that near-white tip by the body's
+      // real (translucent) opacity would dim it right back down to a flat
+      // grey, undoing the illusion entirely - ramp the premultiply up
+      // toward 1 over the SAME eased curve the colour lift itself uses, so
+      // the open end renders as bright as it's drawn instead of grey.
+      // Density gradients keep the original flat premultiply (undefined
+      // here falls back to it in buildRampCanvas) - that ramp is a pigment-
+      // density hint, never meant to read as fading to transparent.
+      const premultiplyAt = gradFieldIsLinear
+        ? (t) => { const eased = t * t * (3 - 2 * t); return bodyAlpha + (1 - bodyAlpha) * eased; }
+        : undefined;
+      // Key on colour, opacity AND which ramp shape - open and closed meshes
+      // that happen to share a colour must NOT share a ramp texture, since
+      // they now use different curves.
+      const key = 'ramp_' + (gradFieldIsLinear ? 'open' : 'radial') + '_'
+        + [rgba.r, rgba.g, rgba.b, bodyAlpha].map(v => v.toFixed(3)).join('_');
       if (!textures.has(key)) {
         try {
           textures.set(key, {
             name: `textures/ramp_${textures.size}.png`,
-            data: canvasToPngBytes(buildRampCanvas(rgba, bodyAlpha))
+            data: canvasToPngBytes(buildRampCanvas(rgba, bodyAlpha, colorAt, premultiplyAt))
           });
         } catch (e) {
           console.warn('USDZ: ramp encode failed, falling back to flat colour', e);
@@ -6056,7 +7488,9 @@ function collectUsdParts() {
         }
         // Field from the FINAL (tessellated) local positions, so the added
         // vertices are included in the observed distance range.
-        gradField = densityField(positions);
+        gradField = gradFieldIsLinear
+          ? linearGradientField(positions, dir.x, dir.y)
+          : densityField(positions);
       }
     }
 
@@ -6091,7 +7525,10 @@ function collectUsdParts() {
       // (t, 0.5) - a 1-D lookup, so no v flip applies here.
       st = [];
       for (let i = 0; i < positions.length; i += 3) {
-        st.push(densityAt(gradField, positions[i], positions[i + 1], positions[i + 2]), 0.5);
+        const t = gradFieldIsLinear
+          ? linearGradientAt(gradField, positions[i], positions[i + 1])
+          : densityAt(gradField, positions[i], positions[i + 1], positions[i + 2]);
+        st.push(t, 0.5);
       }
     } else if (texName && uvs) {
       st = [];
@@ -6196,6 +7633,21 @@ function buildUsda() {
     p.matName = matIds.get(key).name;
   });
 
+  // AR Quick Look's default placement behaviour is "find a real horizontal
+  // surface and sit the model on it" - exactly right for the full piece
+  // (base included), wrong for a base/struts-free export: with nothing at
+  // the bottom acting as a literal pedestal, the piece should be a small
+  // floating object placeable anywhere in view (on a table, against a
+  // wall, hovering in mid-air), not locked to hunting for a surface to
+  // rest on. Preliminary_AnchoringAPI's `type` token is Apple's own hook
+  // for this - "plane" keeps today's surface-seeking behaviour, "none"
+  // drops the surface requirement entirely. Reflects whichever the CURRENT
+  // export actually contains (collectExportMeshes already excludes hidden
+  // base/strut meshes - see window.isStructureVisible - so this always
+  // matches what's really in the file, not just the live viewport toggle).
+  const includesStructure = typeof window.isStructureVisible !== 'function' || window.isStructureVisible();
+  const anchoringType = includesStructure ? 'plane' : 'none';
+
   const L = [];
   L.push('#usda 1.0');
   L.push('(');
@@ -6204,8 +7656,11 @@ function buildUsda() {
   L.push('    upAxis = "Y"');
   L.push(')');
   L.push('');
-  L.push('def Xform "Sculpture"');
+  L.push('def Xform "Sculpture" (');
+  L.push('    prepend apiSchemas = ["Preliminary_AnchoringAPI"]');
+  L.push(')');
   L.push('{');
+  L.push(`    uniform token preliminary:anchoring:type = "${anchoringType}"`);
   L.push('    def Scope "Materials"');
   L.push('    {');
   matIds.forEach(({ name, surf, tex, cutout, selfLit, dither }) => {
